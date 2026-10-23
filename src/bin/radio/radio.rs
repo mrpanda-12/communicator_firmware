@@ -1,0 +1,527 @@
+use embassy_futures::select::{Either, select};
+use embedded_hal::spi::SpiBus;
+use esp_hal::spi::Error as SpiError;
+
+use crate::hardware::lr1121::lr1121::Lr1121;
+use crate::packet::packet_data::{MAX_PACKET_SIZE, PacketData};
+use crate::radio::queue::{self, Packet, QueueError, next_packet, queued_packet_count};
+use crate::radio::radio_error::RadioError;
+use crate::radio::types::{FrequencyBand, LoRaBandwidth, PaMode, PacketStatus, RadioConfig};
+
+// Routes these LR1121 IRQ register bits to DIO9.
+const IRQ_TX_DONE: u32 = 1 << 2;
+const IRQ_RX_DONE: u32 = 1 << 3;
+const IRQ_HEADER_ERROR: u32 = 1 << 6;
+const IRQ_CRC_ERROR: u32 = 1 << 7;
+const IRQ_TIMEOUT: u32 = 1 << 10;
+
+const IRQ_DIO9_MASK: u32 =
+    IRQ_TX_DONE | IRQ_RX_DONE | IRQ_HEADER_ERROR | IRQ_CRC_ERROR | IRQ_TIMEOUT;
+
+// Sets a 30 s TX timeout.
+const TX_TIMEOUT_TICKS: u32 = 30 * 32_768;
+
+// Private LoRa PHY sync word for this custom packet network.
+// 0x12 is the private-network value; 0x34 is the public LoRaWAN value.
+const LORA_SYNC_WORD: u8 = 0x12;
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum TxRampTime {
+    Us48 = 0x02,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum RxTxFallbackMode {
+    StandbyRc = 0x01,
+}
+
+// Limits TX payloads to the packet buffer and the radio's one-byte length.
+const MAX_TX_PAYLOAD: usize = if MAX_PACKET_SIZE < u8::MAX as usize {
+    MAX_PACKET_SIZE
+} else {
+    u8::MAX as usize
+};
+
+pub struct Radio<'a, SPI> {
+    pub lr1121: Lr1121<'a, SPI>,
+    config: RadioConfig,
+    tx_in_flight: bool,
+    rx_active: bool,
+    rx_payload_len: Option<u8>,
+}
+
+impl<'a, SPI> Radio<'a, SPI>
+where
+    SPI: SpiBus<Error = SpiError>,
+{
+    pub fn new(config: RadioConfig, lr1121: Lr1121<'a, SPI>) -> Result<Self, RadioError> {
+        config
+            .validate()
+            .map_err(|_| RadioError::InvalidConfiguration)?;
+
+        let mut radio = Self {
+            lr1121,
+            config,
+            tx_in_flight: false,
+            rx_active: false,
+            rx_payload_len: None,
+        };
+
+        radio.apply_hardware_config()?;
+        Ok(radio)
+    }
+
+    fn apply_hardware_config(&mut self) -> Result<(), RadioError> {
+        let config = self.config;
+
+        // Image calibration needs the external oscillator, which is available
+        // once the TCXO has been configured during system startup.
+        self.lr1121.set_standby(1)?;
+
+        match config.frequency_band {
+            FrequencyBand::Sband => self.lr1121.set_lr_fhss_packet_type()?,
+            FrequencyBand::SubGhz | FrequencyBand::Ism2_4Ghz => {
+                self.lr1121.set_lora_packet_type()?;
+            }
+        }
+
+        // The image-calibration range is encoded in 4 MHz steps and only
+        // covers sub-GHz frequencies on the LR1121.
+        if config.frequency_hz < 1_000_000_000 {
+            let center_mhz = config.frequency_hz / 1_000_000;
+            self.lr1121.calibrate_image_in_mhz(
+                center_mhz.saturating_sub(10),
+                center_mhz.saturating_add(10),
+            )?;
+        }
+
+        self.lr1121.set_rf_frequency(config.frequency_hz)?;
+        self.lr1121
+            .set_rssi_calibration_for_frequency(config.frequency_hz)?;
+
+        match config.frequency_band {
+            FrequencyBand::Sband => {
+                self.lr1121.set_lr_fhss_modulation_params()?;
+                self.lr1121.set_lr_fhss_sync_word()?;
+            }
+            FrequencyBand::SubGhz | FrequencyBand::Ism2_4Ghz => {
+                self.lr1121.set_lora_modulation_params(
+                    config.spreading_factor,
+                    config
+                        .bandwidth
+                        .lr1121_encoding(config.frequency_band)
+                        .ok_or(RadioError::InvalidConfiguration)?,
+                    config.coding_rate.register_value(),
+                    config.low_data_rate_optimization_enabled(),
+                )?;
+
+                let initial_payload_length = if config.implicit_header { 1 } else { 0 };
+                self.lr1121.set_lora_packet_params(
+                    config.preamble_symbols,
+                    config.implicit_header,
+                    initial_payload_length,
+                    config.crc_enabled,
+                    config.invert_iq,
+                )?;
+                self.lr1121.set_lora_sync_word(LORA_SYNC_WORD)?;
+            }
+        }
+
+        let (pa_select, supply, duty_cycle, high_power_setup) =
+            config.pa_mode.lr1121_register_values();
+        self.lr1121
+            .set_pa_config(pa_select, supply, duty_cycle, high_power_setup)?;
+
+        self.lr1121
+            .set_tx_params(config.tx_power_dbm, TxRampTime::Us48 as u8)?;
+
+        self.lr1121
+            .set_rx_tx_fallback_mode(RxTxFallbackMode::StandbyRc as u8)?;
+        self.lr1121.set_rx_boosted(false)?;
+
+        self.lr1121.clear_irq(u32::MAX)?;
+        self.lr1121.set_dio_irq_params(IRQ_DIO9_MASK, 0)?;
+
+        Ok(())
+    }
+
+    pub fn send_packet(&self, packet: &PacketData) -> Result<(), RadioError> {
+        let length = packet.encoded_len();
+        let maximum = self.config.frequency_band.maximum_packet_size();
+        if length > maximum {
+            return Err(RadioError::PayloadTooLong { length, maximum });
+        }
+
+        queue::add_packet(packet).map_err(|error| match error {
+            QueueError::Packet(error) => RadioError::Packet(error),
+            QueueError::PacketTooLong { length, maximum } => {
+                RadioError::PayloadTooLong { length, maximum }
+            }
+            QueueError::Full => RadioError::TxQueueFull,
+        })
+    }
+
+    /// Owns the radio and services the TX queue and RX interrupts.
+    ///
+    /// Passes `None` for explicit-header RX or `Some(length)` for
+    /// implicit-header RX.
+    pub async fn run_worker<F>(
+        mut self,
+        implicit_rx_payload_len: Option<u8>,
+        mut on_packet_received: F,
+    ) -> Result<(), RadioError>
+    where
+        F: FnMut(Packet),
+    {
+        match (self.config.implicit_header, implicit_rx_payload_len) {
+            (false, None) => self.rx_payload_len = None,
+            (true, Some(length)) if length > 0 && usize::from(length) <= MAX_TX_PAYLOAD => {
+                self.rx_payload_len = Some(length);
+            }
+            (true, _) => {
+                return Err(RadioError::ImplicitPayloadLengthRequired);
+            }
+            _ => return Err(RadioError::InvalidConfiguration),
+        }
+
+        if queued_packet_count() == 0 && self.can_receive() {
+            self.start_rx_internal()?;
+        }
+
+        loop {
+            if self.tx_in_flight {
+                self.lr1121.wait_for_irq().await;
+
+                let irq = self.lr1121.get_irq_status()?;
+
+                if irq == 0 {
+                    self.lr1121.wait_for_irq_low().await;
+                    continue;
+                }
+
+                self.lr1121.clear_irq(irq)?;
+
+                if irq & IRQ_TX_DONE != 0 {
+                    self.tx_in_flight = false;
+
+                    if queued_packet_count() == 0 && self.can_receive() {
+                        self.start_rx_internal()?;
+                    }
+                } else if irq & IRQ_TIMEOUT != 0 {
+                    self.tx_in_flight = false;
+
+                    if queued_packet_count() == 0 && self.can_receive() {
+                        self.start_rx_internal()?;
+                    }
+
+                    return Err(RadioError::TxTimeout);
+                } else {
+                    self.lr1121.wait_for_irq_low().await;
+                }
+
+                continue;
+            }
+
+            match select(
+                select(next_packet(), self.lr1121.wait_for_irq()),
+                queue::next_frequency_change(),
+            )
+            .await
+            {
+                Either::First(Either::First(packet)) => {
+                    if self.rx_active && self.lr1121.irq_is_high() {
+                        self.process_rx(&mut on_packet_received)?;
+                    }
+
+                    self.start_transmit(&packet)?;
+                }
+
+                Either::First(Either::Second(())) => {
+                    self.process_rx(&mut on_packet_received)?;
+
+                    if self.lr1121.irq_is_high() {
+                        self.lr1121.wait_for_irq_low().await;
+                    }
+                }
+
+                Either::Second(frequency_hz) => self.change_frequency(frequency_hz, true)?,
+            }
+        }
+    }
+
+    fn start_transmit(&mut self, packet: &Packet) -> Result<(), RadioError> {
+        let payload = packet.as_slice();
+
+        if payload.is_empty() {
+            return Err(RadioError::InvalidParameter("payload must not be empty"));
+        }
+
+        let maximum = self
+            .config
+            .frequency_band
+            .maximum_packet_size()
+            .min(MAX_TX_PAYLOAD);
+        if payload.len() > maximum {
+            return Err(RadioError::PayloadTooLong {
+                length: payload.len(),
+                maximum,
+            });
+        }
+
+        if self.rx_active {
+            self.lr1121.set_standby(0)?;
+            self.rx_active = false;
+        }
+
+        if self.config.frequency_band == FrequencyBand::Sband {
+            self.lr1121.build_lr_fhss_frame(payload)?;
+        } else {
+            self.lr1121.set_lora_packet_params(
+                self.config.preamble_symbols,
+                self.config.implicit_header,
+                payload.len() as u8,
+                self.config.crc_enabled,
+                self.config.invert_iq,
+            )?;
+            self.lr1121.write_buffer(payload)?;
+        }
+        self.lr1121.clear_irq(u32::MAX)?;
+        self.lr1121.set_tx(TX_TIMEOUT_TICKS)?;
+
+        self.tx_in_flight = true;
+        Ok(())
+    }
+
+    pub fn is_tx_idle(&self) -> bool {
+        !self.tx_in_flight && queued_packet_count() == 0
+    }
+
+    pub fn pending_tx_packets(&self) -> usize {
+        queued_packet_count() + usize::from(self.tx_in_flight)
+    }
+
+    pub fn start_receive(&mut self) -> Result<(), RadioError> {
+        if !self.can_receive() {
+            return Err(RadioError::InvalidConfiguration);
+        }
+
+        if self.tx_in_flight || queued_packet_count() != 0 {
+            return Err(RadioError::RadioBusy);
+        }
+
+        if self.config.implicit_header {
+            return Err(RadioError::ImplicitPayloadLengthRequired);
+        }
+
+        self.rx_payload_len = None;
+        self.start_rx_internal()
+    }
+
+    pub fn start_receive_implicit(&mut self, payload_len: u8) -> Result<(), RadioError> {
+        if !self.can_receive() {
+            return Err(RadioError::InvalidConfiguration);
+        }
+
+        if self.tx_in_flight || queued_packet_count() != 0 {
+            return Err(RadioError::RadioBusy);
+        }
+
+        if !self.config.implicit_header
+            || payload_len == 0
+            || usize::from(payload_len) > MAX_TX_PAYLOAD
+        {
+            return Err(RadioError::InvalidConfiguration);
+        }
+
+        self.rx_payload_len = Some(payload_len);
+        self.start_rx_internal()
+    }
+
+    fn start_rx_internal(&mut self) -> Result<(), RadioError> {
+        if !self.can_receive() {
+            return Err(RadioError::InvalidConfiguration);
+        }
+
+        if self.rx_active {
+            self.lr1121.set_standby(0)?;
+            self.rx_active = false;
+        }
+
+        let (implicit_header, payload_len) = match self.rx_payload_len {
+            Some(length) => (true, length),
+            None => (false, 0),
+        };
+
+        self.lr1121.set_lora_packet_params(
+            self.config.preamble_symbols,
+            implicit_header,
+            payload_len,
+            self.config.crc_enabled,
+            self.config.invert_iq,
+        )?;
+
+        self.lr1121.clear_irq(u32::MAX)?;
+        self.lr1121.set_rx(0)?;
+        self.rx_active = true;
+
+        Ok(())
+    }
+
+    // Reads a received packet and passes its encoded bytes to the callback.
+    pub fn process_rx<F>(&mut self, mut on_packet_received: F) -> Result<bool, RadioError>
+    where
+        F: FnMut(Packet),
+    {
+        if !self.rx_active || self.tx_in_flight {
+            return Ok(false);
+        }
+
+        let irq = self.lr1121.get_irq_status()?;
+
+        if irq == 0 {
+            return Ok(false);
+        }
+
+        if irq & (IRQ_HEADER_ERROR | IRQ_CRC_ERROR) != 0 {
+            self.lr1121.clear_irq(irq)?;
+            self.lr1121.set_rx(0)?;
+            return Ok(false);
+        }
+
+        if irq & IRQ_RX_DONE == 0 {
+            self.lr1121.clear_irq(irq)?;
+            self.lr1121.set_rx(0)?;
+            return Ok(false);
+        }
+
+        let status = self.lr1121.get_rx_buffer_status()?;
+        let length = usize::from(status.payload_len);
+
+        if length > MAX_PACKET_SIZE {
+            self.lr1121.clear_irq(irq)?;
+            self.lr1121.set_rx(0)?;
+
+            return Err(RadioError::PayloadTooLong {
+                length,
+                maximum: MAX_PACKET_SIZE,
+            });
+        }
+
+        let mut payload = [0u8; MAX_PACKET_SIZE];
+
+        if length > 0 {
+            self.lr1121
+                .read_buffer(status.buffer_offset, &mut payload[..length])?;
+        }
+
+        let packet =
+            Packet::from_slice(&payload[..length]).map_err(|_| RadioError::PayloadTooLong {
+                length,
+                maximum: MAX_PACKET_SIZE,
+            })?;
+
+        self.lr1121.clear_irq(irq)?;
+        on_packet_received(packet);
+        self.lr1121.set_rx(0)?;
+
+        Ok(true)
+    }
+
+    pub fn tx_done(&mut self) -> Result<bool, RadioError> {
+        let irq = self.lr1121.get_irq_status()?;
+
+        if irq & IRQ_TX_DONE != 0 {
+            self.lr1121.clear_irq(IRQ_TX_DONE)?;
+            self.tx_in_flight = false;
+            return Ok(true);
+        }
+
+        if self.tx_in_flight && irq & IRQ_TIMEOUT != 0 {
+            self.lr1121.clear_irq(IRQ_TIMEOUT)?;
+            self.tx_in_flight = false;
+            return Err(RadioError::TxTimeout);
+        }
+
+        Ok(false)
+    }
+
+    pub fn get_last_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
+        Ok(self.lr1121.get_packet_status()?)
+    }
+
+    // Changes RF band and modem after the radio worker has reached an idle boundary.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> Result<(), RadioError> {
+        if self.tx_in_flight || queued_packet_count() != 0 {
+            return Err(RadioError::RadioBusy);
+        }
+
+        self.change_frequency(frequency_hz, self.rx_active)
+    }
+
+    fn change_frequency(
+        &mut self,
+        frequency_hz: u32,
+        resume_receive: bool,
+    ) -> Result<(), RadioError> {
+        let frequency_band =
+            FrequencyBand::for_frequency(frequency_hz).ok_or(RadioError::InvalidConfiguration)?;
+        let mut next_config = self.config;
+        next_config.frequency_hz = frequency_hz;
+        next_config.frequency_band = frequency_band;
+        next_config.pa_mode = match frequency_band {
+            FrequencyBand::SubGhz if self.config.pa_mode == PaMode::HighPower => PaMode::HighPower,
+            FrequencyBand::SubGhz => PaMode::LowPower,
+            FrequencyBand::Sband | FrequencyBand::Ism2_4Ghz => PaMode::HighFrequency,
+        };
+        if frequency_band != FrequencyBand::Sband
+            && next_config
+                .bandwidth
+                .lr1121_encoding(frequency_band)
+                .is_none()
+        {
+            next_config.bandwidth = LoRaBandwidth::Khz125;
+        }
+        if next_config.pa_mode == PaMode::HighFrequency {
+            next_config.tx_power_dbm = next_config.tx_power_dbm.min(13);
+        }
+        next_config
+            .validate()
+            .map_err(|_| RadioError::InvalidConfiguration)?;
+
+        if self.rx_active {
+            self.lr1121.set_standby(0)?;
+            self.rx_active = false;
+        }
+
+        let previous_config = self.config;
+        self.config = next_config;
+        if let Err(error) = self.apply_hardware_config() {
+            self.config = previous_config;
+            self.apply_hardware_config()?;
+            if resume_receive && self.can_receive() {
+                self.start_rx_internal()?;
+            }
+            return Err(error);
+        }
+
+        if resume_receive && self.can_receive() {
+            self.start_rx_internal()?;
+        }
+
+        Ok(())
+    }
+
+    fn can_receive(&self) -> bool {
+        self.config.frequency_band != FrequencyBand::Sband
+    }
+}
+
+pub fn request_frequency_change(frequency_hz: u32) -> Result<(), RadioError> {
+    if FrequencyBand::for_frequency(frequency_hz).is_none() {
+        return Err(RadioError::InvalidConfiguration);
+    }
+
+    queue::queue_frequency_change(frequency_hz).map_err(|_| RadioError::RadioBusy)
+}
