@@ -1,9 +1,9 @@
 use crate::packet::packet_data::{HEADER_SIZE, MAX_PACKET_SIZE, PacketData};
 use crate::packet::packet_error::PacketError;
 
-pub struct PacketEncoder;
+pub struct PacketSerializer;
 
-impl PacketEncoder {
+impl PacketSerializer {
     pub fn encode(packet_data: &PacketData, buffer: &mut [u8]) -> Result<usize, PacketError> {
         let payload_len = packet_data.payload.len();
         let packet_len = HEADER_SIZE + payload_len;

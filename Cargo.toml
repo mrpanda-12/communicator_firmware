@@ -14,6 +14,7 @@ esp-storage = { version = "0.10.0", features = ["embedded-storage", "esp32s3"] }
 sequential-storage = { version = "8.0.2", default-features = false }
 embassy-embedded-hal = "0.6.0"
 sha2 = { version = "0.11.1", default-features = false }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes"] }
 nmea = { version = "0.8.0", default-features = false, features = ["GGA", "RMC"] }
 chrono = { version = "0.4", default-features = false }
 

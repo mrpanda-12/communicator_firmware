@@ -3,11 +3,11 @@ use heapless::Vec;
 
 use crate::packet::{
     packet_data::{MAX_PACKET_SIZE, PacketData},
-    packet_encoder::PacketEncoder,
     packet_error::PacketError,
+    packet_serializer::PacketSerializer,
 };
 
-pub const QUEUE_CAPACITY: usize = 4;
+pub const QUEUE_CAPACITY: usize = 16;
 const FREQUENCY_CHANGE_CAPACITY: usize = 1;
 
 pub type Packet = Vec<u8, MAX_PACKET_SIZE>;
@@ -35,7 +35,7 @@ pub fn add_packet(packet: &PacketData) -> Result<(), QueueError> {
     }
 
     let mut encoded = [0; MAX_PACKET_SIZE];
-    let encoded_len = PacketEncoder::encode(packet, &mut encoded).map_err(QueueError::Packet)?;
+    let encoded_len = PacketSerializer::encode(packet, &mut encoded).map_err(QueueError::Packet)?;
     let packet =
         Packet::from_slice(&encoded[..encoded_len]).map_err(|_| QueueError::PacketTooLong {
             length: encoded_len,

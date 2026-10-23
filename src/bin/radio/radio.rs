@@ -1,4 +1,5 @@
 use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Timer};
 use embedded_hal::spi::SpiBus;
 use esp_hal::spi::Error as SpiError;
 
@@ -20,6 +21,10 @@ const IRQ_DIO9_MASK: u32 =
 
 // Sets a 30 s TX timeout.
 const TX_TIMEOUT_TICKS: u32 = 30 * 32_768;
+
+// Leaves a short RX window after this many queued transmissions.
+const TX_BURST_LIMIT: usize = 2;
+const RX_WINDOW: Duration = Duration::from_millis(500);
 
 // Private LoRa PHY sync word for this custom packet network.
 // 0x12 is the private-network value; 0x34 is the public LoRaWAN value.
@@ -48,6 +53,7 @@ pub struct Radio<'a, SPI> {
     pub lr1121: Lr1121<'a, SPI>,
     config: RadioConfig,
     tx_in_flight: bool,
+    tx_burst_count: usize,
     rx_active: bool,
     rx_payload_len: Option<u8>,
 }
@@ -65,6 +71,7 @@ where
             lr1121,
             config,
             tx_in_flight: false,
+            tx_burst_count: 0,
             rx_active: false,
             rx_payload_len: None,
         };
@@ -206,11 +213,17 @@ where
                 if irq & IRQ_TX_DONE != 0 {
                     self.tx_in_flight = false;
 
-                    if queued_packet_count() == 0 && self.can_receive() {
-                        self.start_rx_internal()?;
+                    if self.can_receive() {
+                        if queued_packet_count() == 0 {
+                            self.tx_burst_count = 0;
+                            self.start_rx_internal()?;
+                        } else if self.tx_burst_count >= TX_BURST_LIMIT {
+                            self.listen_during_tx_burst(&mut on_packet_received).await?;
+                        }
                     }
                 } else if irq & IRQ_TIMEOUT != 0 {
                     self.tx_in_flight = false;
+                    self.tx_burst_count = 0;
 
                     if queued_packet_count() == 0 && self.can_receive() {
                         self.start_rx_internal()?;
@@ -291,6 +304,34 @@ where
         self.lr1121.set_tx(TX_TIMEOUT_TICKS)?;
 
         self.tx_in_flight = true;
+        self.tx_burst_count += 1;
+        Ok(())
+    }
+
+    async fn listen_during_tx_burst<F>(
+        &mut self,
+        on_packet_received: &mut F,
+    ) -> Result<(), RadioError>
+    where
+        F: FnMut(Packet),
+    {
+        self.tx_burst_count = 0;
+        self.start_rx_internal()?;
+
+        match select(self.lr1121.wait_for_irq(), Timer::after(RX_WINDOW)).await {
+            Either::First(()) => {
+                if self.lr1121.irq_is_high() {
+                    self.process_rx(on_packet_received)?;
+                }
+            }
+            Either::Second(()) => {}
+        }
+
+        if self.rx_active {
+            self.lr1121.set_standby(0)?;
+            self.rx_active = false;
+        }
+
         Ok(())
     }
 
@@ -494,6 +535,7 @@ where
             self.lr1121.set_standby(0)?;
             self.rx_active = false;
         }
+        self.tx_burst_count = 0;
 
         let previous_config = self.config;
         self.config = next_config;

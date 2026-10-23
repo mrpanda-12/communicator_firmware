@@ -15,6 +15,7 @@ pub const GCM_OVERHEAD: usize = GCM_NONCE_SIZE + GCM_TAG_SIZE;
 
 pub const DEFAULT_HOP_LIMIT: u8 = 3;
 
+#[derive(Clone)]
 pub struct PacketData {
     // Stores the protocol version for this packet.
     pub version: u8,

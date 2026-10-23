@@ -41,9 +41,9 @@ pub struct Gps<'d> {
     sentence: [u8; SENTENCE_MAX_LEN],
     sentence_len: usize,
     collecting_sentence: bool,
-    coordinate: Option<Coordinate>,
-    time: Option<GpsTime>,
-    last_sentence_error: Option<SentenceError>,
+    pub coordinate: Option<Coordinate>,
+    pub time: Option<GpsTime>,
+    pub last_sentence_error: Option<SentenceError>,
 }
 
 impl<'d> Gps<'d> {
@@ -83,6 +83,7 @@ impl<'d> Gps<'d> {
             self.feed_byte(*byte);
         }
 
+        // Poll called outside the worker; publish is cheap if not used.
         Ok(count)
     }
 
@@ -101,6 +102,11 @@ impl<'d> Gps<'d> {
 
     pub fn last_sentence_error(&self) -> Option<SentenceError> {
         self.last_sentence_error
+    }
+
+    // Drains buffered UART bytes and updates coordinates/time.
+    pub fn update(&mut self) -> Result<usize, RxError> {
+        self.poll()
     }
 
     fn feed_byte(&mut self, byte: u8) {

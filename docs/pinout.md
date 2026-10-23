@@ -32,29 +32,27 @@ Use UART1, leaving UART0 available for programming and logs.
 | --- | --- | --- |
 | GPIO4 / UART1 RX | GPS TX | Cross TX to RX. |
 | GPIO5 / UART1 TX | GPS RX | Cross RX to TX. |
-| GPIO6 | GPS PPS (optional) | Leave disconnected until PPS timestamps are needed. |
 | 3V3 or module-rated supply | VCC | Confirm the exact NEO-M6N breakout's input range and current before selecting the rail. |
 | GND | GND | Common ground. |
 
-Start with the module's documented baud rate and 8-N-1 framing; do not assume the receiver is still at its factory baud if it has been configured before. Confirm UART RX/TX with a serial monitor before adding PPS handling.
+Start with the module's documented baud rate and 8-N-1 framing; do not assume the receiver is still at its factory baud if it has been configured before. Confirm UART RX/TX with a serial monitor before adding GPS parsing.
 
-The firmware wrapper is [`hardware/gps.rs`](../src/bin/hardware/gps.rs). It defaults to 9600 baud and uses the `nmea` crate in `no_std` mode with GGA/RMC parsing enabled. Poll it from the application loop or a periodic Embassy task; `poll()` drains only already-buffered UART bytes and does not wait for input:
+The firmware wrapper is [`hardware/gps.rs`](../src/bin/hardware/gps.rs). It defaults to 9600 baud and uses the `nmea` crate in `no_std` mode with GGA/RMC parsing enabled. Create a `Gps` object, call `update()` regularly to drain buffered UART bytes and parse sentences, then read `gps.coordinate` and `gps.time` (or `get_coordinate()`/`get_time()`). `poll()` does not wait for input.
 
 ```rust
-let mut gps = Gps::new(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5)?;
-
-loop {
-	gps.poll()?;
-	if let Some(coordinate) = gps.get_coordinate() {
-		// coordinate.latitude_degrees and coordinate.longitude_degrees
-	}
-	if let Some(time) = gps.get_time() {
-		// UTC date (when RMC has supplied one) and time-of-day
-	}
+let gps_pins = pinout::gps_pins(
+	peripherals.UART1,
+	peripherals.GPIO4,
+	peripherals.GPIO5,
+);
+let mut gps = Gps::new(gps_pins.uart, gps_pins.rx, gps_pins.tx)?;
+gps.update()?;
+if let Some(coord) = gps.coordinate {
+    // use coord
 }
 ```
 
-`get_coordinate()` and `get_time()` return the most recently parsed valid data as `Option`; malformed/checksum-invalid sentences are ignored and exposed through `last_sentence_error()`. The PPS pin is only reserved in the pin map; timestamp capture is not implemented.
+`get_coordinate()` and `get_time()` return the most recently parsed valid data as `Option`; malformed/checksum-invalid sentences are ignored and exposed through `last_sentence_error()`. The supported GPS module has no PPS output, so the pin map does not reserve one and PPS timestamps are not implemented.
 
 ### ILI9341 2.4-Inch SPI TFT
 
@@ -72,7 +70,7 @@ Use a separate SPI controller from the LR1121. `SPI3` is the proposed ESP-HAL pe
 | 3V3 | VCC / logic supply | Prefer 3.3 V. Check the specific TFT breakout's power and logic-level circuit. |
 | GND | GND | Common ground. |
 
-The TFT's microSD socket is intentionally left unused in this plan. If enabled later, share SCLK/MOSI/MISO with the display but assign a separate SD chip-select and ensure both chip-selects remain inactive while the other device is used. GPIO6 is currently left available and could be considered for SD CS instead of GPS PPS.
+The TFT's microSD socket is intentionally left unused in this plan. If enabled later, share SCLK/MOSI/MISO with the display but assign a separate SD chip-select and ensure both chip-selects remain inactive while the other device is used. GPIO6 is currently left available and could be used for microSD CS.
 
 ### MCP23017 Button Matrix
 
@@ -107,7 +105,7 @@ Firmware can idle all columns as low outputs so a pressed key pulls a row low an
 | 1-3 | Spare / ADC-capable. |
 | 4 | GPS UART1 RX. |
 | 5 | GPS UART1 TX. |
-| 6 | GPS PPS optional; reserve for SD CS if microSD is added instead. |
+| 6 | Spare; usable for microSD CS. |
 | 7 | TFT backlight enable. |
 | 8 | TFT reset. |
 | 9 | TFT D/C. |
@@ -127,10 +125,10 @@ GPIO27-GPIO32 are claimed in `main.rs` but are not in the supplied 21-pin list. 
 
 1. Check the HF-Kit schematic and connector labels against the GPIO numbers above. Confirm that GPIO4-18 are exposed on the connector intended for peripherals and are not reserved by the kit adapter.
 2. Verify each breakout's supply voltage, logic levels, pull-ups, and current draw. Power the TFT backlight from a suitable supply, not directly from a GPIO.
-3. Bring up GPS UART alone and verify NMEA output on GPIO4/5. Add GPIO6 PPS only after UART is stable.
+3. Verify GPS NMEA output on GPIO4/5. `Gps::run()` now polls the receiver, but the UART path still needs bench verification.
 4. Bring up the ILI9341 on SPI3 using GPIO12/11 and its CS/D-C/RESET pins. Start at a conservative SPI clock and increase only after reliable display updates.
 5. Bring up MCP23017 on GPIO17/18, verify address `0x20`, then test rows/columns and the interrupt on GPIO16.
-6. Add each driver to `main.rs` only after its isolated electrical and bus test passes; do not change the existing LR1121 GPIO assignments.
+6. Add the remaining display and button-expander drivers to `main.rs` only after their isolated electrical and bus tests pass; do not change the existing LR1121 or GPS GPIO assignments.
 
 ## References
 

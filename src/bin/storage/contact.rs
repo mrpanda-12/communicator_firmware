@@ -1,12 +1,13 @@
+use crate::crypto::KEY_SIZE;
 use heapless::String;
 use sequential_storage::map::{SerializationError, Value};
 
-const CONTACT_RECORD_BYTES: usize = 16 + 64 + 32;
+const CONTACT_RECORD_BYTES: usize = 16 + KEY_SIZE + 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contact {
     pub device_id: [u8; 16],
-    pub password: String<64>,
+    pub key: [u8; KEY_SIZE],
     pub custom_name: String<32>,
 }
 
@@ -35,11 +36,13 @@ impl<'a> Value<'a> for Contact {
             return Err(SerializationError::BufferTooSmall);
         }
 
-        // Stores the ID, password, and name in fixed-width fields.
+        // Stores the ID, derived key, and name in fixed-width fields.
         buffer[..16].copy_from_slice(&self.device_id);
-        // Writes password bytes without application-level encryption.
-        encode_fixed_string(&self.password, &mut buffer[16..80]);
-        encode_fixed_string(&self.custom_name, &mut buffer[80..112]);
+        buffer[16..16 + KEY_SIZE].copy_from_slice(&self.key);
+        encode_fixed_string(
+            &self.custom_name,
+            &mut buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES],
+        );
         Ok(CONTACT_RECORD_BYTES)
     }
 
@@ -51,13 +54,15 @@ impl<'a> Value<'a> for Contact {
         let device_id = buffer[..16]
             .try_into()
             .map_err(|_| SerializationError::InvalidFormat)?;
-        let password = decode_fixed_string(&buffer[16..80])?;
-        let custom_name = decode_fixed_string(&buffer[80..112])?;
+        let key = buffer[16..16 + KEY_SIZE]
+            .try_into()
+            .map_err(|_| SerializationError::InvalidFormat)?;
+        let custom_name = decode_fixed_string(&buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES])?;
 
         Ok((
             Self {
                 device_id,
-                password,
+                key,
                 custom_name,
             },
             CONTACT_RECORD_BYTES,

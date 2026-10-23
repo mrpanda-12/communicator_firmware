@@ -56,7 +56,7 @@ The layout of the variable-length payload field depends strictly on the value of
 
 ### Case A: Encrypted Packets (is_encrypted = 1)
 
-This is the intended wire format. The current `crypto/aes.rs` is empty; the firmware does not yet encrypt or authenticate packets.
+This is the intended wire format. `crypto/mod.rs` provides AES-256-GCM `derive_key`, `encrypt`, and `decrypt` primitives, but the packet encode/decode path does not call them yet.
 
 Encrypted packets use AES-256-GCM. For each transmitted fragment, the sender generates a unique 12-byte Nonce using the ESP32-S3 hardware TRNG. This nonce is transmitted directly within the packet payload to ensure the receiver can instantly decrypt the frame without any state synchronization.
 
@@ -100,9 +100,9 @@ The 2.4 GHz LoRa bandwidth encodings include the band-specific 203, 406, and 812
 
 `FrequencyChange` is packet type `0x06` for an announcement/invitation such as “I’m changing frequency; do you want to join me?”. It has no handler or automatic retune behavior in this firmware.
 
-These are LR1121 silicon capabilities, not a guarantee that a particular board supports each band. The current board initialization does not configure the LR1121 RF-switch DIO control or a board-specific band calibration sequence, and the attached antenna/front end must support the selected band. Verify the board RF path and local regulations before transmitting outside the existing sub-GHz profile.
+These are LR1121 silicon capabilities, not a guarantee that a particular board supports each band. The firmware configures the LR1121 RF-switch DIO control, TCXO/LFCLK startup, sub-GHz image calibration, and per-frequency RSSI calibration. The attached antenna and front end must still support the selected band. Verify the board RF path and local regulations before transmitting outside the existing sub-GHz profile.
 
-The packet format is shared across bands. The radio layer limits the complete encoded packet to the selected modem profile's maximum; fragmentation/reassembly is not currently implemented.
+The packet format is shared across bands. The radio layer limits the complete encoded packet to the selected modem profile's maximum. The caller must create each fragment; automatic fragmentation and reassembly are not currently implemented.
 
 ### Profile A: Sub-GHz Long-Range Mesh Mode (869.5 MHz)
 
@@ -118,9 +118,21 @@ The packet format is shared across bands. The radio layer limits the complete en
 - Target Payload Size: 184 Bytes of application data per fragment (maximum if AES-GCM overhead is later implemented).
 - Total Over-The-Air Footprint: 43B Header + 12B Nonce + 184B Ciphertext + 16B Tag = 255 Bytes total (absolute encoded-packet limit).
 
-## 7. Packet Forwarding and Duplicate Detection
+## 7. Transmission Queue, Forwarding, and Duplicate Detection
 
-This section describes intended behavior. The current `network::packet_router` module is empty, and the packet handler does not forward or deduplicate packets.
+### Transmission Queue
+
+This subsection describes implemented behavior.
+
+All outgoing packets use the radio worker's FIFO queue. `Radio::send_packet` checks the encoded packet against the active band limit and enqueues it. After the worker owns `Radio`, other tasks use `queue::add_packet`, which validates the packet and the generic 255-byte limit but not the active band limit; the worker rechecks the limit at dequeue time.
+
+The queue has capacity 16 encoded packets (plus at most one in-flight packet) and provides backpressure through `TxQueueFull`. After every two queued transmissions, the worker opens an RX window of up to 500 ms before continuing; S-band skips this because it is TX-only. The queue does not implement priority, preemption, emergency bypass, retries, persistence, or duplicate suppression. `Radio::start_transmit` is private, so there is no public `Radio` direct-send path. The low-level `Lr1121` driver commands are public but are not a supported bypass because they skip worker pacing, RX suspension/resumption, and TX state tracking. A future priority or emergency path must be an explicit API that still uses the radio worker and does not skip duplicate handling.
+
+Duplicate suppression must not be applied when enqueuing: retries intentionally reuse `packet_id`, and a retry must remain queueable after the original transmission is lost. Duplicate detection belongs on the receive/forwarding path.
+
+### Forwarding and Duplicate Detection
+
+This subsection describes intended behavior. The current `network::packet_router` module is empty, and the packet handler does not forward or deduplicate packets.
 
 For each received packet:
 
@@ -155,6 +167,6 @@ store.set("display_brightness", &80u8, &mut buffer).await?;
 let brightness = store.get::<u8>("display_brightness", &mut buffer).await?;
 ```
 
-Contacts are keyed by their 16-byte device ID and saved with `write_contact`; `read_contact` retrieves one by ID. Their serialized record contains the ID, a 64-byte password field, and a 32-byte custom-name field. The password is stored without application-level encryption.
+Contacts are keyed by their 16-byte device ID and saved with `write_contact`; `read_contact` retrieves one by ID. Their serialized record contains the ID, a 32-byte derived peer key, and a 32-byte custom-name field. The key is stored without application-level encryption.
 
 Provide a work buffer large enough for the largest serialized key and value, rounded up to the flash word size. For a contact record, use at least 160 bytes. Keep a settings buffer large enough for the largest setting key and value you store.

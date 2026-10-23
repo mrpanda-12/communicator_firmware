@@ -1,11 +1,10 @@
-use crate::packet::packet_decoder::PacketDecoder;
-use crate::radio::queue::Packet;
+use crate::{packet::packet_deserializer::PacketDeserializer, radio::queue::Packet};
 
 pub struct PacketHandler;
 
 impl PacketHandler {
     pub fn handle_packet(packet: Packet) {
-        match PacketDecoder::decode(packet.as_slice()) {
+        match PacketDeserializer::decode(packet.as_slice()) {
             Ok(decoded) => {
                 esp_println::println!(
                     "RX {:?} id={} message={} encrypted={} hops={}/{} bytes={}",

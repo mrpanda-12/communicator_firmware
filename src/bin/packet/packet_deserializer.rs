@@ -2,9 +2,9 @@ use crate::packet::packet_data::{HEADER_SIZE, MAX_PACKET_SIZE, PROTOCOL_VERSION,
 use crate::packet::packet_error::PacketError;
 use crate::packet::packet_type::PacketType;
 
-pub struct PacketDecoder;
+pub struct PacketDeserializer;
 
-impl PacketDecoder {
+impl PacketDeserializer {
     pub fn decode(bytes: &[u8]) -> Result<PacketData, PacketError> {
         // Rejects packets shorter than the minimum header size.
         if bytes.len() < HEADER_SIZE {
