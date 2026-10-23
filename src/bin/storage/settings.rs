@@ -23,6 +23,18 @@ impl StorageKey {
         Self::from_parts(b'c', device_id)
     }
 
+    pub(crate) fn message_list(device_id: &[u8; 16]) -> Self {
+        Self::from_parts(b'm', device_id)
+    }
+
+    pub(crate) fn conversation_index() -> Self {
+        Self::from_parts(b's', b"conversations")
+    }
+
+    pub(crate) fn broadcast_messages() -> Self {
+        Self::from_parts(b'm', &[0xFF; 16])
+    }
+
     fn from_parts(namespace: u8, value: &[u8]) -> Self {
         let mut bytes = [0; MAX_KEY_BYTES];
         bytes[0] = namespace;

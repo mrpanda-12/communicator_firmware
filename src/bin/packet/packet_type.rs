@@ -5,6 +5,7 @@ pub enum PacketType {
     Ack = 0x02,
     Coordinates = 0x03,
     Heading = 0x04,
+    DeviceAnnounce = 0x05,
     FrequencyChange = 0x06,
 }
 
@@ -17,6 +18,7 @@ impl TryFrom<u8> for PacketType {
             0x02 => Ok(Self::Ack),
             0x03 => Ok(Self::Coordinates),
             0x04 => Ok(Self::Heading),
+            0x05 => Ok(Self::DeviceAnnounce),
             0x06 => Ok(Self::FrequencyChange),
             _ => Err(()),
         }

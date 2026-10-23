@@ -36,6 +36,18 @@ pub fn derive_key(password: &[u8]) -> [u8; KEY_SIZE] {
     hasher.finalize().into()
 }
 
+pub fn derive_pair_key(password: &[u8], my_id: &[u8; 16], peer_id: &[u8; 16]) -> [u8; KEY_SIZE] {
+    let mut ids = [*my_id, *peer_id];
+    ids.sort_unstable_by(|a, b| a.cmp(b));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"communicator-pair-v1");
+    hasher.update(&ids[0]);
+    hasher.update(&ids[1]);
+    hasher.update(password);
+    hasher.finalize().into()
+}
+
 pub fn encrypt(
     key: &[u8; KEY_SIZE],
     data: &[u8],

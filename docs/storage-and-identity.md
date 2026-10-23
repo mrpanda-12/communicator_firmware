@@ -44,3 +44,10 @@ Only call regeneration for an explicit identity reset. The TRNG must have a supp
 - Contact records store the derived 32-byte key, not the password. The key is still plaintext at the application serialization layer.
 - Storing only a password hash would not preserve the key needed to decrypt messages; the derived key must be stored or re-derived from a re-entered password.
 - The protocol specification describes intended identity/key behavior; it should not be interpreted as implemented security until crypto and authenticated packet handling are added.
+
+## Messages (Flash)
+
+Messages are stored per conversation keyed by device ID. Broadcast uses a fixed broadcast key. Storage keeps up to `MAX_MESSAGES_PER_CONVO` (50) messages per conversation with a ring-buffer style on write. Messages are stored decrypted at rest in flash for fast UI display. Coordinates are serialized as lat/lon f32 with type markers.
+
+- Keys: `m:<device_id>` for DMs, `m:<0xFF*16>` for broadcast
+- API: `FlashStore::save_messages/load_messages`, `save_broadcast_messages/load_broadcast_messages`

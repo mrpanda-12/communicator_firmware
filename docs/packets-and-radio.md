@@ -239,3 +239,7 @@ The request channel holds one pending change. The worker applies it between oper
 The firmware now configures the LR1121 RF switch, TCXO, sub-GHz image calibration, and per-frequency RSSI calibration. Before using a non-default band, still verify the board's antenna/front end, actual supported frequency range, and local regulations. In particular, the Rust S-band range starts at 1.9 GHz, while the Waveshare board reference uses 2.0-2.1 GHz; keep both ends of a link inside a range the hardware actually supports.
 
 For a first link test, use two boards on sub-GHz with the same configuration and watch the serial console for `RX ...` lines. The current test producer broadcasts from device ID `[1; 16]`, so no addressing or encryption setup is required to observe the test payload.
+
+## Device Announce (Discovery)
+
+`PacketType::DeviceAnnounce = 0x05` is used for discovery. An announce is a broadcast packet (`to = [0;16]`) with empty payload, `is_encrypted = false`, and `from` set to the sender's device ID. When searching, the receiver listens for announces and adds unknown devices to a discovery list. No keys are exchanged over radio; both devices derive the pairwise key from the shared password plus both device IDs.

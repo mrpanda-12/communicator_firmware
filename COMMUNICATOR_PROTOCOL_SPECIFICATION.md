@@ -170,3 +170,10 @@ let brightness = store.get::<u8>("display_brightness", &mut buffer).await?;
 Contacts are keyed by their 16-byte device ID and saved with `write_contact`; `read_contact` retrieves one by ID. Their serialized record contains the ID, a 32-byte derived peer key, and a 32-byte custom-name field. The key is stored without application-level encryption.
 
 Provide a work buffer large enough for the largest serialized key and value, rounded up to the flash word size. For a contact record, use at least 160 bytes. Keep a settings buffer large enough for the largest setting key and value you store.
+
+### 8.2 DeviceAnnounce
+- Type: 0x05
+- To: 0x0000...0000 (broadcast)
+- Payload: empty
+- Encryption: false
+- Purpose: Allow devices to discover each other by broadcasting their device ID (sender in header). Pairing uses a shared password with pairwise derivation: `Key(A,B) = SHA256(domain || sorted(A,B) || password)`.

@@ -7,7 +7,8 @@ use sequential_storage::{
     map::{MapConfig, MapStorage, Value},
 };
 
-use crate::storage::{contact::Contact, settings::StorageKey};
+use crate::storage::{contact::Contact, message::StoredMessage, settings::StorageKey};
+use alloc::vec::Vec;
 
 type StorageCache = Cache<Uncached, Uncached, Uncached, StorageKey>;
 type AsyncFlash<'d> = BlockingAsync<FlashStorage<'d>>;
@@ -81,5 +82,79 @@ impl<'d> FlashStore<'d> {
             .store_item(data_buffer, &key, contact)
             .await
             .map_err(StoreError::Storage)
+    }
+
+    pub async fn remove_contact(
+        &mut self,
+        device_id: &[u8; 16],
+        data_buffer: &mut [u8],
+    ) -> Result<(), StoreError> {
+        let key = StorageKey::contact(device_id);
+        self.storage
+            .remove_item(data_buffer, &key)
+            .await
+            .map_err(StoreError::Storage)
+    }
+
+    pub async fn get_contact(
+        &mut self,
+        device_id: &[u8; 16],
+        data_buffer: &mut [u8],
+    ) -> Result<Option<Contact>, StoreError> {
+        self.read_contact(device_id, data_buffer).await
+    }
+
+    pub async fn save_messages(
+        &mut self,
+        device_id: &[u8; 16],
+        messages: &Vec<StoredMessage>,
+        data_buffer: &mut [u8],
+    ) -> Result<(), StoreError> {
+        use crate::storage::message::StoredMessageList;
+        let key = StorageKey::message_list(device_id);
+        self.storage
+            .store_item(data_buffer, &key, &StoredMessageList(messages.clone()))
+            .await
+            .map_err(StoreError::Storage)
+    }
+
+    pub async fn load_messages(
+        &mut self,
+        device_id: &[u8; 16],
+        data_buffer: &mut [u8],
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        use crate::storage::message::StoredMessageList;
+        let key = StorageKey::message_list(device_id);
+        match self.storage.fetch_item(data_buffer, &key).await {
+            Ok(Some(StoredMessageList(msgs))) => Ok(msgs),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(StoreError::Storage(e)),
+        }
+    }
+
+    pub async fn save_broadcast_messages(
+        &mut self,
+        messages: &Vec<StoredMessage>,
+        data_buffer: &mut [u8],
+    ) -> Result<(), StoreError> {
+        use crate::storage::message::StoredMessageList;
+        let key = StorageKey::broadcast_messages();
+        self.storage
+            .store_item(data_buffer, &key, &StoredMessageList(messages.clone()))
+            .await
+            .map_err(StoreError::Storage)
+    }
+
+    pub async fn load_broadcast_messages(
+        &mut self,
+        data_buffer: &mut [u8],
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        use crate::storage::message::StoredMessageList;
+        let key = StorageKey::broadcast_messages();
+        match self.storage.fetch_item(data_buffer, &key).await {
+            Ok(Some(StoredMessageList(msgs))) => Ok(msgs),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(StoreError::Storage(e)),
+        }
     }
 }

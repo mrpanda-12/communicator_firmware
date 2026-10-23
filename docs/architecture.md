@@ -80,3 +80,6 @@ The build is verified for `xtensa-esp32s3-none-elf`; the linker currently emits 
 - Fragmentation, reassembly, forwarding, duplicate suppression, contact-based authorization, and display support are not implemented.
 - Flash storage and device identity APIs exist but are not initialized or called by `main`.
 - Antenna/front-end support, actual RF range, and regulatory approval remain board/application responsibilities. No hardware TX/RX result is recorded here.
+
+## Message Storage
+`storage/message.rs` defines `StoredMessage`, `MessageKind` (Text/Coords), and `MAX_MESSAGES_PER_CONVO` (50). `FlashStore` persists messages per device ID (DMs) and broadcast separately. This enables chat history with capped history and fast loading per conversation.
