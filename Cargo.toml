@@ -43,7 +43,7 @@ static_cell      = "2.1.1"
 ed25519-dalek = "3.0.0"
 heapless = "0.9.3"
 embedded-hal = "1.0.0"
-embassy-sync = "0.6.2"
+embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 embedded-sdmmc = { version = "0.10.0", default-features = false }
 embedded-hal-bus = "0.3.0"

@@ -64,6 +64,12 @@ impl PacketHandler {
             }
         };
 
+        // Drop our own packets if another node relays them back to us.
+        if packet.from == device_id {
+            defmt::debug!("RX ignored: packet originated from this device");
+            return;
+        }
+
         // Return if packet was in the last 16 packets
         let packet_key = PacketKey {
             sender: packet.from,
