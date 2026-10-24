@@ -15,6 +15,10 @@ pub struct RadioConfig {
     // Increases sensitivity while increasing airtime as the value rises.
     pub spreading_factor: u8,
 
+    // Selects the LoRa network sync word for sub-GHz and 2.4 GHz LoRa.
+    // Defaults to the private-network value 0x12; LR-FHSS uses its profile sync word.
+    pub lora_sync_word: u8,
+
     // Sets the LoRa bandwidth when the selected band uses LoRa.
     pub bandwidth: LoRaBandwidth,
 
@@ -79,6 +83,7 @@ impl RadioConfig {
             frequency_hz,
             frequency_band,
             spreading_factor: 9,
+            lora_sync_word: 0x12,
             bandwidth: LoRaBandwidth::Khz125,
             coding_rate: CodingRate::Cr45,
             tx_power_dbm: 10,

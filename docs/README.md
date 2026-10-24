@@ -15,7 +15,7 @@ This directory contains all project Markdown documentation. Start with these imp
 - Sub-GHz and 2.4 GHz LoRa custom-packet TX and RX are implemented.
 - S-band LR-FHSS is transmit-only. S-band RX is not supported by the LR1121 modem path used here.
 - `main.rs` runs a sub-GHz custom-packet test at 869.4 MHz: it queues an unencrypted broadcast `Text` packet every 30 seconds, starts RX, polls GPS on UART1, and updates the display UI. The test producer does not save messages to chat history.
-- The firmware uses the private LoRa sync word (`0x12`), not the public LoRaWAN value (`0x34`).
+- `RadioConfig::lora_sync_word` sets the LoRa PHY sync word and defaults to the private-network value (`0x12`); `0x34` is the public LoRaWAN value.
 - All TX goes through a 16-packet FIFO queue. After every two queued transmissions the worker listens for up to 500 ms before continuing. There is no priority path, retry logic, or fragmentation/reassembly.
 - The packet handler validates and deduplicates received packets and forwards broadcasts or packets addressed to another device. Application delivery for locally addressed packets is still a TODO.
 - Storage has append/read APIs for message history, but send/receive paths and the UI do not call them yet. The storage guide shows how to integrate them.

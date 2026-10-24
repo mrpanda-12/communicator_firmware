@@ -60,7 +60,7 @@ pub async fn run<D>(
         'static,
         embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
         GpsSnapshot,
-        1,
+        2,
     >,
 ) -> !
 where

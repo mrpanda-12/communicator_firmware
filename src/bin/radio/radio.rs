@@ -7,7 +7,8 @@ use esp_hal::spi::Error as SpiError;
 
 use crate::hardware::lr1121::lr1121::Lr1121;
 use crate::packet::packet_data::{MAX_PACKET_SIZE, PacketData};
-use crate::radio::queue::{self, Packet, QueueError, next_packet, queued_packet_count};
+use crate::radio::control::RadioControl;
+use crate::radio::queue::{Packet, QueueError, RadioQueue};
 use crate::radio::radio_error::RadioError;
 use crate::radio::types::{FrequencyBand, LoRaBandwidth, PaMode, PacketStatus, RadioConfig};
 
@@ -28,10 +29,6 @@ const TX_TIMEOUT_TICKS: u32 = 30 * 32_768;
 const TX_BURST_LIMIT: usize = 2;
 const RX_WINDOW: Duration = Duration::from_millis(500);
 
-// Private LoRa PHY sync word for this custom packet network.
-// 0x12 is the private-network value; 0x34 is the public LoRaWAN value.
-const LORA_SYNC_WORD: u8 = 0x12;
-
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum TxRampTime {
@@ -51,8 +48,10 @@ const MAX_TX_PAYLOAD: usize = if MAX_PACKET_SIZE < u8::MAX as usize {
     u8::MAX as usize
 };
 
-pub struct Radio<'a, SPI> {
+pub struct Radio<'a, 'q, SPI> {
     pub lr1121: Lr1121<'a, SPI>,
+    queue: &'q RadioQueue,
+    control: &'q RadioControl,
     config: RadioConfig,
     tx_in_flight: bool,
     tx_burst_count: usize,
@@ -60,17 +59,24 @@ pub struct Radio<'a, SPI> {
     rx_payload_len: Option<u8>,
 }
 
-impl<'a, SPI> Radio<'a, SPI>
+impl<'a, 'q, SPI> Radio<'a, 'q, SPI>
 where
     SPI: SpiBus<Error = SpiError>,
 {
-    pub fn new(config: RadioConfig, lr1121: Lr1121<'a, SPI>) -> Result<Self, RadioError> {
+    pub fn new(
+        config: RadioConfig,
+        lr1121: Lr1121<'a, SPI>,
+        queue: &'q RadioQueue,
+        control: &'q RadioControl,
+    ) -> Result<Self, RadioError> {
         config
             .validate()
             .map_err(|_| RadioError::InvalidConfiguration)?;
 
         let mut radio = Self {
             lr1121,
+            queue,
+            control,
             config,
             tx_in_flight: false,
             tx_burst_count: 0,
@@ -134,7 +140,7 @@ where
                     config.crc_enabled,
                     config.invert_iq,
                 )?;
-                self.lr1121.set_lora_sync_word(LORA_SYNC_WORD)?;
+                self.lr1121.set_lora_sync_word(config.lora_sync_word)?;
             }
         }
 
@@ -163,7 +169,7 @@ where
             return Err(RadioError::PayloadTooLong { length, maximum });
         }
 
-        queue::add_packet(packet).map_err(|error| match error {
+        self.queue.add_packet(packet).map_err(|error| match error {
             QueueError::Packet(error) => RadioError::Packet(error),
             QueueError::PacketTooLong { length, maximum } => {
                 RadioError::PayloadTooLong { length, maximum }
@@ -195,7 +201,7 @@ where
             _ => return Err(RadioError::InvalidConfiguration),
         }
 
-        if queued_packet_count() == 0 && self.can_receive() {
+        if self.queue.queued_packet_count() == 0 && self.can_receive() {
             self.start_rx_internal()?;
         }
 
@@ -216,7 +222,7 @@ where
                     self.tx_in_flight = false;
 
                     if self.can_receive() {
-                        if queued_packet_count() == 0 {
+                        if self.queue.queued_packet_count() == 0 {
                             self.tx_burst_count = 0;
                             self.start_rx_internal()?;
                         } else if self.tx_burst_count >= TX_BURST_LIMIT {
@@ -227,7 +233,7 @@ where
                     self.tx_in_flight = false;
                     self.tx_burst_count = 0;
 
-                    if queued_packet_count() == 0 && self.can_receive() {
+                    if self.queue.queued_packet_count() == 0 && self.can_receive() {
                         self.start_rx_internal()?;
                     }
 
@@ -240,8 +246,8 @@ where
             }
 
             match select(
-                select(next_packet(), self.lr1121.wait_for_irq()),
-                queue::next_frequency_change(),
+                select(self.queue.next_packet(), self.lr1121.wait_for_irq()),
+                self.control.next_frequency_change(),
             )
             .await
             {
@@ -338,11 +344,11 @@ where
     }
 
     pub fn is_tx_idle(&self) -> bool {
-        !self.tx_in_flight && queued_packet_count() == 0
+        !self.tx_in_flight && self.queue.queued_packet_count() == 0
     }
 
     pub fn pending_tx_packets(&self) -> usize {
-        queued_packet_count() + usize::from(self.tx_in_flight)
+        self.queue.queued_packet_count() + usize::from(self.tx_in_flight)
     }
 
     pub fn start_receive(&mut self) -> Result<(), RadioError> {
@@ -350,7 +356,7 @@ where
             return Err(RadioError::InvalidConfiguration);
         }
 
-        if self.tx_in_flight || queued_packet_count() != 0 {
+        if self.tx_in_flight || self.queue.queued_packet_count() != 0 {
             return Err(RadioError::RadioBusy);
         }
 
@@ -367,7 +373,7 @@ where
             return Err(RadioError::InvalidConfiguration);
         }
 
-        if self.tx_in_flight || queued_packet_count() != 0 {
+        if self.tx_in_flight || self.queue.queued_packet_count() != 0 {
             return Err(RadioError::RadioBusy);
         }
 
@@ -497,7 +503,7 @@ where
 
     // Changes RF band and modem after the radio worker has reached an idle boundary.
     pub fn set_frequency(&mut self, frequency_hz: u32) -> Result<(), RadioError> {
-        if self.tx_in_flight || queued_packet_count() != 0 {
+        if self.tx_in_flight || self.queue.queued_packet_count() != 0 {
             return Err(RadioError::RadioBusy);
         }
 
@@ -561,12 +567,4 @@ where
     fn can_receive(&self) -> bool {
         self.config.frequency_band != FrequencyBand::Sband
     }
-}
-
-pub fn request_frequency_change(frequency_hz: u32) -> Result<(), RadioError> {
-    if FrequencyBand::for_frequency(frequency_hz).is_none() {
-        return Err(RadioError::InvalidConfiguration);
-    }
-
-    queue::queue_frequency_change(frequency_hz).map_err(|_| RadioError::RadioBusy)
 }

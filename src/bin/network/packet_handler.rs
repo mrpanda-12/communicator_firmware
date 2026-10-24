@@ -1,7 +1,7 @@
 use crate::packet::packet_type::PacketType;
 use crate::{
     packet::{packet_data::PacketData, packet_deserializer::PacketDeserializer},
-    radio::queue::{self, Packet, QueueError},
+    radio::queue::{Packet, QueueError, RadioQueue},
     storage::storage_manager::StorageManager,
 };
 use core::str::from_utf8;
@@ -29,6 +29,7 @@ impl PacketHandler {
     pub async fn handle_packet(
         &mut self,
         packet: Packet,
+        tx_queue: &RadioQueue,
         storage: &mut StorageManager<'static>,
         flash_buffer: &mut [u8],
     ) {
@@ -109,7 +110,7 @@ impl PacketHandler {
         }
 
         if broadcast {
-            forward_packet(&mut packet);
+            forward_packet(&mut packet, tx_queue);
             if packet.is_encrypted {
                 return;
             }
@@ -117,7 +118,7 @@ impl PacketHandler {
         }
 
         if !addressed_to_this_device {
-            forward_packet(&mut packet);
+            forward_packet(&mut packet, tx_queue);
             return;
         }
 
@@ -141,13 +142,13 @@ impl PacketHandler {
 }
 
 // Decrement a packet's remaining hops before queueing it for forwarding.
-fn forward_packet(packet: &mut PacketData) {
+fn forward_packet(packet: &mut PacketData, tx_queue: &RadioQueue) {
     if !packet.decrement_hop_limit() {
         defmt::debug!("Packet reached its hop limit; not forwarding");
         return;
     }
 
-    match queue::add_packet(packet) {
+    match tx_queue.add_packet(packet) {
         Ok(()) => {}
         Err(QueueError::Full) => {
             defmt::warn!("Could not forward packet: TX queue is full");

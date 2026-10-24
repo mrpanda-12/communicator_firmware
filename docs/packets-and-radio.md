@@ -8,7 +8,7 @@
 | 2.4 GHz LoRa, 2.4-2.5 GHz | Yes | Yes | Requires an explicit 2.4 GHz `RadioConfig`; it is not the current `main.rs` default. |
 | S-band LR-FHSS, 1.9-2.1 GHz | Yes | No | The LR1121 User Manual states its LR-FHSS implementation is transmit-only. S-band also has no LoRa mode, so S-band RX is rejected. |
 
-By default, `main.rs` starts RX and queues a broadcast `Text` test packet every 30 seconds. A link requires two boards with the same frequency, spreading factor, bandwidth, coding rate, preamble, header mode, CRC setting, and sync word. The firmware uses the private LoRa sync word `0x12`; the public LoRaWAN value is `0x34`, so LoRaWAN devices do not decode these packets.
+By default, `main.rs` starts RX and queues a broadcast `Text` test packet every 30 seconds. A link requires two boards with the same frequency, spreading factor, bandwidth, coding rate, preamble, header mode, CRC setting, and sync word. `RadioConfig::lora_sync_word` sets the LoRa PHY sync word and defaults to the private-network value `0x12`. The public LoRaWAN value is `0x34`, so LoRaWAN devices do not decode these packets.
 
 The build is verified, but no two-board RF test is recorded. Antenna connection, RF-switch behavior, range, and peer interoperability still require bench verification.
 
@@ -86,11 +86,39 @@ Every supported transmission goes through the radio worker's TX queue. There is 
 
 1. Build a `PacketData` value. `PacketData::new` validates fragment metadata, payload capacity, and the encrypted-payload minimum.
 2. Enqueue the packet:
-   - While holding `Radio` and before `run_worker` consumes it, call `Radio::send_packet`. It checks the complete encoded length against the active band limit, then calls `queue::add_packet`.
-   - After `run_worker` takes `Radio`, other tasks can call `queue::add_packet` directly. It validates packet metadata and the generic 255-byte limit, but not the active band limit. The worker rechecks at dequeue time and exits with `PayloadTooLong` if the packet does not fit.
-3. `queue::add_packet` encodes the packet with `PacketSerializer` and sends the encoded bytes to the static `PACKETS` Embassy channel.
+   - While holding `Radio` and before `run_worker` consumes it, call `Radio::send_packet`. It checks the complete encoded length against the active band limit, then enqueues into that radio's queue.
+   - After `run_worker` takes `Radio`, other tasks use the matching `RadioQueue::add_packet` handle. It validates packet metadata and the generic 255-byte limit, but not the active band limit. The worker rechecks at dequeue time and exits with `PayloadTooLong` if the packet does not fit.
+3. `RadioQueue::add_packet` encodes the packet with `PacketSerializer` and sends the encoded bytes to that queue instance's Embassy channel.
 4. The worker takes one packet at a time, stops RX if active, loads the LoRa payload or builds the LR-FHSS frame, clears stale IRQs, and starts TX with a 30-second timeout.
 5. On `TX_DONE`, the worker clears `tx_in_flight`. If the queue is empty, it restarts RX. If packets remain, it continues sending, but after every two consecutive transmissions it opens an RX window of up to 500 ms before continuing. On `TIMEOUT`, it returns `TxTimeout`.
+
+`Radio::send_packet` means “accept this packet for transmission,” not “transmit it now.” It only places the encoded packet in the queue. The `run_worker` loop is the part that actually talks to the LR1121: it removes a queued packet, prepares the radio, and starts the over-the-air transmission. This keeps RX interrupts, TX completion, timeouts, and radio state changes under one owner.
+
+### Queue Ownership
+
+Create the queue separately, then pass a reference to it when constructing the radio:
+
+```rust
+let radio_queue = RadioQueue::new();
+let radio_control = RadioControl::new();
+let radio = Radio::new(radio_config, lr1121, &radio_queue, &radio_control)?;
+```
+
+`Radio` borrows both objects. `RadioQueue` carries outgoing packets; `RadioControl` carries local commands such as frequency changes. `run_worker` takes ownership of `Radio`; once it is running, application tasks cannot call methods on that moved value. Keep both objects available and pass the queue to packet producers and the packet handler, and the control channel to code that needs to request retuning. The worker remains the sole owner of the hardware and waits on its packet queue, control channel, and radio interrupts. Create one queue and one control channel per radio to keep their traffic isolated. Neither object takes a `Radio` in its constructor or is accessed as a field through `radio` after the worker starts.
+
+For two radios, create and pair two queues:
+
+```rust
+let first_queue = RadioQueue::new();
+let first_control = RadioControl::new();
+let first_radio = Radio::new(first_config, first_lr1121, &first_queue, &first_control)?;
+
+let second_queue = RadioQueue::new();
+let second_control = RadioControl::new();
+let second_radio = Radio::new(second_config, second_lr1121, &second_queue, &second_control)?;
+```
+
+This explicit ownership makes dependencies visible and permits separate queues for separate radios. Producers must be given the correct queue reference; a packet forwarded by one radio should be enqueued on that same radio's queue.
 
 Example using the band-aware path before starting the worker:
 
@@ -111,9 +139,12 @@ let packet = PacketData::new(
     DEFAULT_HOP_LIMIT,
 )?;
 
+let radio_queue = RadioQueue::new();
+let radio_control = RadioControl::new();
+let radio = Radio::new(radio_config, lr1121, &radio_queue, &radio_control)?;
 radio.send_packet(&packet)?;
 radio.run_worker(None, async |packet| {
-    PacketHandler::handle_packet(packet, &mut storage, &mut flash_buffer).await;
+    PacketHandler::handle_packet(packet, &radio_queue, &mut storage, &mut flash_buffer).await;
 }).await?;
 ```
 
@@ -124,7 +155,7 @@ radio.run_worker(None, async |packet| {
 | Ordering | FIFO. Packets transmit in enqueue order. |
 | TX burst | The worker sends two queued packets, then listens for up to 500 ms before sending the next two. S-band skips the RX window because it is TX-only. |
 | Capacity | 16 encoded packets, plus at most one packet already in flight. |
-| Backpressure | `Radio::send_packet` returns `TxQueueFull`; `queue::add_packet` returns `QueueError::Full`. |
+| Backpressure | `Radio::send_packet` returns `TxQueueFull`; `RadioQueue::add_packet` returns `QueueError::Full`. |
 | Retries | None. A failed TX does not re-enqueue the packet. |
 | Priority | None. There is no priority ordering. |
 | Emergency bypass | None at the `Radio` layer. Low-level `Lr1121` TX commands exist but are unsupported outside the worker. |
@@ -132,13 +163,13 @@ radio.run_worker(None, async |packet| {
 | Persistence | None. Queued packets are lost on reset. |
 | In-flight packet | Counted by `tx_in_flight`; `pending_tx_packets` includes it. |
 
-`queue::add_packet` is public because `main.rs` uses it for the test producer after `Radio` has moved into the worker. Application code should prefer `Radio::send_packet` whenever it still has a `Radio` value.
+`RadioQueue::add_packet` is public because application tasks and the packet forwarder need to enqueue after `Radio` has moved into the worker. Application code should prefer `Radio::send_packet` whenever it still has a `Radio` value, since it also checks the active band's packet limit before enqueueing.
 
 The queue stores encoded packets, not messages. The firmware does not split a large message into fragments and does not reassemble fragments. A caller that wants a 10-fragment message must create 10 `PacketData` values with the same `message_id`, `fragment_count = 10`, and `fragment_index` values `0..=9`, then enqueue all 10.
 
 With an empty queue, capacity 16 accepts all 10 fragments in one producer burst. The worker sends them FIFO and opens a short RX window after fragments 2, 4, 6, and 8; after fragment 10 the queue is empty, so it returns to normal RX. This window is not an acknowledgement and is not synchronized with the receiver. It only gives the radio a chance to hear traffic during a long transmit burst.
 
-If a producer enqueues faster than the radio drains the queue, `Full` is returned. The producer must wait and retry later; the firmware does not buffer an unbounded message or apply backpressure by blocking `queue::add_packet`. A message with more than 16 fragments cannot be fully queued at once unless the queue capacity is raised or the producer refills it between transmissions.
+If a producer enqueues faster than the radio drains its queue, `Full` is returned. The producer must wait and retry later; the firmware does not buffer an unbounded message or apply backpressure by blocking `RadioQueue::add_packet`. A message with more than 16 fragments cannot be fully queued at once unless the queue capacity is raised or the producer refills it between transmissions.
 
 ### Emergency and Priority Sends
 
@@ -180,7 +211,7 @@ The receive-side cache deduplicates on `(from, packet_id)` before forwarding or 
 - Enters XOSC standby and selects the LoRa or LR-FHSS packet type.
 - For sub-GHz, calibrates image rejection over the configured frequency +/-10 MHz in 4 MHz steps.
 - Sets RF frequency and the matching RSSI calibration table.
-- Configures LoRa modulation/packet parameters and private sync word `0x12`, or the LR-FHSS modulation profile.
+- Configures LoRa modulation/packet parameters and the `RadioConfig::lora_sync_word` value (default `0x12`), or the LR-FHSS modulation profile.
 - Configures the PA, TX power, and 48 us ramp.
 - Selects RC-standby fallback, disables RX boost, clears IRQs, and routes TX/RX/error/timeout IRQs to DIO9.
 
@@ -195,16 +226,21 @@ Example profile from `main.rs`:
 ```rust
 let radio_config = RadioConfig {
     frequency_band: FrequencyBand::SubGhz,
+    lora_sync_word: 0x12,
     bandwidth: LoRaBandwidth::Khz125,
     pa_mode: PaMode::HighPower,
     tx_power_dbm: 22,
     ..RadioConfig::new(869_400_000)
 };
 
-let radio = Radio::new(radio_config, lr1121)?;
+let radio_queue = RadioQueue::new();
+let radio_control = RadioControl::new();
+let radio = Radio::new(radio_config, lr1121, &radio_queue, &radio_control)?;
 ```
 
 `RadioConfig::new(frequency_hz)` selects a band from the frequency and supplies defaults. Set the band-specific fields explicitly when the default is not the desired profile. `validate` rejects out-of-band frequencies, unsupported bandwidth/band combinations, PA mismatches, invalid power, spreading factors outside 5-12, and a zero preamble.
+
+For a separate LoRa network, set `lora_sync_word` to the same value on every radio in that network. The field defaults to private sync word `0x12`; `0x34` is the public LoRaWAN sync word. The LR-FHSS S-band profile uses its own fixed sync word and ignores this LoRa setting.
 
 ## Bands and Limits
 
@@ -226,17 +262,22 @@ The current S-band LR-FHSS profile uses GMSK, 136.72 kHz bandwidth, 5/6 coding r
 
 ## Live Retuning
 
-`Radio::set_frequency(frequency_hz)` retunes directly only when the radio is idle; it returns `RadioBusy` while TX is active or packets remain queued. If RX was active, it stops RX, reconfigures the band/modem/PA, and resumes RX where supported.
+`Radio::set_frequency(frequency_hz)` retunes directly only when the radio is idle; it returns `RadioBusy` while TX is active or packets remain queued. If RX was active, it stops RX, reconfigures the band/modem/PA, and resumes RX where supported. Use this direct method before the worker takes ownership of the radio.
 
-The worker owns the radio after `run_worker` begins. From another task, call the module function to enqueue a local retune request:
+After `run_worker` begins, the worker owns the radio and is the only task that can operate its hardware. To request a retune from another task, use the same `RadioControl` that was passed to `Radio::new`:
 
 ```rust
-use crate::radio::radio::request_frequency_change;
+use crate::radio::control::RadioControl;
 
-request_frequency_change(2_450_000_000)?;
+// Use the same control channel that was passed to Radio::new for this radio.
+radio_control.request_frequency_change(2_450_000_000)?;
 ```
 
-The request channel holds one pending change. The worker applies it between operations. This function changes only this device's local radio; it does not transmit a `FrequencyChange` packet or coordinate peers. `PacketType::FrequencyChange` is currently just a wire enum variant.
+The call checks that the frequency is inside a firmware-supported `FrequencyBand` and puts the request in that radio's control channel. It does not retune the hardware before it returns. Each control channel holds one pending request; if it is already full, the call returns `RadioBusy`. An out-of-range frequency returns `InvalidConfiguration`.
+
+When the worker receives the request, it applies it between radio operations, with no transmission in flight. It stops RX if RX is active, switches the LR1121 frequency and band configuration, and resumes RX if it was previously active and the new band supports receiving. S-band is transmit-only, so the worker does not resume RX there. The worker also picks settings supported by the new band: it changes an incompatible LoRa bandwidth to 125 kHz and selects an appropriate PA mode and power limit. Pending packets still go through this same worker; packets sent after the retune use the new frequency.
+
+`Ok(())` means the request was accepted into the control channel, not that the hardware retune has already succeeded. Hardware errors occur later in the worker and are returned from `run_worker`. A local retune changes only this radio; it does not transmit a `FrequencyChange` packet, tell peers to follow, or confirm that another device is listening on the new frequency. `PacketType::FrequencyChange` is currently just a wire enum variant without an implemented handler.
 
 The firmware now configures the LR1121 RF switch, TCXO, sub-GHz image calibration, and per-frequency RSSI calibration. Before using a non-default band, still verify the board's antenna/front end, actual supported frequency range, and local regulations. In particular, the Rust S-band range starts at 1.9 GHz, while the Waveshare board reference uses 2.0-2.1 GHz; keep both ends of a link inside a range the hardware actually supports.
 

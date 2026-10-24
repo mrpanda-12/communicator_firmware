@@ -9,7 +9,7 @@ Startup currently:
 1. Initializes the ESP32-S3 at the maximum CPU clock and starts the Embassy runtime.
 2. Initializes the ILI9341 on hardware SPI3 (GPIO12 SCK, GPIO11 MOSI) at 10 MHz. SPI2 is used by the LR1121. Settings and application data use the dedicated internal-flash partition; there is no SD-card backend or second-core storage worker.
 3. Configures the radio SPI/control pins through `hardware/pinout.rs` and constructs `Lr1121`. The driver performs a hard reset and system startup: SPI CRC off, DCDC regulator, board RF switch, 3.0 V TCXO, 32.768 kHz crystal LFCLK, XOSC standby, full calibration, and IRQ/error clearing.
-4. `Radio::new` applies the sub-GHz LoRa profile at 869.4 MHz, including image calibration, RSSI calibration, modem/packet parameters, private sync word `0x12`, HP PA, 22 dBm TX power, 48 us ramp, RC-standby fallback, and DIO9 IRQ routing.
+4. `Radio::new` applies the sub-GHz LoRa profile at 869.4 MHz, including image calibration, RSSI calibration, modem/packet parameters, configured LoRa sync word (default `0x12`), HP PA, 22 dBm TX power, 48 us ramp, RC-standby fallback, and DIO9 IRQ routing.
 5. Starts GPS polling on UART1 (GPIO4/GPIO5) and publishes compact location/time snapshots to the UI through an Embassy watch.
 6. Starts the radio worker alongside a diagnostic producer that queues an unencrypted broadcast text test packet every 30 seconds. This is not a user chat send path and does not save chat history.
 7. Starts the display UI task. It currently renders screens and tracks logical UI state; physical button input, chat sending and flash-backed conversation rendering are not connected yet.
@@ -46,8 +46,9 @@ See the [HF-Kit peripheral pinout](pinout.md) for GPS, SPI TFT, and MCP23017 wir
 | `packet/packet_encoder.rs` | Serializes packet fields to the wire format. |
 | `packet/packet_decoder.rs` | Parses and validates the fixed header and payload. |
 | `packet/packet_type.rs` | Packet type byte assignments and conversion from a wire byte. |
-| `radio/queue.rs` | Static FIFO TX queue (16 encoded packets) and one pending local frequency-change request. No priority, emergency bypass, retries, persistence, or duplicate suppression. |
-| `radio/radio.rs` | Applies per-band hardware configuration, queues TX, services RX/TX IRQs, enforces a 30 s TX timeout, listens for up to 500 ms after every two queued transmissions, and retunes on worker requests. It sets the private LoRa sync word and routes IRQs to DIO9. |
+| `radio/queue.rs` | Per-radio FIFO TX queue (16 encoded packets). No priority, emergency bypass, retries, persistence, or duplicate suppression. |
+| `radio/control.rs` | Per-radio control channel for one pending local frequency-change request. It does not carry network packets. |
+| `radio/radio.rs` | Applies per-band hardware configuration including the configured LoRa sync word, queues TX, services RX/TX IRQs, enforces a 30 s TX timeout, listens for up to 500 ms after every two queued transmissions, and retunes on worker requests. It routes IRQs to DIO9. |
 | `radio/types/` | Configuration and value types for bands, PA paths, LoRa bandwidth/coding rate, the S-band LR-FHSS profile, and status values. |
 | `hardware/flash.rs` | Internal-flash settings, contacts, and indexed message persistence over `sequential-storage`. |
 | `storage/settings.rs` | Internal namespaced key serialization for settings and contacts. |
@@ -73,9 +74,9 @@ The build is verified for `xtensa-esp32s3-none-elf`; the linker currently emits 
 - LR1121 system startup, the board RF switch, TCXO/LFCLK setup, sub-GHz image calibration, RSSI calibration, PA selection, and DIO9 IRQ routing are implemented in code.
 - LR-FHSS is transmit-only in this firmware. S-band RX is rejected/not started.
 - `main.rs` starts RX and a 30-second sub-GHz test transmitter. A second board with the same frequency, modem, and sync word is required to observe received packets.
-- All TX uses a single FIFO queue (capacity 16). The worker listens for up to 500 ms after every two queued transmissions on bands that support RX. There is no public direct-radio send path, priority class, or emergency bypass. Retries and fragmentation/reassembly are not implemented.
+- Each radio uses its own FIFO queue (capacity 16). The worker listens for up to 500 ms after every two queued transmissions on bands that support RX. There is no public direct-radio send path, priority class, or emergency bypass. Retries and fragmentation/reassembly are not implemented.
 - `FrequencyChange` is only a packet type. It has no announcement payload schema, handler, acceptance flow, or automatic retune behavior.
-- A local `request_frequency_change` is separate from the `FrequencyChange` wire packet.
+- `RadioControl::request_frequency_change` is a local worker command, separate from the `FrequencyChange` wire packet.
 - AES-256-GCM primitives exist in `crypto/mod.rs`. An `is_encrypted` flag still does not encrypt or authenticate data by itself because the packet path does not call them.
 - Fragmentation/reassembly, contact-based authorization, local message delivery, outgoing chat sends, and saving received/sent messages are not implemented. Hop-limited forwarding and volatile duplicate suppression are implemented.
 - Flash storage and device identity are initialized by `main`; the test producer uses the ID for test packets. Settings, contacts and message-history APIs exist, but message append/read is not integrated into a chat flow yet.

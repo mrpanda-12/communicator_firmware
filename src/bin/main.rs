@@ -11,7 +11,7 @@ pub mod radio;
 pub mod storage;
 pub mod ui;
 
-static GPS_SNAPSHOT: Watch<CriticalSectionRawMutex, ui::GpsSnapshot, 1> = Watch::new();
+static GPS_SNAPSHOT: Watch<CriticalSectionRawMutex, ui::GpsSnapshot, 2> = Watch::new();
 
 use crate::{
     hardware::{flash::FlashStore, gps::Gps, lr1121::lr1121::Lr1121, pinout},
@@ -21,7 +21,8 @@ use crate::{
         packet_type::PacketType,
     },
     radio::{
-        queue,
+        control::RadioControl,
+        queue::RadioQueue,
         radio::Radio,
         types::{FrequencyBand, LoRaBandwidth, PaMode, RadioConfig},
     },
@@ -35,8 +36,6 @@ use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
 // Keep esp-println's defmt-espflash global logger linked for defmt output.
-#[allow(unused_imports)]
-use esp_println::defmt as _;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
@@ -49,6 +48,8 @@ use esp_hal::{
     time::Rate,
     timer::timg::TimerGroup,
 };
+#[allow(unused_imports)]
+use esp_println::defmt as _;
 
 extern crate alloc;
 
@@ -132,7 +133,7 @@ async fn initialize_storage(
     (storage, device_id)
 }
 
-fn init_radio(
+fn init_radio<'q>(
     spi2: peripherals::SPI2<'static>,
     gpio40: peripherals::GPIO40<'static>,
     gpio45: peripherals::GPIO45<'static>,
@@ -141,7 +142,9 @@ fn init_radio(
     gpio41: peripherals::GPIO41<'static>,
     gpio39: peripherals::GPIO39<'static>,
     gpio38: peripherals::GPIO38<'static>,
-) -> Radio<'static, Spi<'static, esp_hal::Blocking>> {
+    radio_queue: &'q RadioQueue,
+    radio_control: &'q RadioControl,
+) -> Radio<'static, 'q, Spi<'static, esp_hal::Blocking>> {
     let radio_pins = pinout::radio_pins(gpio40, gpio45, gpio46, gpio42, gpio41, gpio39, gpio38);
 
     let spi = Spi::new(
@@ -172,7 +175,8 @@ fn init_radio(
         ..RadioConfig::new(869_400_000)
     };
 
-    Radio::new(radio_config, lr1121).expect("Failed to configure LR1121")
+    Radio::new(radio_config, lr1121, radio_queue, radio_control)
+        .expect("Failed to configure LR1121")
 }
 
 fn init_gps(
@@ -195,7 +199,7 @@ async fn gps_task(mut gps: Gps<'static>) -> ! {
             GPS_SNAPSHOT.sender().send(snapshot);
             published = snapshot;
         }
-        Timer::after(Duration::from_millis(250)).await;
+        Timer::after(Duration::from_millis(20)).await;
     }
 }
 
@@ -240,6 +244,8 @@ async fn main(_spawner: Spawner) -> ! {
     );
     let _display_backlight = Output::new(peripherals.GPIO7, Level::High, OutputConfig::default());
 
+    let radio_queue = RadioQueue::new();
+    let radio_control = RadioControl::new();
     let radio = init_radio(
         peripherals.SPI2,
         peripherals.GPIO40,
@@ -249,17 +255,19 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO41,
         peripherals.GPIO39,
         peripherals.GPIO38,
+        &radio_queue,
+        &radio_control,
     );
     let gps = init_gps(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5);
 
     let mut packet_handler = PacketHandler::new();
     let radio_worker = radio.run_worker(None, async |packet| {
         packet_handler
-            .handle_packet(packet, &mut storage, &mut flash_buffer)
+            .handle_packet(packet, &radio_queue, &mut storage, &mut flash_buffer)
             .await;
     });
     let gps_fut = gps_task(gps);
-    let test_packet_producer = async move {
+    let test_packet_producer = async {
         let mut packet_id = 1u16;
 
         loop {
@@ -270,6 +278,7 @@ async fn main(_spawner: Spawner) -> ! {
             };
             defmt::info!("Device identity: {}", device_id);
             defmt::info!("Packet {:x}", packet_id);
+
             let packet = PacketData::new(
                 packet_id,
                 packet_id,
@@ -285,7 +294,7 @@ async fn main(_spawner: Spawner) -> ! {
             )
             .expect("valid test packet");
 
-            if queue::add_packet(&packet).is_err() {
+            if radio_queue.add_packet(&packet).is_err() {
                 defmt::warn!("Test packet queue is full; dropping packet");
             }
 
@@ -301,9 +310,7 @@ async fn main(_spawner: Spawner) -> ! {
             Either::Second(_) => defmt::error!("GPS task stopped"),
         }
     };
-    GPS_SNAPSHOT
-        .sender()
-        .send(ui::gps_snapshot(None, None));
+    GPS_SNAPSHOT.sender().send(ui::gps_snapshot(None, None));
     let ui_fut = ui::run(
         display,
         GPS_SNAPSHOT

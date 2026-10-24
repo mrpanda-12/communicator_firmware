@@ -76,15 +76,22 @@ impl<'d> Gps<'d> {
     // Consumes currently buffered UART bytes without waiting for new input.
     // Returns the number of bytes read; parsed sentences update the cached fix.
     pub fn poll(&mut self) -> Result<usize, RxError> {
+        let mut total = 0;
         let mut bytes = [0; UART_READ_BUFFER_SIZE];
-        let count = self.uart.read_buffered(&mut bytes)?;
 
-        for byte in &bytes[..count] {
-            self.feed_byte(*byte);
+        loop {
+            let count = self.uart.read_buffered(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+
+            total += count;
+            for byte in &bytes[..count] {
+                self.feed_byte(*byte);
+            }
         }
 
-        // Poll called outside the worker; publish is cheap if not used.
-        Ok(count)
+        Ok(total)
     }
 
     pub fn get_coordinate(&self) -> Option<Coordinate> {
