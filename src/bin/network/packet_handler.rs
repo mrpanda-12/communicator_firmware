@@ -83,7 +83,8 @@ impl PacketHandler {
 
         // Dev info
         defmt::info!(
-            "RX type={} id={} message={} encrypted={} broadcast={} addressed_here={} hops={}/{} bytes={}",
+            "RX from= {} type={} id={} message={} encrypted={} broadcast={} addressed_here={} hops={}/{} bytes={}",
+            packet.from,
             packet.packet_type as u8,
             packet.packet_id,
             packet.message_id,
@@ -106,7 +107,7 @@ impl PacketHandler {
 
         if broadcast {
             forward_packet(&mut packet);
-            todo!("Handle broadcast packet");
+            // todo!("Handle broadcast packet");
         }
 
         if !addressed_to_this_device {
@@ -114,7 +115,7 @@ impl PacketHandler {
             return;
         }
 
-        todo!("Handle packet addressed to this device")
+        // todo!("Handle packet addressed to this device")
     }
 
     // Remember a packet once and evict the oldest key when the cache fills.

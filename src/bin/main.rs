@@ -37,6 +37,7 @@ use embassy_time::{Duration, Timer};
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
+use esp_println::defmt as _;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
@@ -109,14 +110,17 @@ async fn initialize_storage<SPI>(
     sd: SdCardStorage<SPI, embassy_time::Delay>,
     trng: &Trng,
     flash_buffer: &mut [u8],
-) -> StorageManager<'static, SPI, embassy_time::Delay>
+) -> (StorageManager<'static, SPI, embassy_time::Delay>, Option<[u8; 16]>)
 where
     SPI: SpiDevice<u8>,
 {
     let mut storage = StorageManager::from_backends(flash, sd);
 
-    match storage.load_device_id(flash_buffer).await {
-        Ok(Some(_)) => defmt::info!("Loaded device identity from internal flash"),
+    let device_id = match storage.load_device_id(flash_buffer).await {
+        Ok(Some(device_id)) => {
+            defmt::info!("Loaded device identity from internal flash");
+            Some(device_id)
+        }
         Ok(None) => match storage
             .regenerate_device_id(flash_buffer, |id| {
                 trng.read(id);
@@ -124,13 +128,22 @@ where
             })
             .await
         {
-            Ok(_) => defmt::info!("Generated and saved first-boot device identity"),
-            Err(_) => defmt::error!("Failed to create and persist device identity"),
+            Ok(device_id) => {
+                defmt::info!("Generated and saved first-boot device identity");
+                Some(device_id)
+            }
+            Err(_) => {
+                defmt::error!("Failed to create and persist device identity");
+                None
+            }
         },
-        Err(_) => defmt::error!("Could not load device identity from internal flash"),
-    }
+        Err(_) => {
+            defmt::error!("Could not load device identity from internal flash");
+            None
+        }
+    };
 
-    storage
+    (storage, device_id)
 }
 
 fn init_radio(
@@ -222,7 +235,8 @@ async fn main(_spawner: Spawner) -> ! {
     let flash_store = init_flash_storage(peripherals.FLASH);
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
     let mut flash_buffer = [0u8; 256];
-    let mut storage = initialize_storage(flash_store, sd_store, &trng, &mut flash_buffer).await;
+    let (mut storage, device_id) =
+        initialize_storage(flash_store, sd_store, &trng, &mut flash_buffer).await;
 
     let radio = init_radio(
         peripherals.SPI2,
@@ -243,18 +257,23 @@ async fn main(_spawner: Spawner) -> ! {
             .await;
     });
     let gps_fut = gps_task(gps);
-
-    let test_packet_producer = async {
+    let test_packet_producer = async move {
         let mut packet_id = 1u16;
 
         loop {
+            let Some(device_id) = device_id else {
+                defmt::warn!("Skipping test packet: device identity is unavailable");
+                Timer::after(Duration::from_secs(30)).await;
+                continue;
+            };
+            defmt::info!("Device identity: {}", device_id);
             defmt::info!("Packet {:x}", packet_id);
             let packet = PacketData::new(
                 packet_id,
                 packet_id,
                 0,
                 1,
-                [1; 16],
+                device_id,
                 [0; 16],
                 false,
                 PacketType::Text,
