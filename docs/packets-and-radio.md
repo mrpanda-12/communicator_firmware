@@ -112,7 +112,9 @@ let packet = PacketData::new(
 )?;
 
 radio.send_packet(&packet)?;
-radio.run_worker(None, PacketHandler::handle_packet).await?;
+radio.run_worker(None, async |packet| {
+    PacketHandler::handle_packet(packet, &mut storage, &mut flash_buffer).await;
+}).await?;
 ```
 
 ### Queue Behavior
@@ -126,7 +128,7 @@ radio.run_worker(None, PacketHandler::handle_packet).await?;
 | Retries | None. A failed TX does not re-enqueue the packet. |
 | Priority | None. There is no priority ordering. |
 | Emergency bypass | None at the `Radio` layer. Low-level `Lr1121` TX commands exist but are unsupported outside the worker. |
-| Duplicate suppression | None. Identical packets or repeated `packet_id` values are queued separately. |
+| Duplicate suppression | RX handler keeps the 64 most recently seen `(sender ID, packet_id)` pairs in RAM; TX queue still accepts duplicate packets. |
 | Persistence | None. Queued packets are lost on reset. |
 | In-flight packet | Counted by `tx_in_flight`; `pending_tx_packets` includes it. |
 
@@ -153,13 +155,13 @@ These are design requirements, not implemented capabilities.
 
 ## Receiving, Forwarding, and Duplicates
 
-The worker reads RX buffer status and bytes, clears the IRQ, and passes the raw encoded packet to the callback. `PacketHandler::handle_packet` decodes the packet, prints its type/IDs/hop count, and prints the payload as UTF-8 or hexadecimal bytes. Invalid packets are logged without panicking.
+The worker reads RX buffer status and bytes, clears the IRQ, restarts RX, and passes the raw encoded packet to its async callback. `PacketHandler::handle_packet` decodes the packet, loads this device's ID from `StorageManager`, and checks a 64-entry RAM cache keyed by `(sender ID, packet_id)`. Duplicate packets are dropped before forwarding. Broadcasts are forwarded and reach the broadcast handling TODO; unicast packets for another device are forwarded and then ignored locally; packets addressed to this device reach the local handling TODO. Invalid packets and identity-load failures are logged without panicking.
 
 RX is single-packet mode (`set_rx(0)`), and the worker restarts RX after each packet or error. Header errors, CRC errors, and non-RX IRQs clear the pending IRQ and restart RX.
 
-Duplicate detection and forwarding are not implemented. `network::packet_router` is empty, and `PacketHandler` processes every valid received packet without checking whether it has already seen it.
+Duplicate detection in the receive handler and basic hop-limited forwarding are implemented. The 64-entry cache is volatile, so a reset clears it; an old packet can be accepted again after its key is evicted. `network::packet_router` remains empty, and local application handling is still a TODO.
 
-The intended receive-side rule is documented in the protocol specification: deduplicate on `(from, packet_id)` before local delivery or forwarding, then forward only if `hop_limit` is nonzero. Deduplication must not be applied at TX enqueue time: retries intentionally reuse `packet_id`, and the queue must be able to carry a retry after the original frame was lost. The current queue therefore keeps duplicate packets, and the receiver-side cache still has to be implemented.
+The receive-side cache deduplicates on `(from, packet_id)` before forwarding or local delivery, then forwards only if `hop_limit` is nonzero. Deduplication is not applied at TX enqueue time: retries can reuse `packet_id`, and the queue remains able to carry them. A retry received by a node while its key remains cached will be dropped, so reliable retry/acknowledgement behavior still needs a more specific policy.
 
 ## LR1121 Hardware Setup
 

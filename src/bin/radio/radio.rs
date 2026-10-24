@@ -1,3 +1,5 @@
+use core::ops::AsyncFnMut;
+
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use embedded_hal::spi::SpiBus;
@@ -180,7 +182,7 @@ where
         mut on_packet_received: F,
     ) -> Result<(), RadioError>
     where
-        F: FnMut(Packet),
+        F: AsyncFnMut(Packet),
     {
         match (self.config.implicit_header, implicit_rx_payload_len) {
             (false, None) => self.rx_payload_len = None,
@@ -245,14 +247,14 @@ where
             {
                 Either::First(Either::First(packet)) => {
                     if self.rx_active && self.lr1121.irq_is_high() {
-                        self.process_rx(&mut on_packet_received)?;
+                        self.process_rx(&mut on_packet_received).await?;
                     }
 
                     self.start_transmit(&packet)?;
                 }
 
                 Either::First(Either::Second(())) => {
-                    self.process_rx(&mut on_packet_received)?;
+                    self.process_rx(&mut on_packet_received).await?;
 
                     if self.lr1121.irq_is_high() {
                         self.lr1121.wait_for_irq_low().await;
@@ -313,7 +315,7 @@ where
         on_packet_received: &mut F,
     ) -> Result<(), RadioError>
     where
-        F: FnMut(Packet),
+        F: AsyncFnMut(Packet),
     {
         self.tx_burst_count = 0;
         self.start_rx_internal()?;
@@ -321,7 +323,7 @@ where
         match select(self.lr1121.wait_for_irq(), Timer::after(RX_WINDOW)).await {
             Either::First(()) => {
                 if self.lr1121.irq_is_high() {
-                    self.process_rx(on_packet_received)?;
+                    self.process_rx(on_packet_received).await?;
                 }
             }
             Either::Second(()) => {}
@@ -411,9 +413,9 @@ where
     }
 
     // Reads a received packet and passes its encoded bytes to the callback.
-    pub fn process_rx<F>(&mut self, mut on_packet_received: F) -> Result<bool, RadioError>
+    pub async fn process_rx<F>(&mut self, mut on_packet_received: F) -> Result<bool, RadioError>
     where
-        F: FnMut(Packet),
+        F: AsyncFnMut(Packet),
     {
         if !self.rx_active || self.tx_in_flight {
             return Ok(false);
@@ -464,8 +466,9 @@ where
             })?;
 
         self.lr1121.clear_irq(irq)?;
-        on_packet_received(packet);
         self.lr1121.set_rx(0)?;
+        self.rx_active = true;
+        on_packet_received(packet).await;
 
         Ok(true)
     }

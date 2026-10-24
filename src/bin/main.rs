@@ -103,28 +103,17 @@ fn init_trng(
     (source, trng)
 }
 
-/// 4/ Load persistent defaults and create a device ID only on first boot.
+/// 4/ Load the device ID and create it only when the flash store has no ID.
 async fn initialize_storage<SPI>(
-    storage: &mut StorageManager<'static, SPI, embassy_time::Delay>,
+    flash: FlashStore<'static>,
+    sd: SdCardStorage<SPI, embassy_time::Delay>,
     trng: &Trng,
     flash_buffer: &mut [u8],
-) where
+) -> StorageManager<'static, SPI, embassy_time::Delay>
+where
     SPI: SpiDevice<u8>,
 {
-    match storage
-        .get_setting::<u8>("display_brightness", flash_buffer)
-        .await
-    {
-        Ok(Some(_)) => defmt::info!("Loaded display_brightness from internal flash"),
-        Ok(None) => match storage
-            .set_setting("display_brightness", &80u8, flash_buffer)
-            .await
-        {
-            Ok(()) => defmt::info!("Saved default display_brightness to internal flash"),
-            Err(_) => defmt::error!("Could not persist default display_brightness"),
-        },
-        Err(_) => defmt::error!("Could not read display_brightness from internal flash"),
-    }
+    let mut storage = StorageManager::from_backends(flash, sd);
 
     match storage.load_device_id(flash_buffer).await {
         Ok(Some(_)) => defmt::info!("Loaded device identity from internal flash"),
@@ -140,6 +129,8 @@ async fn initialize_storage<SPI>(
         },
         Err(_) => defmt::error!("Could not load device identity from internal flash"),
     }
+
+    storage
 }
 
 fn init_radio(
@@ -229,10 +220,9 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO6,
     );
     let flash_store = init_flash_storage(peripherals.FLASH);
-    let mut storage = StorageManager::from_backends(flash_store, sd_store);
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
     let mut flash_buffer = [0u8; 256];
-    initialize_storage(&mut storage, &trng, &mut flash_buffer).await;
+    let mut storage = initialize_storage(flash_store, sd_store, &trng, &mut flash_buffer).await;
 
     let radio = init_radio(
         peripherals.SPI2,
@@ -246,7 +236,12 @@ async fn main(_spawner: Spawner) -> ! {
     );
     let gps = init_gps(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5);
 
-    let radio_worker = radio.run_worker(None, |packet| PacketHandler::handle_packet(packet));
+    let mut packet_handler = PacketHandler::new();
+    let radio_worker = radio.run_worker(None, async |packet| {
+        packet_handler
+            .handle_packet(packet, &mut storage, &mut flash_buffer)
+            .await;
+    });
     let gps_fut = gps_task(gps);
 
     let test_packet_producer = async {
