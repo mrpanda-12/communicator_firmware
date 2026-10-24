@@ -7,11 +7,11 @@ This is a `no_std`, `no_main` ESP32-S3 firmware using `esp-hal` and Embassy. The
 Startup currently:
 
 1. Initializes the ESP32-S3 at the maximum CPU clock and starts the Embassy runtime.
-2. Reserves GPIO27-GPIO32, then creates SPI2 for the LR1121 at 1 MHz, SPI mode 0.
+2. Creates SPI3 for the SD card on GPIO13-GPIO15 with chip select GPIO6, initializes persistent storage, then creates SPI2 for the LR1121 at 1 MHz, SPI mode 0.
 3. Configures the radio SPI/control pins through `hardware/pinout.rs` and constructs `Lr1121`. The driver performs a hard reset and system startup: SPI CRC off, DCDC regulator, board RF switch, 3.0 V TCXO, 32.768 kHz crystal LFCLK, XOSC standby, full calibration, and IRQ/error clearing.
 4. `Radio::new` applies the sub-GHz LoRa profile at 869.4 MHz, including image calibration, RSSI calibration, modem/packet parameters, private sync word `0x12`, HP PA, 22 dBm TX power, 48 us ramp, RC-standby fallback, and DIO9 IRQ routing.
 5. Leaves UART1 on GPIO4/GPIO5 available for GPS via `pinout::gps_pins()`; GPS is not started by `main.rs`.
-6. Starts the radio worker alongside a test producer that queues a broadcast `Text` packet every 30 seconds.
+6. Starts the radio worker alongside a test producer that queues broadcast `Text` packets after randomized intervals to reduce collisions between devices running the same test firmware.
 
 Radio pin assignment (configured through `hardware/pinout.rs`):
 
@@ -36,7 +36,7 @@ See the [HF-Kit peripheral pinout](pinout.md) for GPS, SPI TFT, and MCP23017 wir
 | `hardware/pinout.rs` | Board wiring and constructors for the configured radio control pins, GPS UART pins, and future display/button-expander GPIO constants. |
 | `hardware/gps.rs` | Nonblocking UART1 polling and NMEA GGA/RMC parsing. Hold a `Gps` object, call `update()` to drain UART, read `coordinate`/`time` fields. No PPS support. |
 | `crypto/mod.rs` | Software AES-256-GCM `derive_key`, `encrypt`, and `decrypt` free functions. Nonces use the ESP-HAL RNG. Packet encoding does not call these yet. |
-| `device/identity.rs` | Loads or explicitly regenerates a 16-byte device ID with ESP-HAL `Trng`, persisting it as the `device_id` setting. Not called by `main` yet. |
+| `storage/storage_manager.rs` | Routes application storage operations; loads or explicitly regenerates the flash-backed device ID and selects message history location from `message_storage_location`. |
 | `hardware/display.rs` | Empty; no display driver is implemented. |
 | `hardware/lr1121/lr1121.rs` | SPI transport, reset/BUSY/IRQ handling, system startup, RF-switch/TCXO/LFCLK setup, image and RSSI calibration, modem/PA/TX/RX commands, and LR-FHSS frame building. |
 | `hardware/lr1121/opcode.rs` | Typed LR1121 system, radio, packet, and LR-FHSS opcodes used by the driver. |
@@ -49,7 +49,7 @@ See the [HF-Kit peripheral pinout](pinout.md) for GPS, SPI TFT, and MCP23017 wir
 | `radio/queue.rs` | Static FIFO TX queue (16 encoded packets) and one pending local frequency-change request. No priority, emergency bypass, retries, persistence, or duplicate suppression. |
 | `radio/radio.rs` | Applies per-band hardware configuration, queues TX, services RX/TX IRQs, enforces a 30 s TX timeout, listens for up to 500 ms after every two queued transmissions, and retunes on worker requests. It sets the private LoRa sync word and routes IRQs to DIO9. |
 | `radio/types/` | Configuration and value types for bands, PA paths, LoRa bandwidth/coding rate, the S-band LR-FHSS profile, and status values. |
-| `storage/flash.rs` | Typed settings and contact persistence over `sequential-storage` and ESP flash. |
+| `hardware/flash.rs` | Internal-flash settings, contacts, and indexed message persistence over `sequential-storage`. |
 | `storage/settings.rs` | Internal namespaced key serialization for settings and contacts. |
 | `storage/contact.rs` | Fixed-width contact serialization. Stores a derived 32-byte key instead of a password; the key is not encrypted by this type. |
 
@@ -83,3 +83,8 @@ The build is verified for `xtensa-esp32s3-none-elf`; the linker currently emits 
 
 ## Message Storage
 `storage/message.rs` defines `StoredMessage`, `MessageKind` (Text/Coords), and `MAX_MESSAGES_PER_CONVO` (50). `FlashStore` persists messages per device ID (DMs) and broadcast separately. This enables chat history with capped history and fast loading per conversation.
+
+
+## Storage Layout
+- **Internal Flash only**: Device identity, contacts (with pairwise keys), and critical settings. Accessed via `hardware/flash.rs` (`FlashStore`).
+- **Selectable**: Messages/conversations route through `storage/storage_manager.rs` (internal flash or SD card via `hardware/sdcard.rs`). SD uses SPI3 on GPIO13-15 with GPIO6 chip select and a fixed timestamp source.

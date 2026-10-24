@@ -70,7 +70,7 @@ Use a separate SPI controller from the LR1121. `SPI3` is the proposed ESP-HAL pe
 | 3V3 | VCC / logic supply | Prefer 3.3 V. Check the specific TFT breakout's power and logic-level circuit. |
 | GND | GND | Common ground. |
 
-The TFT's microSD socket is intentionally left unused in this plan. If enabled later, share SCLK/MOSI/MISO with the display but assign a separate SD chip-select and ensure both chip-selects remain inactive while the other device is used. GPIO6 is currently left available and could be used for microSD CS.
+The TFT's microSD socket can be used with SPI storage. GPIO13/14/15 provide SCK/MOSI/MISO and GPIO6 is used for microSD CS. Storage can be selected between internal flash and SD card via `StorageManager`.
 
 ### MCP23017 Button Matrix
 
@@ -105,21 +105,23 @@ Firmware can idle all columns as low outputs so a pressed key pulls a row low an
 | 1-3 | Spare / ADC-capable. |
 | 4 | GPS UART1 RX. |
 | 5 | GPS UART1 TX. |
-| 6 | Spare; usable for microSD CS. |
+| 6 | MicroSD CS. |
 | 7 | TFT backlight enable. |
 | 8 | TFT reset. |
 | 9 | TFT D/C. |
 | 10 | TFT CS. |
 | 11 | TFT MOSI. |
 | 12 | TFT SCLK. |
-| 13-15 | Spare / ADC-capable. |
+| 13 | MicroSD SCK (SPI storage). |
+| 14 | MicroSD MOSI (SPI storage). |
+| 15 | MicroSD MISO (SPI storage). |
 | 16 | MCP23017 interrupt. |
 | 17 | I2C SDA to MCP23017. |
 | 18 | I2C SCL to MCP23017. |
 | 38-42, 45-46 | LR1121 signals; do not reassign. |
 | 43-44 | UART0; retain for console/programming. |
 
-GPIO27-GPIO32 are claimed in `main.rs` but are not in the supplied 21-pin list. Do not rely on them as accessible expansion GPIOs; verify their module flash/PSRAM use before changing those claims.
+GPIO27-GPIO32 are not used by the current application. They are not in the supplied 21-pin list, so verify module flash/PSRAM use and board access before assigning them.
 
 ## Bring-Up Plan
 

@@ -45,6 +45,8 @@ heapless = "0.9.3"
 embedded-hal = "1.0.0"
 embassy-sync = "0.6.2"
 embassy-futures = "0.1.2"
+embedded-sdmmc = { version = "0.10.0", default-features = false }
+embedded-hal-bus = "0.3.0"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

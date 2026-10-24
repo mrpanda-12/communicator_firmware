@@ -4,7 +4,7 @@ This directory documents the current firmware implementation. Start with:
 
 - [Architecture and modules](architecture.md): startup, source map, implemented behavior, and build command.
 - [Packets and radio](packets-and-radio.md): packet layout, construction, TX queue, radio setup, bands, and retuning.
-- [Storage and identity](storage-and-identity.md): flash partition requirements, typed settings, contacts, and device IDs.
+- [Storage and identity](storage-and-identity.md): storage routing, flash partition requirements, SD message logs, settings, contacts, and device IDs.
 - [Pinout plan](pinout.md): GPS wiring and driver usage, plus proposed ILI9341 TFT and MCP23017 wiring while preserving LR1121 and UART0 pins.
 
 ## Current Radio Status

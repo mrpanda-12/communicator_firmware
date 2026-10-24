@@ -8,7 +8,7 @@
 | 2.4 GHz LoRa, 2.4-2.5 GHz | Yes | Yes | Requires an explicit 2.4 GHz `RadioConfig`; it is not the current `main.rs` default. |
 | S-band LR-FHSS, 1.9-2.1 GHz | Yes | No | The LR1121 User Manual states its LR-FHSS implementation is transmit-only. S-band also has no LoRa mode, so S-band RX is rejected. |
 
-By default, `main.rs` starts RX and queues a broadcast `Text` packet every 30 seconds. A link requires two boards with the same frequency, spreading factor, bandwidth, coding rate, preamble, header mode, CRC setting, and sync word. The firmware uses the private LoRa sync word `0x12`; the public LoRaWAN value is `0x34`, so LoRaWAN devices do not decode these packets.
+By default, `main.rs` starts RX and queues a broadcast `Text` test packet every 30 seconds. A link requires two boards with the same frequency, spreading factor, bandwidth, coding rate, preamble, header mode, CRC setting, and sync word. The firmware uses the private LoRa sync word `0x12`; the public LoRaWAN value is `0x34`, so LoRaWAN devices do not decode these packets.
 
 The build is verified, but no two-board RF test is recorded. Antenna connection, RF-switch behavior, range, and peer interoperability still require bench verification.
 
