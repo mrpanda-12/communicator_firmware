@@ -35,7 +35,8 @@ pub fn add_packet(packet: &PacketData) -> Result<(), QueueError> {
     }
 
     let mut encoded = [0; MAX_PACKET_SIZE];
-    let encoded_len = PacketSerializer::encode(packet, &mut encoded).map_err(QueueError::Packet)?;
+    let encoded_len =
+        PacketSerializer::serialize(packet, &mut encoded).map_err(QueueError::Packet)?;
     let packet =
         Packet::from_slice(&encoded[..encoded_len]).map_err(|_| QueueError::PacketTooLong {
             length: encoded_len,

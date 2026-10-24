@@ -22,7 +22,9 @@ These radio assignments match the current firmware in `src/bin/main.rs` and Wave
 
 The LR1121 RF switch is controlled by the radio's own DIO pins through `SetDioAsRfSwitch`; it does not require any of the external GPIOs listed below. The board front end must still physically support the selected frequency band.
 
-## Proposed External Peripherals
+## Peripheral Wiring
+
+The GPS and TFT wiring below is configured in the current firmware. MCP23017 wiring is still a plan; there is no I2C button driver or physical button input task yet.
 
 ### u-blox NEO-M6N GPS
 
@@ -56,12 +58,12 @@ if let Some(coord) = gps.coordinate {
 
 ### ILI9341 2.4-Inch SPI TFT
 
-Use a separate SPI controller from the LR1121. `SPI3` is the proposed ESP-HAL peripheral; configure pins through the ESP32-S3 GPIO matrix after checking the selected HAL version and exposed headers.
+Use hardware SPI3 for the display; SPI2 remains dedicated to the LR1121. The current firmware does not use the TFT's microSD socket.
 
 | ESP32-S3 GPIO | TFT signal | Notes |
 | ---: | --- | --- |
-| GPIO12 | SCLK / SCK | SPI clock. |
-| GPIO11 | MOSI / SDI | Display data input. |
+| GPIO12 | SCLK / SCK | SPI3 clock. |
+| GPIO11 | MOSI / SDI | SPI3 data output. |
 | GPIO10 | CS | Dedicated display chip select, active low. |
 | GPIO9 | D/C | Data/command select. |
 | GPIO8 | RESET | Display reset. |
@@ -70,7 +72,7 @@ Use a separate SPI controller from the LR1121. `SPI3` is the proposed ESP-HAL pe
 | 3V3 | VCC / logic supply | Prefer 3.3 V. Check the specific TFT breakout's power and logic-level circuit. |
 | GND | GND | Common ground. |
 
-The TFT's microSD socket can be used with SPI storage. GPIO13/14/15 provide SCK/MOSI/MISO and GPIO6 is used for microSD CS. Storage can be selected between internal flash and SD card via `StorageManager`.
+The TFT breakout's microSD socket is currently unused. Firmware storage uses the ESP32-S3's dedicated internal-flash partition.
 
 ### MCP23017 Button Matrix
 
@@ -105,16 +107,14 @@ Firmware can idle all columns as low outputs so a pressed key pulls a row low an
 | 1-3 | Spare / ADC-capable. |
 | 4 | GPS UART1 RX. |
 | 5 | GPS UART1 TX. |
-| 6 | MicroSD CS. |
+| 6 | Spare. |
 | 7 | TFT backlight enable. |
 | 8 | TFT reset. |
 | 9 | TFT D/C. |
 | 10 | TFT CS. |
-| 11 | TFT MOSI. |
-| 12 | TFT SCLK. |
-| 13 | MicroSD SCK (SPI storage). |
-| 14 | MicroSD MOSI (SPI storage). |
-| 15 | MicroSD MISO (SPI storage). |
+| 11 | TFT MOSI (SPI3 hardware). |
+| 12 | TFT SCLK (SPI3 hardware). |
+| 13-15 | Spare. |
 | 16 | MCP23017 interrupt. |
 | 17 | I2C SDA to MCP23017. |
 | 18 | I2C SCL to MCP23017. |
@@ -127,10 +127,10 @@ GPIO27-GPIO32 are not used by the current application. They are not in the suppl
 
 1. Check the HF-Kit schematic and connector labels against the GPIO numbers above. Confirm that GPIO4-18 are exposed on the connector intended for peripherals and are not reserved by the kit adapter.
 2. Verify each breakout's supply voltage, logic levels, pull-ups, and current draw. Power the TFT backlight from a suitable supply, not directly from a GPIO.
-3. Verify GPS NMEA output on GPIO4/5. `Gps::run()` now polls the receiver, but the UART path still needs bench verification.
-4. Bring up the ILI9341 on SPI3 using GPIO12/11 and its CS/D-C/RESET pins. Start at a conservative SPI clock and increase only after reliable display updates.
-5. Bring up MCP23017 on GPIO17/18, verify address `0x20`, then test rows/columns and the interrupt on GPIO16.
-6. Add the remaining display and button-expander drivers to `main.rs` only after their isolated electrical and bus tests pass; do not change the existing LR1121 or GPS GPIO assignments.
+3. Verify GPS NMEA output on GPIO4/5 on the target board.
+4. Verify ILI9341 updates on SPI3 using GPIO12/11 and its CS/D-C/RESET pins.
+5. If adding the MCP23017, bring it up on GPIO17/18, verify address `0x20`, then test rows/columns and the interrupt on GPIO16.
+6. Keep LR1121 and GPS GPIO assignments unchanged when wiring the button expander.
 
 ## References
 

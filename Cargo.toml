@@ -39,14 +39,14 @@ esp-backtrace = { version = "0.20.0", features = [
 esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32s3"] }
 
 critical-section = "1.2.0"
-static_cell      = "2.1.1"
 ed25519-dalek = "3.0.0"
 heapless = "0.9.3"
 embedded-hal = "1.0.0"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
-embedded-sdmmc = { version = "0.10.0", default-features = false }
 embedded-hal-bus = "0.3.0"
+embedded-graphics = "0.8.1"
+mipidsi = "0.10.0"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

@@ -1,13 +1,11 @@
-use core::str::from_utf8;
-use embassy_time::Delay;
-use embedded_hal::spi::SpiDevice;
-
+use crate::packet::packet_type::PacketType;
 use crate::{
     packet::{packet_data::PacketData, packet_deserializer::PacketDeserializer},
     radio::queue::{self, Packet, QueueError},
     storage::storage_manager::StorageManager,
 };
-use crate::packet::packet_type::PacketType;
+use core::str::from_utf8;
+use heapless::Vec;
 
 const SEEN_PACKET_CACHE_CAPACITY: usize = 64;
 
@@ -18,26 +16,24 @@ struct PacketKey {
 }
 
 pub struct PacketHandler {
-    seen_packets: heapless::Vec<PacketKey, SEEN_PACKET_CACHE_CAPACITY>,
+    seen_packets: Vec<PacketKey, SEEN_PACKET_CACHE_CAPACITY>,
 }
 
 impl PacketHandler {
     pub const fn new() -> Self {
         Self {
-            seen_packets: heapless::Vec::new(),
+            seen_packets: Vec::new(),
         }
     }
 
-    pub async fn handle_packet<SPI>(
+    pub async fn handle_packet(
         &mut self,
         packet: Packet,
-        storage: &mut StorageManager<'static, SPI, Delay>,
+        storage: &mut StorageManager<'static>,
         flash_buffer: &mut [u8],
-    ) where
-        SPI: SpiDevice<u8>,
-    {
+    ) {
         // Decode packet
-        let mut packet: PacketData = match PacketDeserializer::decode(packet.as_slice()) {
+        let mut packet: PacketData = match PacketDeserializer::deserialize(packet.as_slice()) {
             Ok(packet) => packet,
             Err(_) => {
                 defmt::warn!("RX invalid packet ({} bytes)", packet.len());
@@ -86,7 +82,6 @@ impl PacketHandler {
         let broadcast = packet.is_broadcast();
         let addressed_to_this_device = packet.is_for(&device_id);
 
-
         // Dev info
         defmt::info!(
             "RX from= {} type={} id={} message={} encrypted={} broadcast={} addressed_here={} hops={}/{} bytes={}",
@@ -106,13 +101,18 @@ impl PacketHandler {
             if packet.packet_type == PacketType::Text {
                 match from_utf8(packet.payload.as_slice()) {
                     Ok(text) => defmt::info!("RX payload: {=str}", text),
-                    Err(_) => defmt::info!("RX payload is not UTF-8 ({} bytes)", packet.payload.len()),
+                    Err(_) => {
+                        defmt::info!("RX payload is not UTF-8 ({} bytes)", packet.payload.len())
+                    }
                 }
             }
         }
 
         if broadcast {
             forward_packet(&mut packet);
+            if packet.is_encrypted {
+                return;
+            }
             // todo!("Handle broadcast packet");
         }
 

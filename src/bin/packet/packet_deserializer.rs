@@ -5,7 +5,7 @@ use crate::packet::packet_type::PacketType;
 pub struct PacketDeserializer;
 
 impl PacketDeserializer {
-    pub fn decode(bytes: &[u8]) -> Result<PacketData, PacketError> {
+    pub fn deserialize(bytes: &[u8]) -> Result<PacketData, PacketError> {
         // Rejects packets shorter than the minimum header size.
         if bytes.len() < HEADER_SIZE {
             return Err(PacketError::PacketTooShort);

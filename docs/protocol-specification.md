@@ -1,5 +1,7 @@
 # Communicator Protocol Specification
 
+> **Status:** This document describes protocol goals, not a complete description of the current firmware. For what is implemented today, see [Architecture](architecture.md) and [Packets and radio](packets-and-radio.md). Encryption, authenticated delivery, reassembly, contact discovery and local chat delivery remain incomplete.
+
 ## 1. Packet Format
 
 Each radio packet contains a fixed header followed by a variable-length body. The version field is the first byte. The total received packet length determines the body length; there is no separate payload-length field.
@@ -27,7 +29,7 @@ Receivers must reject unsupported versions, invalid field values, and packets to
 
 Generate device IDs and nonces using a hardware true random source. Do not treat uptime or CPU clock values as cryptographic entropy. On ESP32-S3, use the HAL TRNG only while a supported entropy source is active, such as its ADC source or RF subsystem.
 
-1. Device ID Generation: The intended behavior is to generate a 16-byte Device ID during initial setup and persist it across restarts. The current identity module provides explicit load and regenerate operations, but `main.rs` does not initialize or call it. Regenerate only after an explicit user action. A new ID requires pairing again.
+1. Device ID Generation: Generate a 16-byte Device ID during initial setup and persist it across restarts. The current `StorageManager` loads an existing ID or creates one on first boot. Regenerate only after an explicit user action. A new ID requires pairing again.
 2. Unique Peer Key Derivation: When pairing two devices, an exclusive, unique symmetric encryption key (Key_A_B) is derived using a Key Derivation Function (KDF) like HKDF, combining the global Secret AES Password and both high-entropy hardware-generated Device IDs. Names are strictly excluded from the derivation:
    `Key_A_B = HKDF(Secret_Password, ID_A || ID_B)`
    The global Secret AES Password is configured out-of-band and never transmitted over the air.
@@ -132,7 +134,7 @@ Duplicate suppression must not be applied when enqueuing: retries intentionally 
 
 ### Forwarding and Duplicate Detection
 
-This subsection describes intended behavior. The current `network::packet_router` module is empty, and the packet handler does not forward or deduplicate packets.
+This subsection describes the intended routing policy. The current packet handler has a volatile 64-entry duplicate cache and hop-limited forwarding for broadcasts and packets addressed to another device. Application delivery for locally addressed packets is not implemented.
 
 For each received packet:
 
@@ -146,11 +148,11 @@ The initial hop limit is 3. Packets addressed to the receiving device are proces
 
 ## 8. Persistent Storage
 
-Store the local Device ID, the master Secret AES Password, known contacts, and the replay-protection window across restarts. The local Device ID is loaded or regenerated through `device::identity`; regeneration is an explicit operation and requires pairing again.
+This is a design target, not the current persistence schema. The firmware currently stores the local Device ID, typed settings, contacts and indexed conversation messages using `storage::storage_manager::StorageManager`. It does not store a master password or a persistent replay-protection window. Identity regeneration is explicit and requires pairing again.
 
 ### Flash Store
 
-`storage::flash::FlashStore` provides persistent typed settings and contact records on ESP flash. It wraps `esp_storage::FlashStorage` for async use and delegates page management and wear leveling to `sequential-storage`.
+`hardware::flash::FlashStore` provides persistent typed settings, contacts and indexed message records on ESP internal flash. `storage::storage_manager::StorageManager` is the application-facing facade. It wraps `esp_storage::FlashStorage` for async use and delegates page management and wear leveling to `sequential-storage`. See [Storage and identity](storage-and-identity.md) for current initialization and usage examples.
 
 Construct the store with the ESP flash peripheral and the absolute flash address range reserved for application data:
 
@@ -158,7 +160,7 @@ Construct the store with the ESP flash peripheral and the absolute flash address
 let mut store = FlashStore::new(peripherals.FLASH, data_start..data_end)?;
 ```
 
-The range must belong to a dedicated data partition, start and end on flash erase-page boundaries, and contain at least two pages. `MapConfig::try_new` checks the range geometry, but does not check the device partition table or prevent overlap with firmware. Writes can erase sectors inside the supplied range. Never use a range occupied by the bootloader, partition table, firmware, or another data owner. The project must obtain `data_start..data_end` from its actual partition layout; no safe default range is currently defined.
+The range must belong to a dedicated data partition, start and end on flash erase-page boundaries, and contain at least two pages. `MapConfig::try_new` checks the range geometry, but does not check the device partition table or prevent overlap with firmware. Writes can erase sectors inside the supplied range. Never use a range occupied by the bootloader, partition table, firmware, or another data owner. This repository currently uses the `storage` partition declared by `partitions.csv`; see [Storage and identity](storage-and-identity.md#startup-and-partition-requirements) for its bounds and how to verify the flashed table.
 
 Settings use named keys and typed values. Keep the value type for a setting name consistent, because the stored record does not include a type tag. Names are limited to 31 UTF-8 bytes. Supported primitive values include booleans, signed and unsigned integers, and `f32`/`f64`.
 

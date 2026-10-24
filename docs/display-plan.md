@@ -1,10 +1,20 @@
-# Display UI Plan (ILI9341 2.4" SPI)
+# Display UI: Current State and Plan
+
+## Implemented now
+
+- The ILI9341 TFT is initialized by `hardware/display.rs` using `mipidsi` and `embedded-graphics` over hardware SPI3 at 10 MHz.
+- UI state, contact list, and renderers are split across `src/bin/ui/` rather than one large render module.
+- GPS task publishes snapshots for the persistent top bar.
+- The broadcast conversation is a permanent entry in the conversation list.
+- Screen drawing and logical key-state transitions exist.
+
+The display is not yet a usable chat terminal: there is no physical button input task, no message send integration, no conversation-history loading/rendering, and no message persistence calls. The current chat renderer displays a history placeholder. See [Storage and identity](storage-and-identity.md#saving-and-loading-messages) for the persistence integration pattern.
 
 ## Hardware
-- Display: ILI9341 2.4" SPI TFT (planned)
-- Pins (from docs/pinout.md): GPIO12 SCK, GPIO11 MOSI, GPIO10 CS, GPIO9 D/C, GPIO8 RESET, GPIO7 BL
-- SPI: Use SPI3 (SPI2 is taken by LR1121)
-- Driver: `mipidsi` + `embedded-graphics` + `display-interface-spi` (recommended)
+- Display: ILI9341 2.4" SPI TFT
+- Pins: GPIO12 SCK, GPIO11 MOSI, GPIO10 CS, GPIO9 D/C, GPIO8 RESET, GPIO7 BL
+- SPI: display uses hardware SPI3 at 10 MHz; LR1121 remains on SPI2
+- Driver: `mipidsi` + `embedded-graphics`; `embedded-hal-bus` wraps the SPI device
 
 ## Layout
 ```
@@ -23,15 +33,14 @@
 +----------------------------------+
 ```
 
-- Top bar is persistent - shows GPS coords/time/fix status, updated from GPS snapshot via `embassy_sync::watch` from `gps_task`. If GPS disabled or no fix, show appropriate status.
+- Top bar is persistent - shows GPS coords/time/fix status, updated from GPS snapshot via `embassy_sync::watch` from `gps_task`.
 - Bottom row is arrow keys (left/up/down/right/enter). Top 4 rows form the character grid for typing.
-- Entire UI driven by single state machine.
+- UI state is held in `ui::state::UiState`; physical buttons are not wired into it yet.
 
 ## GPS
-- Add `gps_enabled: bool` in settings (default true)
-- In `gps_task`, if disabled skip polling; just sleep. No hardware changes needed.
-- Publish `GpsSnapshot { fix: bool, lat: f64/f32, lon: ..., time: ..., enabled: bool, sats: ... }` via `embassy_sync::watch` for UI
-- Top bar shows status regardless (NO FIX / OFF / coords)
+- GPS polling stays enabled. Disabling it would save little power on this board and would remove location/time features.
+- `gps_task` polls the receiver and publishes snapshots through `embassy_sync::watch` for the top bar.
+- The top bar shows `NO GPS FIX` or the latest coordinates/time.
 
 ## Boot/Menu Flow
 ```
@@ -52,7 +61,7 @@ CHATS
   UNKNOWN AB12...   "?"              12:41
 ```
 
-- **Broadcast** is treated as a pseudo-conversation at the top (like a contact). Unencrypted, `to = [0x00;16]`. Clearly labeled `[PUBLIC - UNENCRYPTED]`.
+- **Broadcast** is a permanent, undeletable conversation contact at the top of the same contact list. It is unencrypted, uses `to = [0x00;16]`, and is clearly labeled `[PUBLIC - UNENCRYPTED]`.
 - Known contacts show `custom_name` if set, else shortened device ID
 - Unknown senders can appear if they messaged - can add to contacts/block from chat menu
 - Sorted by last activity (most recent first)
@@ -60,7 +69,7 @@ CHATS
 ### Chat View (per conversation)
 ```
 +----------------------------------+
-| < | Alice / BROADCAST | ⋮        |  <- back, name/id, 3-dot menu
+| < | Alice / BROADCAST            |  <- back, name/id
 +----------------------------------+
 |                                  |
 | THEM: hey                        |
@@ -68,14 +77,14 @@ CHATS
 | THEM: [COORDS] 59.9139, 10.7522  |
 |                                  |
 +----------------------------------+
-| [TYPE MESSAGE...............]    |  <- text input area
+| [TYPE MESSAGE.............] ... |  <- input and message actions
 +----------------------------------+
 ```
 
 - UP/DOWN to scroll history
 - Type using 5x5 grid, arrows to navigate cursor
 - ENTER to send/focus input
-- 3-dot menu (⋮) while in input opens context menu
+- The three-dot menu (⋮) is beside the text input, not in the chat title bar. Activating it opens message actions such as SEND COORDS.
 
 ### 3-dot Menu (in text input)
 ```
@@ -94,13 +103,12 @@ CHATS
 - **DM to unknown**: Don't allow encrypted sending unless added to contacts first. Can read but send disabled or prompt to add
 - Payload format when encrypted: `nonce (12) || ciphertext || tag (16)`
 
-## Message Storage
-- Save up to **N=50 messages per conversation** (ring buffer, prune oldest on overflow)
-- Keyed by device ID: DMs use peer device ID, broadcast uses special key (`[0xFF;16]` or similar)
-- Store decrypted plaintext in flash for fast UI
-- Lazy load only the active conversation
-- Save on send and on receive (after reassembly/decryption)
-- Track unread count per conversation
+## Message Storage Plan
+- Use the existing `StorageManager::append_messages` / `append_broadcast_messages` APIs to save one `StoredMessage` per logical message.
+- Use `from_me = true` for locally created messages and `false` for received messages.
+- Load the active conversation through the paged APIs; avoid loading all history into RAM.
+- Save received messages only after complete validation, reassembly and decryption.
+- A 50-message cap, pruning policy and unread-count persistence are not implemented by the current storage API.
 
 ## Settings Structure
 ```
@@ -117,7 +125,6 @@ SETTINGS
 ├── Frequency
 │   └── Change frequency (show current, cycle; may require restart)
 └── GPS
-    ├── Enable/Disable
     └── Show Status
 ```
 
@@ -154,20 +161,27 @@ enum Screen {
 ```
 
 ## Implementation Order
-1. **Data layer** - `ui/state.rs`, conversation/message types integrated with storage
+1. **Data layer** - integrate `ui/state.rs`, conversation/message types with storage
 2. **GPS snapshot sharing** - `embassy_sync::watch` in `gps_task`, top bar display
 3. **Navigation/Input** - Key mapping for 5x5 grid + arrows, screen stack
 4. **Top bar** - Always render first
 5. **ChatsList + ChatView** - Merged UI, broadcast as pseudo-convo
 6. **3-dot menu + SEND COORDS** - Context menu in input area
 7. **Contact discovery** - DeviceAnnounce send/receive, search UI, pairwise key derivation
-8. **Flash message persistence** - Save/load with N=50 cap, lazy load
+8. **Flash message persistence** - Save/load logical sent and received messages; decide history cap and pruning policy
 9. **Settings pages** - Device/Contacts/Frequency/GPS
 10. **Polish** - Unread counts, toasts, blacklisting
+
+## Code Layout
+- TFT driver and board initialization helpers live in `src/bin/hardware/display.rs`.
+- The ILI9341 uses hardware SPI3. Message and settings storage currently use the dedicated internal-flash partition.
+- Conversation/contact entries and the permanent Broadcast contact live in `src/bin/ui/contact.rs`.
+- Screen state and logical key handling live in `src/bin/ui/state.rs`.
+- Rendering is split by screen under `src/bin/ui/render/` (`top_bar.rs`, `menu.rs`, `chat.rs`, and shared `style.rs`).
 
 ## Notes
 - Don't implement groups yet (v2). Focus on solid DMs + broadcast first.
 - Discovery uses existing announce mechanism, no key exchange over radio.
-- GPS toggle stops polling in `gps_task` without hardware changes.
+- GPS polling stays enabled; settings can show current fix and time status.
 - Multiple recipients: send separate packets per contact (each encrypted with their key).
 - Messages stored decrypted in flash for UI responsiveness.

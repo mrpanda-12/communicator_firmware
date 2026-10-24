@@ -17,11 +17,6 @@ pub const BUTTON_EXPANDER_INTERRUPT_GPIO: u8 = 16;
 pub const BUTTON_EXPANDER_SDA_GPIO: u8 = 17;
 pub const BUTTON_EXPANDER_SCL_GPIO: u8 = 18;
 
-pub const SDCARD_SPI_SCK_GPIO: u8 = 13;
-pub const SDCARD_SPI_MOSI_GPIO: u8 = 14;
-pub const SDCARD_SPI_MISO_GPIO: u8 = 15;
-pub const SDCARD_CS_GPIO: u8 = 6;
-
 pub const UART0_TX_GPIO: u8 = 43;
 pub const UART0_RX_GPIO: u8 = 44;
 

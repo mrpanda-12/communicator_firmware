@@ -9,35 +9,6 @@ pub struct MessagePage {
     pub done: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MessageStorageLocation {
-    InternalFlash,
-    SdCard,
-}
-
-impl<'a> Value<'a> for MessageStorageLocation {
-    fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, SerializationError> {
-        let value = match self {
-            Self::InternalFlash => 0,
-            Self::SdCard => 1,
-        };
-        let byte = buffer
-            .first_mut()
-            .ok_or(SerializationError::BufferTooSmall)?;
-        *byte = value;
-        Ok(1)
-    }
-
-    fn deserialize_from(buffer: &'a [u8]) -> Result<(Self, usize), SerializationError> {
-        match buffer.first() {
-            Some(0) => Ok((Self::InternalFlash, 1)),
-            Some(1) => Ok((Self::SdCard, 1)),
-            Some(_) => Err(SerializationError::InvalidFormat),
-            None => Err(SerializationError::BufferTooSmall),
-        }
-    }
-}
-
 /// Maximum UTF-8 payload bytes carried by one text/coordinate message.
 pub const MAX_MESSAGE_PAYLOAD: usize = 200;
 
@@ -71,8 +42,7 @@ pub struct Conversation {
     pub display_name: String<32>,
 }
 
-/// Legacy in-memory convenience type. Do not store whole conversation histories
-/// as one flash map value; the StorageManager streams records to SD instead.
+/// Legacy in-memory convenience type. Persist message histories as indexed records.
 #[derive(Clone, Debug)]
 pub struct MessageStore {
     pub messages: Vec<StoredMessage>,

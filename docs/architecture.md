@@ -7,11 +7,12 @@ This is a `no_std`, `no_main` ESP32-S3 firmware using `esp-hal` and Embassy. The
 Startup currently:
 
 1. Initializes the ESP32-S3 at the maximum CPU clock and starts the Embassy runtime.
-2. Creates SPI3 for the SD card on GPIO13-GPIO15 with chip select GPIO6, initializes persistent storage, then creates SPI2 for the LR1121 at 1 MHz, SPI mode 0.
+2. Initializes the ILI9341 on hardware SPI3 (GPIO12 SCK, GPIO11 MOSI) at 10 MHz. SPI2 is used by the LR1121. Settings and application data use the dedicated internal-flash partition; there is no SD-card backend or second-core storage worker.
 3. Configures the radio SPI/control pins through `hardware/pinout.rs` and constructs `Lr1121`. The driver performs a hard reset and system startup: SPI CRC off, DCDC regulator, board RF switch, 3.0 V TCXO, 32.768 kHz crystal LFCLK, XOSC standby, full calibration, and IRQ/error clearing.
 4. `Radio::new` applies the sub-GHz LoRa profile at 869.4 MHz, including image calibration, RSSI calibration, modem/packet parameters, private sync word `0x12`, HP PA, 22 dBm TX power, 48 us ramp, RC-standby fallback, and DIO9 IRQ routing.
-5. Leaves UART1 on GPIO4/GPIO5 available for GPS via `pinout::gps_pins()`; GPS is not started by `main.rs`.
-6. Starts the radio worker alongside a test producer that queues broadcast `Text` packets after randomized intervals to reduce collisions between devices running the same test firmware.
+5. Starts GPS polling on UART1 (GPIO4/GPIO5) and publishes compact location/time snapshots to the UI through an Embassy watch.
+6. Starts the radio worker alongside a diagnostic producer that queues an unencrypted broadcast text test packet every 30 seconds. This is not a user chat send path and does not save chat history.
+7. Starts the display UI task. It currently renders screens and tracks logical UI state; physical button input, chat sending and flash-backed conversation rendering are not connected yet.
 
 Radio pin assignment (configured through `hardware/pinout.rs`):
 
@@ -27,21 +28,20 @@ Radio pin assignment (configured through `hardware/pinout.rs`):
 
 The LR1121 RF switch is configured inside the radio with `SetDioAsRfSwitch` using the board reference values (`RFSW0 | RFSW1`) and does not consume additional ESP32 GPIOs. Selecting a silicon band in software still does not prove that the board's antenna, matching network, front end, or regulatory domain supports it.
 
-See the [HF-Kit peripheral pinout](pinout.md) for GPS, SPI TFT, and MCP23017 wiring. GPS is configured in firmware; the display and button-expander assignments are still proposed.
+See the [HF-Kit peripheral pinout](pinout.md) for GPS, SPI TFT, and MCP23017 wiring. GPS and the TFT are initialized by firmware. The button expander is documented as a wiring plan and is not yet integrated.
 
 ## Source Map
 
 | Module | Responsibility and current state |
 | --- | --- |
-| `hardware/pinout.rs` | Board wiring and constructors for the configured radio control pins, GPS UART pins, and future display/button-expander GPIO constants. |
+| `hardware/pinout.rs` | Board wiring and constructors for radio and GPS pins. |
 | `hardware/gps.rs` | Nonblocking UART1 polling and NMEA GGA/RMC parsing. Hold a `Gps` object, call `update()` to drain UART, read `coordinate`/`time` fields. No PPS support. |
 | `crypto/mod.rs` | Software AES-256-GCM `derive_key`, `encrypt`, and `decrypt` free functions. Nonces use the ESP-HAL RNG. Packet encoding does not call these yet. |
-| `storage/storage_manager.rs` | Routes application storage operations; loads or explicitly regenerates the flash-backed device ID and selects message history location from `message_storage_location`. |
-| `hardware/display.rs` | Empty; no display driver is implemented. |
+| `storage/storage_manager.rs` | Application-facing internal-flash API for settings, identity, contacts and message history. |
+| `hardware/display.rs` | ILI9341 driver initialization and embedded-graphics display adapter. |
 | `hardware/lr1121/lr1121.rs` | SPI transport, reset/BUSY/IRQ handling, system startup, RF-switch/TCXO/LFCLK setup, image and RSSI calibration, modem/PA/TX/RX commands, and LR-FHSS frame building. |
 | `hardware/lr1121/opcode.rs` | Typed LR1121 system, radio, packet, and LR-FHSS opcodes used by the driver. |
-| `network/packet_handler.rs` | Decodes received packets and prints their metadata and unencrypted payload. Malformed input is reported without panicking. It does not route or forward packets. |
-| `network/packet_router.rs` | Empty; forwarding and duplicate detection are not implemented. |
+| `network/packet_handler.rs` | Decodes and validates RX packets, drops self-originated and recently seen packets, and forwards broadcasts or packets addressed elsewhere. Local application delivery remains a TODO. |
 | `packet/packet_data.rs` | In-memory packet representation and basic validation. |
 | `packet/packet_encoder.rs` | Serializes packet fields to the wire format. |
 | `packet/packet_decoder.rs` | Parses and validates the fixed header and payload. |
@@ -73,18 +73,15 @@ The build is verified for `xtensa-esp32s3-none-elf`; the linker currently emits 
 - LR1121 system startup, the board RF switch, TCXO/LFCLK setup, sub-GHz image calibration, RSSI calibration, PA selection, and DIO9 IRQ routing are implemented in code.
 - LR-FHSS is transmit-only in this firmware. S-band RX is rejected/not started.
 - `main.rs` starts RX and a 30-second sub-GHz test transmitter. A second board with the same frequency, modem, and sync word is required to observe received packets.
-- All TX uses a single FIFO queue (capacity 16). The worker listens for up to 500 ms after every two queued transmissions on bands that support RX. There is no public direct-radio send path, priority class, or emergency bypass. Retries, fragmentation/reassembly, and duplicate suppression are not implemented.
+- All TX uses a single FIFO queue (capacity 16). The worker listens for up to 500 ms after every two queued transmissions on bands that support RX. There is no public direct-radio send path, priority class, or emergency bypass. Retries and fragmentation/reassembly are not implemented.
 - `FrequencyChange` is only a packet type. It has no announcement payload schema, handler, acceptance flow, or automatic retune behavior.
 - A local `request_frequency_change` is separate from the `FrequencyChange` wire packet.
 - AES-256-GCM primitives exist in `crypto/mod.rs`. An `is_encrypted` flag still does not encrypt or authenticate data by itself because the packet path does not call them.
-- Fragmentation, reassembly, forwarding, duplicate suppression, contact-based authorization, and display support are not implemented.
-- Flash storage and device identity APIs exist but are not initialized or called by `main`.
+- Fragmentation/reassembly, contact-based authorization, local message delivery, outgoing chat sends, and saving received/sent messages are not implemented. Hop-limited forwarding and volatile duplicate suppression are implemented.
+- Flash storage and device identity are initialized by `main`; the test producer uses the ID for test packets. Settings, contacts and message-history APIs exist, but message append/read is not integrated into a chat flow yet.
 - Antenna/front-end support, actual RF range, and regulatory approval remain board/application responsibilities. No hardware TX/RX result is recorded here.
 
-## Message Storage
-`storage/message.rs` defines `StoredMessage`, `MessageKind` (Text/Coords), and `MAX_MESSAGES_PER_CONVO` (50). `FlashStore` persists messages per device ID (DMs) and broadcast separately. This enables chat history with capped history and fast loading per conversation.
-
-
 ## Storage Layout
-- **Internal Flash only**: Device identity, contacts (with pairwise keys), and critical settings. Accessed via `hardware/flash.rs` (`FlashStore`).
-- **Selectable**: Messages/conversations route through `storage/storage_manager.rs` (internal flash or SD card via `hardware/sdcard.rs`). SD uses SPI3 on GPIO13-15 with GPIO6 chip select and a fixed timestamp source.
+- Settings, device identity, contacts and message records use `hardware/flash.rs` through `storage/storage_manager.rs`.
+- The display uses hardware SPI3; the LR1121 uses SPI2.
+- For message creation, append and paged-read examples, see [Storage and identity](storage-and-identity.md#saving-and-loading-messages).

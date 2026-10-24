@@ -9,15 +9,12 @@ pub mod network;
 pub mod packet;
 pub mod radio;
 pub mod storage;
+pub mod ui;
+
+static GPS_SNAPSHOT: Watch<CriticalSectionRawMutex, ui::GpsSnapshot, 1> = Watch::new();
 
 use crate::{
-    hardware::{
-        flash::FlashStore,
-        gps::Gps,
-        lr1121::lr1121::Lr1121,
-        pinout,
-        sdcard::{FixedTimeSource, SdCardStorage},
-    },
+    hardware::{flash::FlashStore, gps::Gps, lr1121::lr1121::Lr1121, pinout},
     network::packet_handler::PacketHandler,
     packet::{
         packet_data::{DEFAULT_HOP_LIMIT, PacketData},
@@ -33,10 +30,12 @@ use crate::{
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::{Duration, Timer};
-use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
+// Keep esp-println's defmt-espflash global logger linked for defmt output.
+#[allow(unused_imports)]
 use esp_println::defmt as _;
 use esp_hal::{
     clock::CpuClock,
@@ -60,32 +59,23 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const FLASH_DATA_START: u32 = 0x210000;
 const FLASH_DATA_END: u32 = 0x400000;
 
-// SD SPI wiring from the Waveshare ESP32-S3-LR1121-HF-Kit pinout:
-// GPIO13=SCK, GPIO14=MOSI, GPIO15=MISO, GPIO6=CS.
+// TFT uses SPI3 on GPIO12=SCK and GPIO11=MOSI.
 
-/// 1/ Build the low-level SD backend from the project's SPI3 and GPIO assignments.
-fn init_sd_storage(
+/// 1/ Build the display's dedicated hardware SPI3 bus.
+fn init_display_spi(
     spi3: peripherals::SPI3<'static>,
-    sck: peripherals::GPIO13<'static>,
-    mosi: peripherals::GPIO14<'static>,
-    miso: peripherals::GPIO15<'static>,
-    cs: peripherals::GPIO6<'static>,
-) -> SdCardStorage<impl SpiDevice<u8>, embassy_time::Delay> {
-    let bus = Spi::new(
+    sck: peripherals::GPIO12<'static>,
+    mosi: peripherals::GPIO11<'static>,
+) -> Spi<'static, esp_hal::Blocking> {
+    Spi::new(
         spi3,
         Config::default()
-            .with_frequency(Rate::from_khz(400))
+            .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
     )
-    .expect("Failed to initialize SD SPI3")
+    .expect("Failed to initialize display SPI3")
     .with_sck(sck)
     .with_mosi(mosi)
-    .with_miso(miso);
-
-    let chip_select = Output::new(cs, Level::High, OutputConfig::default());
-    let device = ExclusiveDevice::new(bus, chip_select, embassy_time::Delay)
-        .expect("Failed to create SD SPI device");
-    SdCardStorage::new(device, embassy_time::Delay, FixedTimeSource)
 }
 
 /// 2/ Open the flash map over the reserved range from the real partition layout.
@@ -105,16 +95,12 @@ fn init_trng(
 }
 
 /// 4/ Load the device ID and create it only when the flash store has no ID.
-async fn initialize_storage<SPI>(
+async fn initialize_storage(
     flash: FlashStore<'static>,
-    sd: SdCardStorage<SPI, embassy_time::Delay>,
     trng: &Trng,
     flash_buffer: &mut [u8],
-) -> (StorageManager<'static, SPI, embassy_time::Delay>, Option<[u8; 16]>)
-where
-    SPI: SpiDevice<u8>,
-{
-    let mut storage = StorageManager::from_backends(flash, sd);
+) -> (StorageManager<'static>, Option<[u8; 16]>) {
+    let mut storage = StorageManager::from_flash(flash);
 
     let device_id = match storage.load_device_id(flash_buffer).await {
         Ok(Some(device_id)) => {
@@ -199,8 +185,16 @@ fn init_gps(
 }
 
 async fn gps_task(mut gps: Gps<'static>) -> ! {
+    let mut published = ui::gps_snapshot(None, None);
+    GPS_SNAPSHOT.sender().send(published);
+
     loop {
         let _ = gps.update();
+        let snapshot = ui::gps_snapshot(gps.get_coordinate(), gps.get_time());
+        if snapshot != published {
+            GPS_SNAPSHOT.sender().send(snapshot);
+            published = snapshot;
+        }
         Timer::after(Duration::from_millis(250)).await;
     }
 }
@@ -225,18 +219,26 @@ async fn main(_spawner: Spawner) -> ! {
     }
 
     // 5/ Initialize custom storage backends and persistent application values.
-    let sd_store = init_sd_storage(
-        peripherals.SPI3,
-        peripherals.GPIO13,
-        peripherals.GPIO14,
-        peripherals.GPIO15,
-        peripherals.GPIO6,
-    );
     let flash_store = init_flash_storage(peripherals.FLASH);
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
-    let mut flash_buffer = [0u8; 256];
-    let (mut storage, device_id) =
-        initialize_storage(flash_store, sd_store, &trng, &mut flash_buffer).await;
+    let mut flash_buffer = [0u8; 512];
+    let (mut storage, device_id) = initialize_storage(flash_store, &trng, &mut flash_buffer).await;
+
+    let mut display_buffer = [0u8; 512];
+    let display_cs = Output::new(peripherals.GPIO10, Level::High, OutputConfig::default());
+    let display_dc = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
+    let display_reset = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
+    let display_bus = init_display_spi(peripherals.SPI3, peripherals.GPIO12, peripherals.GPIO11);
+    let display_spi = ExclusiveDevice::new(display_bus, display_cs, embassy_time::Delay)
+        .expect("Failed to create display SPI device");
+    let display = hardware::display::init(
+        display_spi,
+        display_dc,
+        display_reset,
+        embassy_time::Delay,
+        &mut display_buffer,
+    );
+    let _display_backlight = Output::new(peripherals.GPIO7, Level::High, OutputConfig::default());
 
     let radio = init_radio(
         peripherals.SPI2,
@@ -292,14 +294,29 @@ async fn main(_spawner: Spawner) -> ! {
         }
     };
 
-    let fut = async {
+    let services_fut = async {
         match select(radio_worker, gps_fut).await {
             Either::First(Ok(())) => defmt::error!("Radio worker stopped"),
             Either::First(Err(_)) => defmt::error!("Radio worker failed"),
             Either::Second(_) => defmt::error!("GPS task stopped"),
         }
     };
-    let _ = select(fut, test_packet_producer).await;
+    GPS_SNAPSHOT
+        .sender()
+        .send(ui::gps_snapshot(None, None));
+    let ui_fut = ui::run(
+        display,
+        GPS_SNAPSHOT
+            .receiver()
+            .expect("GPS snapshot watch should be initialized"),
+    );
+    let services_and_ui_fut = async {
+        match select(services_fut, ui_fut).await {
+            Either::First(()) => defmt::error!("Firmware service stopped"),
+            Either::Second(never) => match never {},
+        }
+    };
+    let _ = select(services_and_ui_fut, test_packet_producer).await;
 
     loop {
         Timer::after(Duration::from_secs(1)).await;
