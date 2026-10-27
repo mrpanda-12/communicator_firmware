@@ -1,20 +1,27 @@
-use heapless::{Vec, index_map::FnvIndexMap};
+use heapless::Vec;
 
 use crate::packet::{
-    packet_data::{DEFAULT_HOP_LIMIT, GCM_OVERHEAD, MAX_PAYLOAD_SIZE, PacketData},
+    packet_data::{
+        DEFAULT_HOP_LIMIT, GCM_OVERHEAD, HEADER_SIZE, MAX_FRAGMENT_COUNT, MAX_LOGICAL_MESSAGE_SIZE,
+        MAX_PACKET_SIZE, MAX_PAYLOAD_SIZE, PacketData,
+    },
     packet_error::PacketError,
     packet_type::PacketType,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+const REASSEMBLY_CAPACITY: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentKey {
     pub from: [u8; 16],
+    pub to: [u8; 16],
     pub message_id: u16,
 }
 
 pub struct Fragmenter;
 
 impl Fragmenter {
+    /// Split plaintext into packets. Encrypted callers must encrypt every returned packet before queuing it.
     pub fn fragment(
         packet_id: u16,
         message_id: u16,
@@ -25,58 +32,85 @@ impl Fragmenter {
         payload: &[u8],
         initial_hop_limit: u8,
         hop_limit: u8,
-    ) -> Result<Vec<PacketData, 16>, PacketError> {
-        let overhead = if is_encrypted { GCM_OVERHEAD } else { 0 };
-        if MAX_PAYLOAD_SIZE < overhead {
+    ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
+        Self::fragment_with_limit(
+            packet_id,
+            message_id,
+            from,
+            to,
+            is_encrypted,
+            packet_type,
+            payload,
+            initial_hop_limit,
+            hop_limit,
+            MAX_PACKET_SIZE,
+        )
+    }
+
+    /// Split plaintext using the encoded-packet limit of the active radio band.
+    pub fn fragment_with_limit(
+        packet_id: u16,
+        message_id: u16,
+        from: [u8; 16],
+        to: [u8; 16],
+        is_encrypted: bool,
+        packet_type: PacketType,
+        payload: &[u8],
+        initial_hop_limit: u8,
+        hop_limit: u8,
+        maximum_packet_size: usize,
+    ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
+        // Reserve the current band's header and GCM overhead before splitting application text.
+        if payload.len() > MAX_LOGICAL_MESSAGE_SIZE {
             return Err(PacketError::PayloadTooLarge);
         }
-
-        let max_fragment_payload = MAX_PAYLOAD_SIZE - overhead;
-        if max_fragment_payload == 0 {
+        if maximum_packet_size > MAX_PACKET_SIZE || maximum_packet_size < HEADER_SIZE {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        let overhead = if is_encrypted { GCM_OVERHEAD } else { 0 };
+        let available_payload = maximum_packet_size - HEADER_SIZE;
+        if available_payload < overhead {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        let max_fragment_payload = available_payload - overhead;
+        if max_fragment_payload == 0 && !payload.is_empty() {
             return Err(PacketError::PayloadTooLarge);
         }
 
         let fragment_count = if payload.is_empty() {
             1
         } else {
-            ((payload.len() + max_fragment_payload - 1) / max_fragment_payload) as u8
+            payload.len().div_ceil(max_fragment_payload)
         };
 
-        if fragment_count == 0 {
-            return Err(PacketError::InvalidFragmentMetadata);
-        }
-
-        if fragment_count as usize > 16 {
+        if fragment_count == 0 || fragment_count > MAX_FRAGMENT_COUNT {
             return Err(PacketError::PayloadTooLarge);
         }
 
-        let mut packets: Vec<PacketData, 16> = Vec::new();
+        let mut packets: Vec<PacketData, MAX_FRAGMENT_COUNT> = Vec::new();
         for index in 0..fragment_count {
-            let start = (index as usize) * max_fragment_payload;
+            let start = index * max_fragment_payload;
             let end = core::cmp::min(start + max_fragment_payload, payload.len());
             let chunk = &payload[start..end];
 
-            let mut fragment_payload: Vec<u8, 212> = Vec::new();
-            for byte in chunk {
-                fragment_payload
-                    .push(*byte)
-                    .map_err(|_| PacketError::PayloadTooLarge)?;
-            }
-
-            let packet = PacketData::new(
-                packet_id,
+            let mut packet = PacketData::new(
+                packet_id.wrapping_add(index as u16),
                 message_id,
-                index,
-                fragment_count,
+                index as u8,
+                fragment_count as u8,
                 from,
                 to,
-                is_encrypted,
+                false,
                 packet_type,
-                fragment_payload.as_slice(),
+                chunk,
                 initial_hop_limit,
                 hop_limit,
             )?;
-            packets.push(packet).map_err(|_| PacketError::PayloadTooLarge)?;
+            // Build with plaintext first so a short final chunk can be encrypted to a valid GCM frame.
+            packet.is_encrypted = is_encrypted;
+            packets
+                .push(packet)
+                .map_err(|_| PacketError::PayloadTooLarge)?;
         }
 
         Ok(packets)
@@ -90,7 +124,7 @@ impl Fragmenter {
         is_encrypted: bool,
         packet_type: PacketType,
         payload: &[u8],
-    ) -> Result<Vec<PacketData, 16>, PacketError> {
+    ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
         Self::fragment(
             packet_id,
             message_id,
@@ -103,106 +137,212 @@ impl Fragmenter {
             DEFAULT_HOP_LIMIT,
         )
     }
+
+    pub fn fragment_with_defaults_and_limit(
+        packet_id: u16,
+        message_id: u16,
+        from: [u8; 16],
+        to: [u8; 16],
+        is_encrypted: bool,
+        packet_type: PacketType,
+        payload: &[u8],
+        maximum_packet_size: usize,
+    ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
+        Self::fragment_with_limit(
+            packet_id,
+            message_id,
+            from,
+            to,
+            is_encrypted,
+            packet_type,
+            payload,
+            DEFAULT_HOP_LIMIT,
+            DEFAULT_HOP_LIMIT,
+            maximum_packet_size,
+        )
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptedFragment {
+    pub packet_id: u16,
+    pub fingerprint: [u8; 32],
+}
+
+pub struct ReassembledMessage {
+    pub first_packet: PacketData,
+    pub payload: Vec<u8, MAX_LOGICAL_MESSAGE_SIZE>,
+    pub encrypted: bool,
+    pub accepted_fragments: Vec<AcceptedFragment, MAX_FRAGMENT_COUNT>,
+}
+
+#[derive(Clone, Copy)]
+struct FragmentMeta {
+    packet_id: u16,
+    fingerprint: [u8; 32],
+    offset: usize,
+    length: usize,
+}
+
 struct FragmentEntry {
+    key: FragmentKey,
     total: u8,
+    is_encrypted: bool,
+    packet_type: PacketType,
+    initial_hop_limit: u8,
+    fragments: [Option<FragmentMeta>; MAX_FRAGMENT_COUNT],
+    first_packet: Option<PacketData>,
     received: u8,
-    fragments: [Option<PacketData>; 16],
+    payload: Vec<u8, MAX_LOGICAL_MESSAGE_SIZE>,
 }
 
 pub struct Defragmenter {
-    cache: FnvIndexMap<(FragmentKey, u16), FragmentEntry, 8>,
+    cache: Vec<FragmentEntry, REASSEMBLY_CAPACITY>,
 }
 
 impl Defragmenter {
     pub fn new() -> Self {
-        Self {
-            cache: FnvIndexMap::new(),
-        }
+        Self { cache: Vec::new() }
     }
 
-    pub fn push(&mut self, packet: PacketData) -> Option<PacketData> {
-        if packet.fragment_count == 1 {
-            return Some(packet);
+    /// Store authenticated plaintext fragments and return only after a complete logical message exists.
+    pub fn push(
+        &mut self,
+        packet: PacketData,
+        plaintext: &[u8],
+        fingerprint: [u8; 32],
+    ) -> Result<Option<ReassembledMessage>, PacketError> {
+        if packet.fragment_count == 0
+            || packet.fragment_count as usize > MAX_FRAGMENT_COUNT
+            || packet.fragment_index >= packet.fragment_count
+            || plaintext.len() > MAX_PAYLOAD_SIZE
+        {
+            return Err(PacketError::InvalidFragmentMetadata);
         }
 
-        if packet.fragment_index >= packet.fragment_count {
-            return None;
+        let mut message_payload = Vec::new();
+        message_payload
+            .extend_from_slice(plaintext)
+            .map_err(|_| PacketError::PayloadTooLarge)?;
+        let mut accepted_fragments = Vec::new();
+        accepted_fragments
+            .push(AcceptedFragment {
+                packet_id: packet.packet_id,
+                fingerprint,
+            })
+            .map_err(|_| PacketError::PayloadTooLarge)?;
+
+        if packet.fragment_count == 1 {
+            return Ok(Some(ReassembledMessage {
+                first_packet: packet.clone(),
+                payload: message_payload,
+                encrypted: packet.is_encrypted,
+                accepted_fragments,
+            }));
         }
 
         let key = FragmentKey {
             from: packet.from,
+            to: packet.to,
             message_id: packet.message_id,
         };
-        let cache_key = (key, packet.packet_id);
-
-        if !self.cache.contains_key(&cache_key) {
-            self.cache
-                .insert(
-                    cache_key,
-                    FragmentEntry {
+        let index = packet.fragment_index as usize;
+        let entry_index = match self.cache.iter().position(|entry| entry.key == key) {
+            Some(index) => index,
+            None => {
+                if self.cache.is_full() {
+                    self.cache.remove(0);
+                }
+                self.cache
+                    .push(FragmentEntry {
+                        key,
                         total: packet.fragment_count,
+                        is_encrypted: packet.is_encrypted,
+                        packet_type: packet.packet_type,
+                        initial_hop_limit: packet.initial_hop_limit,
+                        fragments: [const { None }; MAX_FRAGMENT_COUNT],
+                        first_packet: None,
                         received: 0,
-                        fragments: [const { None }; 16],
-                    },
-                )
-                .ok()?;
+                        payload: Vec::new(),
+                    })
+                    .map_err(|_| PacketError::PayloadTooLarge)?;
+                self.cache.len() - 1
+            }
+        };
+
+        let consistent = {
+            let entry = &self.cache[entry_index];
+            entry.total == packet.fragment_count
+                && entry.is_encrypted == packet.is_encrypted
+                && entry.packet_type == packet.packet_type
+                && entry.initial_hop_limit == packet.initial_hop_limit
+        };
+        if !consistent {
+            self.cache.remove(entry_index);
+            return Err(PacketError::InvalidFragmentMetadata);
         }
 
-        let idx = packet.fragment_index as usize;
-        let total = packet.fragment_count;
-        let entry = self.cache.get_mut(&cache_key)?;
-        if entry.total != total {
-            return None;
-        }
-        if entry.fragments[idx].is_some() {
-            return None;
+        let duplicate = self.cache[entry_index].fragments[index].as_ref();
+        if let Some(existing) = duplicate {
+            if existing.packet_id == packet.packet_id && existing.fingerprint == fingerprint {
+                return Ok(None);
+            }
+            self.cache.remove(entry_index);
+            return Err(PacketError::InvalidFragmentMetadata);
         }
 
-        entry.fragments[idx] = Some(packet);
+        if self.cache[entry_index].payload.len() + plaintext.len() > MAX_LOGICAL_MESSAGE_SIZE {
+            self.cache.remove(entry_index);
+            return Err(PacketError::PayloadTooLarge);
+        }
+
+        let entry = &mut self.cache[entry_index];
+        if packet.fragment_index == 0 {
+            entry.first_packet = Some(packet.clone());
+        }
+        let offset = entry.payload.len();
+        entry
+            .payload
+            .extend_from_slice(plaintext)
+            .map_err(|_| PacketError::PayloadTooLarge)?;
+        entry.fragments[index] = Some(FragmentMeta {
+            packet_id: packet.packet_id,
+            fingerprint,
+            offset,
+            length: plaintext.len(),
+        });
         entry.received += 1;
 
         if entry.received == entry.total {
-            let entry = self.cache.remove(&cache_key)?;
-            let mut total_len: usize = 0;
+            let entry = self.cache.remove(entry_index);
+            let mut payload = Vec::new();
+            let mut accepted_fragments = Vec::new();
+            let first_packet = entry.first_packet;
             for i in 0..entry.total {
-                if let Some(frag) = &entry.fragments[i as usize] {
-                    total_len += frag.payload.len();
-                }
-            }
-            if total_len > MAX_PAYLOAD_SIZE {
-                return None;
+                let Some(fragment) = entry.fragments[i as usize].as_ref() else {
+                    return Err(PacketError::InvalidFragmentMetadata);
+                };
+                payload
+                    .extend_from_slice(
+                        &entry.payload[fragment.offset..fragment.offset + fragment.length],
+                    )
+                    .map_err(|_| PacketError::PayloadTooLarge)?;
+                accepted_fragments
+                    .push(AcceptedFragment {
+                        packet_id: fragment.packet_id,
+                        fingerprint: fragment.fingerprint,
+                    })
+                    .map_err(|_| PacketError::PayloadTooLarge)?;
             }
 
-            let first = entry.fragments[0].as_ref()?.clone();
-            let mut payload: Vec<u8, 212> = Vec::new();
-            for i in 0..entry.total {
-                let frag = entry.fragments[i as usize].as_ref()?;
-                for byte in frag.payload.iter() {
-                    payload.push(*byte).ok()?;
-                }
-            }
-
-            let mut merged = PacketData::new(
-                first.packet_id,
-                first.message_id,
-                0,
-                1,
-                first.from,
-                first.to,
-                first.is_encrypted,
-                first.packet_type,
-                payload.as_slice(),
-                first.initial_hop_limit,
-                first.hop_limit,
-            )
-            .ok()?;
-            merged.payload = payload;
-            Some(merged)
+            Ok(Some(ReassembledMessage {
+                first_packet: first_packet.ok_or(PacketError::InvalidFragmentMetadata)?,
+                payload,
+                encrypted: entry.is_encrypted,
+                accepted_fragments,
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 }

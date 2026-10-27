@@ -85,6 +85,7 @@ where
         };
 
         radio.apply_hardware_config()?;
+        radio.control.publish_config(radio.config);
         Ok(radio)
     }
 
@@ -556,6 +557,8 @@ where
             }
             return Err(error);
         }
+
+        self.control.publish_config(self.config);
 
         if resume_receive && self.can_receive() {
             self.start_rx_internal()?;

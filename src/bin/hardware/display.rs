@@ -27,7 +27,7 @@ where
     let interface = SpiInterface::new(spi, dc, buffer);
     Builder::new(ILI9341Rgb565, interface)
         .reset_pin(reset)
-        .orientation(Orientation::new().rotate(Rotation::Deg90))
+        .orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
         .init(&mut delay)
         .expect("Failed to initialize ILI9341 display")
 }

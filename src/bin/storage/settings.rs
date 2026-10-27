@@ -24,6 +24,10 @@ impl StorageKey {
         Self::from_parts(b'c', device_id)
     }
 
+    pub(crate) const fn is_contact(&self) -> bool {
+        self.len == 17 && self.bytes[0] == b'c'
+    }
+
     pub(crate) fn message(device_id: &[u8; 16], index: u32) -> Self {
         let mut value = [0; 20];
         value[..16].copy_from_slice(device_id);

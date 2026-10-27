@@ -12,7 +12,7 @@ Startup currently:
 4. `Radio::new` applies the sub-GHz LoRa profile at 869.4 MHz, including image calibration, RSSI calibration, modem/packet parameters, configured LoRa sync word (default `0x12`), HP PA, 22 dBm TX power, 48 us ramp, RC-standby fallback, and DIO9 IRQ routing.
 5. Starts GPS polling on UART1 (GPIO4/GPIO5) and publishes compact location/time snapshots to the UI through an Embassy watch.
 6. Starts the radio worker alongside a diagnostic producer that queues an unencrypted broadcast text test packet every 30 seconds. This is not a user chat send path and does not save chat history.
-7. Starts the display UI task. It currently renders screens and tracks logical UI state; physical button input, chat sending and flash-backed conversation rendering are not connected yet.
+7. Starts the display UI task. The logical chat flow supports direct text send/receive, encrypted ACK status, received GPS coordinate rows, and navigation; the physical button expander and flash-backed conversation history are not integrated.
 
 Radio pin assignment (configured through `hardware/pinout.rs`):
 
@@ -36,13 +36,14 @@ See the [HF-Kit peripheral pinout](pinout.md) for GPS, SPI TFT, and MCP23017 wir
 | --- | --- |
 | `hardware/pinout.rs` | Board wiring and constructors for radio and GPS pins. |
 | `hardware/gps.rs` | Nonblocking UART1 polling and NMEA GGA/RMC parsing. Hold a `Gps` object, call `update()` to drain UART, read `coordinate`/`time` fields. No PPS support. |
-| `crypto/mod.rs` | Software AES-256-GCM `derive_key`, `encrypt`, and `decrypt` free functions. Nonces use the ESP-HAL RNG. Packet encoding does not call these yet. |
+| `crypto/mod.rs` | PBKDF2 pair-key derivation and software AES-256-GCM helpers. Nonces use the ESP-HAL RNG; paired direct text, coordinates, and ACK payloads use per-packet authenticated encryption. |
 | `storage/storage_manager.rs` | Application-facing internal-flash API for settings, identity, contacts and message history. |
 | `hardware/display.rs` | ILI9341 driver initialization and embedded-graphics display adapter. |
 | `hardware/lr1121/lr1121.rs` | SPI transport, reset/BUSY/IRQ handling, system startup, RF-switch/TCXO/LFCLK setup, image and RSSI calibration, modem/PA/TX/RX commands, and LR-FHSS frame building. |
 | `hardware/lr1121/opcode.rs` | Typed LR1121 system, radio, packet, and LR-FHSS opcodes used by the driver. |
-| `network/packet_handler.rs` | Decodes and validates RX packets, drops self-originated and recently seen packets, and forwards broadcasts or packets addressed elsewhere. Local application delivery remains a TODO. |
-| `packet/packet_data.rs` | In-memory packet representation and basic validation. |
+| `network/packet_handler.rs` | Validates/deduplicates and forwards packets, reassembles authenticated direct text, delivers accepted text/coordinates to the chat UI, and queues ACKs for accepted direct messages. |
+| `packet/packet_data.rs` | In-memory packet representation and validation, including the 16-fragment wire bound. |
+| `packet/fragment.rs` | Band-aware text splitting and bounded reassembly of up to 512 application bytes per logical message. |
 | `packet/packet_encoder.rs` | Serializes packet fields to the wire format. |
 | `packet/packet_decoder.rs` | Parses and validates the fixed header and payload. |
 | `packet/packet_type.rs` | Packet type byte assignments and conversion from a wire byte. |
@@ -74,15 +75,16 @@ The build is verified for `xtensa-esp32s3-none-elf`; the linker currently emits 
 - LR1121 system startup, the board RF switch, TCXO/LFCLK setup, sub-GHz image calibration, RSSI calibration, PA selection, and DIO9 IRQ routing are implemented in code.
 - LR-FHSS is transmit-only in this firmware. S-band RX is rejected/not started.
 - `main.rs` starts RX and a 30-second sub-GHz test transmitter. A second board with the same frequency, modem, and sync word is required to observe received packets.
-- Each radio uses its own FIFO queue (capacity 16). The worker listens for up to 500 ms after every two queued transmissions on bands that support RX. There is no public direct-radio send path, priority class, or emergency bypass. Retries and fragmentation/reassembly are not implemented.
+- Each radio uses its own FIFO queue (capacity 16). The worker listens for up to 500 ms after every two queued transmissions on bands that support RX. There is no public direct-radio send path, priority class, or emergency bypass. Automatic packet retries are not implemented; chat text fragmentation/reassembly is bounded to 16 frames and 512 application bytes.
 - `FrequencyChange` is only a packet type. It has no announcement payload schema, handler, acceptance flow, or automatic retune behavior.
 - `RadioControl::request_frequency_change` is a local worker command, separate from the `FrequencyChange` wire packet.
-- AES-256-GCM primitives exist in `crypto/mod.rs`. An `is_encrypted` flag still does not encrypt or authenticate data by itself because the packet path does not call them.
-- Fragmentation/reassembly, contact-based authorization, local message delivery, outgoing chat sends, and saving received/sent messages are not implemented. Hop-limited forwarding and volatile duplicate suppression are implemented.
-- Flash storage and device identity are initialized by `main`; the test producer uses the ID for test packets. Settings, contacts and message-history APIs exist, but message append/read is not integrated into a chat flow yet.
+- Paired direct text, coordinates, and ACK payloads use AES-256-GCM with immutable packet headers as associated data; paired contacts reject plaintext fallback and invalid tags.
+- Discovery/pairing, outgoing direct chat, bounded fragment reassembly, incoming chat delivery, received-coordinate navigation, and in-memory ACK indicators are implemented. ACK checks are shown only for encrypted direct messages and are not persisted.
+- Flash storage and device identity are initialized by `main`; the diagnostic producer uses the ID for test packets. Settings, contacts, and message-history APIs exist, but chat messages and ACK state are not appended to flash.
 - Antenna/front-end support, actual RF range, and regulatory approval remain board/application responsibilities. No hardware TX/RX result is recorded here.
 
 ## Storage Layout
 - Settings, device identity, contacts and message records use `hardware/flash.rs` through `storage/storage_manager.rs`.
 - The display uses hardware SPI3; the LR1121 uses SPI2.
 - For message creation, append and paged-read examples, see [Storage and identity](storage-and-identity.md#saving-and-loading-messages).
+- For ACK status, text fragmentation, coordinate wire format, and navigation limits, see [Chat, fragmentation, and GPS navigation](chat-fragmentation-and-navigation.md).

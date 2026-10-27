@@ -6,8 +6,11 @@ use crate::packet::packet_type::PacketType;
 pub const PROTOCOL_VERSION: u8 = 1;
 
 pub const HEADER_SIZE: usize = 43;
+pub const AUTHENTICATED_HEADER_SIZE: usize = HEADER_SIZE - 1;
 pub const MAX_PACKET_SIZE: usize = 255;
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
+pub const MAX_LOGICAL_MESSAGE_SIZE: usize = 512;
+pub const MAX_FRAGMENT_COUNT: usize = 16;
 
 pub const GCM_NONCE_SIZE: usize = 12;
 pub const GCM_TAG_SIZE: usize = 16;
@@ -69,7 +72,10 @@ impl PacketData {
         hop_limit: u8,
     ) -> Result<Self, PacketError> {
         // Rejects invalid fragment metadata.
-        if fragment_count == 0 || fragment_index >= fragment_count {
+        if fragment_count == 0
+            || fragment_count as usize > MAX_FRAGMENT_COUNT
+            || fragment_index >= fragment_count
+        {
             return Err(PacketError::InvalidFragmentMetadata);
         }
 
@@ -108,7 +114,10 @@ impl PacketData {
         }
 
         // Rejects invalid fragment metadata.
-        if self.fragment_count == 0 || self.fragment_index >= self.fragment_count {
+        if self.fragment_count == 0
+            || self.fragment_count as usize > MAX_FRAGMENT_COUNT
+            || self.fragment_index >= self.fragment_count
+        {
             return Err(PacketError::InvalidFragmentMetadata);
         }
 
@@ -148,6 +157,21 @@ impl PacketData {
     pub fn encoded_len(&self) -> usize {
         // Calculates the full encoded size in bytes.
         HEADER_SIZE + self.payload.len()
+    }
+
+    pub fn authenticated_header(&self) -> [u8; AUTHENTICATED_HEADER_SIZE] {
+        let mut header = [0; AUTHENTICATED_HEADER_SIZE];
+        header[0] = self.version;
+        header[1..3].copy_from_slice(&self.packet_id.to_be_bytes());
+        header[3..5].copy_from_slice(&self.message_id.to_be_bytes());
+        header[5] = self.fragment_index;
+        header[6] = self.fragment_count;
+        header[7..23].copy_from_slice(&self.from);
+        header[23..39].copy_from_slice(&self.to);
+        header[39] = u8::from(self.is_encrypted);
+        header[40] = self.packet_type as u8;
+        header[41] = self.initial_hop_limit;
+        header
     }
 
     pub fn application_payload_len(&self) -> Option<usize> {

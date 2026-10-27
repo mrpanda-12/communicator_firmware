@@ -82,3 +82,4 @@ fn decode_fixed_string<const N: usize>(bytes: &[u8]) -> Result<String<N>, Serial
         .map_err(|_| SerializationError::InvalidData)?;
     Ok(value)
 }
+

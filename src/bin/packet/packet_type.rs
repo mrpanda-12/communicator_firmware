@@ -7,6 +7,8 @@ pub enum PacketType {
     Heading = 0x04,
     DeviceAnnounce = 0x05,
     FrequencyChange = 0x06,
+    DeviceAnnounceResponse = 0x07,
+    PairingConfirm = 0x08,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -20,7 +22,10 @@ impl TryFrom<u8> for PacketType {
             0x04 => Ok(Self::Heading),
             0x05 => Ok(Self::DeviceAnnounce),
             0x06 => Ok(Self::FrequencyChange),
+            0x07 => Ok(Self::DeviceAnnounceResponse),
+            0x08 => Ok(Self::PairingConfirm),
             _ => Err(()),
         }
     }
 }
+

@@ -4,12 +4,17 @@ use aes_gcm::{
 };
 use alloc::vec::Vec;
 use esp_hal::rng::Rng;
+use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
+use sha2_010::Sha256 as Pbkdf2Sha256;
+
+use crate::packet::packet_data::{GCM_OVERHEAD, PacketData};
 
 pub const KEY_SIZE: usize = 32;
 pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
 pub const OVERHEAD: usize = NONCE_SIZE + TAG_SIZE;
+const PAIR_KDF_ROUNDS: u32 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
@@ -29,23 +34,19 @@ pub fn hash_with_salt(data: &[u8], salt: &[u8]) -> [u8; KEY_SIZE] {
     hasher.finalize().into()
 }
 
-pub fn derive_key(password: &[u8]) -> [u8; KEY_SIZE] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"communicator-aes-256-gcm-key-v1");
-    hasher.update(password);
-    hasher.finalize().into()
-}
-
 pub fn derive_pair_key(password: &[u8], my_id: &[u8; 16], peer_id: &[u8; 16]) -> [u8; KEY_SIZE] {
     let mut ids = [*my_id, *peer_id];
     ids.sort_unstable_by(|a, b| a.cmp(b));
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"communicator-pair-v1");
-    hasher.update(&ids[0]);
-    hasher.update(&ids[1]);
-    hasher.update(password);
-    hasher.finalize().into()
+    const DOMAIN: &[u8] = b"communicator-pair-v2";
+    let mut salt = [0; DOMAIN.len() + 32];
+    salt[..DOMAIN.len()].copy_from_slice(DOMAIN);
+    salt[DOMAIN.len()..DOMAIN.len() + 16].copy_from_slice(&ids[0]);
+    salt[DOMAIN.len() + 16..].copy_from_slice(&ids[1]);
+
+    let mut key = [0; KEY_SIZE];
+    pbkdf2_hmac::<Pbkdf2Sha256>(password, &salt, PAIR_KDF_ROUNDS, &mut key);
+    key
 }
 
 pub fn encrypt(
@@ -86,3 +87,52 @@ pub fn decrypt(
 
     Ok(plaintext)
 }
+
+pub fn encrypt_packet_payload(
+    packet: &mut PacketData,
+    key: &[u8; KEY_SIZE],
+    plaintext: &[u8],
+) -> Result<(), CryptoError> {
+    if !packet.is_encrypted {
+        return Err(CryptoError::EncryptionFailed);
+    }
+    let aad = packet.authenticated_header();
+    let (nonce, ciphertext, tag) = encrypt(key, plaintext, &aad)?;
+    packet.payload.clear();
+    packet
+        .payload
+        .extend_from_slice(&nonce)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    packet
+        .payload
+        .extend_from_slice(&ciphertext)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    packet
+        .payload
+        .extend_from_slice(&tag)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    Ok(())
+}
+
+pub fn decrypt_packet_payload(
+    packet: &PacketData,
+    key: &[u8; KEY_SIZE],
+) -> Result<Vec<u8>, CryptoError> {
+    if !packet.is_encrypted || packet.payload.len() < GCM_OVERHEAD {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    let payload = packet.payload.as_slice();
+    let nonce = <[u8; NONCE_SIZE]>::try_from(&payload[..NONCE_SIZE])
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    let tag = <[u8; TAG_SIZE]>::try_from(&payload[payload.len() - TAG_SIZE..])
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    let ciphertext = &payload[NONCE_SIZE..payload.len() - TAG_SIZE];
+    decrypt(
+        key,
+        &nonce,
+        ciphertext,
+        &tag,
+        &packet.authenticated_header(),
+    )
+}
+

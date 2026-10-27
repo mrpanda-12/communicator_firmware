@@ -1,5 +1,6 @@
 //! Application storage facade backed by the dedicated internal-flash partition.
 
+use alloc::vec::Vec;
 use alloc::{format, string::String};
 use sequential_storage::map::{SerializationError, Value};
 
@@ -126,6 +127,10 @@ impl<'flash> StorageManager<'flash> {
             .read_contact(device_id, buffer)
             .await
             .map_err(store_error)
+    }
+
+    pub async fn load_contacts(&mut self, buffer: &mut [u8]) -> Result<Vec<Contact>, String> {
+        self.flash.load_contacts(buffer).await.map_err(store_error)
     }
 
     pub async fn append_messages(

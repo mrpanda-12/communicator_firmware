@@ -20,6 +20,7 @@ type AsyncFlash<'d> = BlockingAsync<FlashStorage<'d>>;
 #[derive(Debug)]
 pub enum StoreError {
     InvalidKey,
+    InvalidContact,
     MessageIndexOverflow,
     MissingMessageRecord,
     Storage(sequential_storage::Error<FlashStorageError>),
@@ -90,7 +91,43 @@ impl<'d> FlashStore<'d> {
             .map_err(StoreError::Storage)
     }
 
-    /// 5/ Insert or replace a contact, including its serialized pairwise key.
+    /// 5/ Load the latest records stored under contact keys for the UI list.
+    pub async fn load_contacts(
+        &mut self,
+        data_buffer: &mut [u8],
+    ) -> Result<Vec<Contact>, StoreError> {
+        let mut iterator = self
+            .storage
+            .fetch_all_items(data_buffer)
+            .await
+            .map_err(StoreError::Storage)?;
+        let mut contacts: Vec<Contact> = Vec::new();
+
+        while let Some((key, value)) = iterator
+            .next::<&[u8]>(data_buffer)
+            .await
+            .map_err(StoreError::Storage)?
+        {
+            if !key.is_contact() {
+                continue;
+            }
+
+            let (contact, _) =
+                Contact::deserialize_from(value).map_err(|_| StoreError::InvalidContact)?;
+            if let Some(existing) = contacts
+                .iter_mut()
+                .find(|existing| existing.device_id == contact.device_id)
+            {
+                *existing = contact;
+            } else {
+                contacts.push(contact);
+            }
+        }
+
+        Ok(contacts)
+    }
+
+    /// 6/ Insert or replace a contact, including its serialized pairwise key.
     pub async fn write_contact(
         &mut self,
         contact: &Contact,
@@ -103,7 +140,7 @@ impl<'d> FlashStore<'d> {
             .map_err(StoreError::Storage)
     }
 
-    /// 6/ Append only newly received or created records under monotonic per-conversation keys.
+    /// 7/ Append only newly received or created records under monotonic per-conversation keys.
     ///
     /// The separate count entry advances only after all records have been
     /// written, so a retry after a partial failure can safely reuse those indices.
@@ -136,7 +173,7 @@ impl<'d> FlashStore<'d> {
             .map_err(StoreError::Storage)
     }
 
-    /// 7/ Read one bounded page of records using a record index as the cursor.
+    /// 8/ Read one bounded page of records using a record index as the cursor.
     ///
     /// Pass `next_offset` to the next call. Keep the page size small enough for
     /// RAM; this backend's cursor is a record index (SD uses a byte offset).

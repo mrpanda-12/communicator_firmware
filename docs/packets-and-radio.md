@@ -10,7 +10,7 @@
 
 By default, `main.rs` starts RX and queues a broadcast `Text` test packet every 30 seconds. A link requires two boards with the same frequency, spreading factor, bandwidth, coding rate, preamble, header mode, CRC setting, and sync word. `RadioConfig::lora_sync_word` sets the LoRa PHY sync word and defaults to the private-network value `0x12`. The public LoRaWAN value is `0x34`, so LoRaWAN devices do not decode these packets.
 
-The build is verified, but no two-board RF test is recorded. Antenna connection, RF-switch behavior, range, and peer interoperability still require bench verification.
+`cargo check` succeeds for the configured ESP32-S3 target; no linked firmware or two-board RF test is recorded. Antenna connection, RF-switch behavior, range, and peer interoperability still require bench verification.
 
 ## Sync Words vs. Your Packet Decoder
 
@@ -63,7 +63,7 @@ Packets use one format on every RF band. The current header is 43 bytes; payload
 | `packet_type` | 40 | 1 | Application type byte. |
 | `initial_hop_limit` | 41 | 1 | Original hop limit. |
 | `hop_limit` | 42 | 1 | Current hop limit. |
-| `payload` | 43 | Variable | Application bytes, or intended encrypted payload if crypto is implemented. |
+| `payload` | 43 | Variable | Application bytes, or nonce/ciphertext/tag for encrypted packets. |
 
 Current packet type assignments:
 
@@ -73,10 +73,14 @@ Current packet type assignments:
 | `0x02` | `Ack` |
 | `0x03` | `Coordinates` |
 | `0x04` | `Heading` |
-| `0x05` | Unassigned |
+| `0x05` | `DeviceAnnounce` discovery request |
 | `0x06` | `FrequencyChange` announcement type; no handler yet |
+| `0x07` | `DeviceAnnounceResponse` |
+| `0x08` | `PairingConfirm` authenticated pairing stage |
 
-`PacketData::new` validates fragment metadata, payload capacity, and the minimum nonce/tag length when `is_encrypted` is true. It does not encrypt, authenticate, fragment, or reassemble data.
+`PacketData::new` validates fragment metadata, payload capacity, and the minimum nonce/tag length when `is_encrypted` is true. This firmware supports up to 16 fragments and 512 bytes per logical text message. Each encrypted fragment gets its own AES-256-GCM nonce and tag; other packet types are not automatically encrypted. See [protocol fragmentation and coordinates](protocol-specification.md#3-fragmentation-and-reassembly) and [chat, fragmentation, and GPS navigation](chat-fragmentation-and-navigation.md).
+
+For accepted direct `Text` and `Coordinates`, the receiver queues an `Ack` after required decryption/authentication, payload validation, and successful enqueue into the in-memory UI queue. Text ACKs are generated only after full fragment reassembly. The ACK is unicast to the sender and carries the acknowledged logical message ID as a two-byte big-endian payload. ACKs for paired contacts are AES-GCM protected; ACKs for accepted unpaired plaintext introductions are plaintext and unauthenticated. An ACK confirms receiver-side queue acceptance only—not display, reading, or flash persistence. The chat shows a green check only for the matching encrypted direct-message row; it never marks plaintext or broadcast rows and does not persist this status.
 
 ## Sending Packets
 
@@ -165,11 +169,9 @@ radio.run_worker(None, async |packet| {
 
 `RadioQueue::add_packet` is public because application tasks and the packet forwarder need to enqueue after `Radio` has moved into the worker. Application code should prefer `Radio::send_packet` whenever it still has a `Radio` value, since it also checks the active band's packet limit before enqueueing.
 
-The queue stores encoded packets, not messages. The firmware does not split a large message into fragments and does not reassemble fragments. A caller that wants a 10-fragment message must create 10 `PacketData` values with the same `message_id`, `fragment_count = 10`, and `fragment_index` values `0..=9`, then enqueue all 10.
+The queue stores encoded packets, not logical messages. The chat sender fragments text up to 512 bytes into at most 16 band-sized packets and queues each one. An empty queue can hold all fragments, but queueing is not atomic: if `Full` occurs partway through a message, already queued fragments cannot be rolled back and the receiver will not deliver an incomplete message. The worker sends queued fragments FIFO and opens a short RX window after every two transmissions; this window is not an acknowledgement and is not synchronized with the receiver.
 
-With an empty queue, capacity 16 accepts all 10 fragments in one producer burst. The worker sends them FIFO and opens a short RX window after fragments 2, 4, 6, and 8; after fragment 10 the queue is empty, so it returns to normal RX. This window is not an acknowledgement and is not synchronized with the receiver. It only gives the radio a chance to hear traffic during a long transmit burst.
-
-If a producer enqueues faster than the radio drains its queue, `Full` is returned. The producer must wait and retry later; the firmware does not buffer an unbounded message or apply backpressure by blocking `RadioQueue::add_packet`. A message with more than 16 fragments cannot be fully queued at once unless the queue capacity is raised or the producer refills it between transmissions.
+The receiver retains at most four incomplete message assemblies and evicts the oldest when that cache is full. It does not impose a wall-clock expiry. Missing fragments do not result in delivery or an ACK. The reassembly limit is 16 fragments and 512 plaintext bytes; the packet layer rejects larger fragment counts.
 
 ### Emergency and Priority Sends
 
@@ -186,13 +188,13 @@ These are design requirements, not implemented capabilities.
 
 ## Receiving, Forwarding, and Duplicates
 
-The worker reads RX buffer status and bytes, clears the IRQ, restarts RX, and passes the raw encoded packet to its async callback. `PacketHandler::handle_packet` decodes the packet, loads this device's ID from `StorageManager`, and checks a 64-entry RAM cache keyed by `(sender ID, packet_id)`. Duplicate packets are dropped before forwarding. Broadcasts are forwarded and reach the broadcast handling TODO; unicast packets for another device are forwarded and then ignored locally; packets addressed to this device reach the local handling TODO. Invalid packets and identity-load failures are logged without panicking.
+The worker reads RX buffer status and bytes, clears the IRQ, restarts RX, and passes the raw encoded packet to its async callback. `PacketHandler::handle_packet` decodes the packet, loads this device's ID from `StorageManager`, and checks a 64-entry RAM cache keyed by `(sender ID, packet_id)`. Duplicate and self-originated packets are dropped. Accepted packet origins are added to the bounded nearby-device list. Valid broadcast `DeviceAnnounce` packets receive targeted, empty, unencrypted `DeviceAnnounceResponse` packets; ordinary traffic also teaches peers passively. Paired direct text and coordinates are decrypted only after their per-packet AES-GCM tags validate against the stored sender key; missing keys, tampering, and plaintext from a paired contact are rejected. Unpaired plaintext introductions remain readable and are explicitly warned in the UI.
 
 RX is single-packet mode (`set_rx(0)`), and the worker restarts RX after each packet or error. Header errors, CRC errors, and non-RX IRQs clear the pending IRQ and restart RX.
 
-Duplicate detection in the receive handler and basic hop-limited forwarding are implemented. The 64-entry cache is volatile, so a reset clears it; an old packet can be accepted again after its key is evicted. `network::packet_router` remains empty, and local application handling is still a TODO.
+Duplicate detection in the receive handler and basic hop-limited forwarding are implemented. The 64-entry cache is volatile, so a reset clears it; an old packet can be accepted again after its key is evicted. Accepted direct and broadcast text and valid coordinates are delivered to a bounded in-memory conversation view after any required authentication/decryption; messages are not persisted as chat history. The UI lets the user select a received GPS row to open a distance and movement-direction screen.
 
-The receive-side cache deduplicates on `(from, packet_id)` before forwarding or local delivery, then forwards only if `hop_limit` is nonzero. Deduplication is not applied at TX enqueue time: retries can reuse `packet_id`, and the queue remains able to carry them. A retry received by a node while its key remains cached will be dropped, so reliable retry/acknowledgement behavior still needs a more specific policy.
+The receive-side cache deduplicates on `(from, packet_id)` before forwarding or local delivery, then forwards only if `hop_limit` is nonzero. An identical retry of a fragment from an already accepted encrypted direct message may trigger another ACK without a duplicate chat entry. The sender does not currently retry packets automatically. ACKs update only the matching encrypted direct-message row in volatile UI memory; they do not prove display or persistence.
 
 ## LR1121 Hardware Setup
 
@@ -252,7 +254,7 @@ These are LR1121 silicon ranges and firmware modem choices, not a guarantee that
 | `Sband` | 1.9-2.1 GHz | LR-FHSS | No; TX only | 133 bytes |
 | `Ism2_4Ghz` | 2.4-2.5 GHz | LoRa | Yes | 255 bytes |
 
-The common packet header remains 43 bytes. Thus the packet payload space is 212 bytes on the 255-byte profiles and 90 bytes on the current 133-byte LR-FHSS profile. The AES-256-GCM primitives add a 12-byte nonce and 16-byte tag, reducing application data capacity to 184 and 62 bytes respectively. The packet encode/decode path does not apply this encryption yet.
+The common packet header remains 43 bytes. Thus the packet payload space is 212 bytes on the 255-byte profiles and 90 bytes on the current 133-byte LR-FHSS profile. AES-256-GCM adds a 12-byte nonce and 16-byte tag, reducing application data capacity to 184 and 62 bytes respectively. The chat supports up to 512 bytes of logical text in at most 16 fragments; it sizes fragments for the active band, so a 512-byte encrypted message takes three fragments on LoRa or nine on S-band.
 
 LoRa bandwidth is represented by `LoRaBandwidth`. Sub-GHz supports 62.5, 125, 250, and 500 kHz in the current config. 2.4 GHz additionally maps 203, 406, and 812 kHz to the band-specific LR1121 encodings. S-band ignores the LoRa modulation fields and uses `LrFhssProfile::SbandDefault`.
 
@@ -285,4 +287,8 @@ For a first link test, use two boards on sub-GHz with the same configuration and
 
 ## Device Announce (Discovery)
 
-`PacketType::DeviceAnnounce = 0x05` is used for discovery. An announce is a broadcast packet (`to = [0;16]`) with empty payload, `is_encrypted = false`, and `from` set to the sender's device ID. When searching, the receiver listens for announces and adds unknown devices to a discovery list. No keys are exchanged over radio; both devices derive the pairwise key from the shared password plus both device IDs.
+`PacketType::DeviceAnnounce = 0x05` is an active discovery request: it is broadcast to `[0; 16]`, unencrypted, and has an empty payload. Receivers queue `DeviceAnnounceResponse = 0x07` directly to the requester's ID; the response is also empty and unencrypted. Separately, passive discovery remembers the sender ID from every valid accepted packet. Both paths expose public IDs only and are not authentication.
+
+After selecting an unpaired peer, users can send an explicitly warned plaintext introduction or enter the same high-entropy secret on both devices. PBKDF2-HMAC-SHA256 (100,000 iterations) derives a pair key from that secret and the sorted public IDs. The lower ID initiates an authenticated request/challenge/final exchange; fresh nonces bind the exchange and the secret is never transmitted. Paired direct `Text` packets use AES-256-GCM with the packet's immutable header fields as AAD, excluding only the mutable remaining hop limit. Relays forward encrypted packets without decrypting them. A paired contact rejects plaintext, missing-key ciphertext, and invalid tags.
+
+After an accepted direct text or coordinate message, the receiver queues a unicast `Ack` (`0x02`) with the original logical `message_id` as a two-byte big-endian payload. The ACK uses AES-GCM for a paired contact and is plaintext for an unpaired introduction. An accepted text retry can be acknowledged again without adding another chat row. On receipt, the sender shows a green check only on the in-memory encrypted direct-message row matching both peer and logical ID; plaintext and broadcast rows never show it. ACK queueing is not an over-the-air confirmation, and an ACK does not mean the message was displayed, read, or stored in flash. The check is not persisted, and an unpaired plaintext ACK is unauthenticated.

@@ -2,13 +2,16 @@
 
 ## Implemented now
 
-- The ILI9341 TFT is initialized by `hardware/display.rs` using `mipidsi` and `embedded-graphics` over hardware SPI3 at 10 MHz.
-- UI state, contact list, and renderers are split across `src/bin/ui/` rather than one large render module.
-- GPS task publishes snapshots for the persistent top bar.
-- The broadcast conversation is a permanent entry in the conversation list.
-- Screen drawing and logical key-state transitions exist.
+- The ILI9341 TFT is initialized by `hardware/display.rs` using `mipidsi` and `embedded-graphics` over hardware SPI3 at 10 MHz. UI state, contacts, and screen renderers are separated under `src/bin/ui/`.
+- GPS snapshots feed the status bar and live navigation screen. The broadcast conversation remains a permanent entry in the conversation list.
+- Nearby peers are learned passively from valid packets and actively through a user-triggered `DeviceAnnounce`/`DeviceAnnounceResponse` scan. Discovery IDs are public and unauthenticated.
+- A discovered unpaired peer can receive a clearly warned plaintext introduction. Pairing uses the locally entered shared secret, canonical public IDs, authenticated key confirmation, and a persisted contact key.
+- Paired direct text is encrypted per fragment with AES-256-GCM. The composer accepts up to 512 bytes, splits text into no more than 16 band-sized fragments, and the receiver authenticates/reassembles before delivering one chat item.
+- Accepted direct text and coordinate messages receive a targeted ACK carrying the logical message ID. Only a matching encrypted direct-message row displays a green check; the indicator is volatile and means queue acceptance, not display or persistence.
+- Received `Coordinates` packets display as selectable GPS rows. Up/Down selects a row and Enter opens distance/turn guidance; direction is estimated from successive local GPS fixes after five metres of movement.
+- A fake navigator is enabled by default because the physical button expander is not integrated. Disable it for normal operation with `cargo run --release --no-default-features`.
 
-The display is not yet a usable chat terminal: there is no physical button input task, no message send integration, no conversation-history loading/rendering, and no message persistence calls. The current chat renderer displays a history placeholder. See [Storage and identity](storage-and-identity.md#saving-and-loading-messages) for the persistence integration pattern.
+Chat send/receive and location navigation are connected to the UI, but conversation history is still bounded in RAM and is lost on restart. The app does not currently expose a control to transmit its own GPS position, does not automatically retry packets, and has no physical button input task. See [Storage and identity](storage-and-identity.md#saving-and-loading-messages) for the unintegrated history API and [Chat, fragmentation, and GPS navigation](chat-fragmentation-and-navigation.md) for protocol and navigation limits.
 
 ## Hardware
 - Display: ILI9341 2.4" SPI TFT
@@ -17,25 +20,9 @@ The display is not yet a usable chat terminal: there is no physical button input
 - Driver: `mipidsi` + `embedded-graphics`; `embedded-hal-bus` wraps the SPI device
 
 ## Layout
-```
-+----------------------------------+
-| GPS: XX.XXXX,YY.YYYY | HH:MM | FX|  <- TOP BAR (always visible)
-+----------------------------------+
-|                                  |
-|           CURRENT SCREEN         |
-|                                  |
-+----------------------------------+
-| [1][2][3][4][5]                  |
-| [6][7][8][9][0]                  |
-| [Q][W][E][R][T]                  |
-| [A][S][D][F][G]                  |
-| [<-][^][v][->][ENT]              |  <- ARROW ROW (bottom)
-+----------------------------------+
-```
-
 - Top bar is persistent - shows GPS coords/time/fix status, updated from GPS snapshot via `embassy_sync::watch` from `gps_task`.
-- Bottom row is arrow keys (left/up/down/right/enter). Top 4 rows form the character grid for typing.
-- UI state is held in `ui::state::UiState`; physical buttons are not wired into it yet.
+- The display has no keyboard. Text entry is intended for an external keyboard; the current fake navigator injects demo key events so screens can be previewed.
+- UI state is held in `ui::state::UiState`; physical input controls are not wired into it yet.
 
 ## GPS
 - GPS polling stays enabled. Disabling it would save little power on this board and would remove location/time features.
@@ -46,8 +33,13 @@ The display is not yet a usable chat terminal: there is no physical button input
 ```
 MAIN MENU
 ├── CHATS  -> merged chats list
+├── CONTACTS -> saved direct contacts + passive device discovery
 └── SETTINGS
 ```
+
+Settings opens Device, Frequency, and GPS categories. Each category contains selectable options; Enter opens a detail screen and Back returns to the previous level. The detail screens describe planned behavior and identify actions that are still previews.
+The Device > Device Info screen shows the actual 16-byte identity loaded from flash at boot and the firmware version declared in `src/bin/main.rs`. If identity loading or creation failed, the screen reports that it is unavailable.
+Contacts is separate from Settings. It lists saved direct contacts, passively heard announcements, and a one-shot action to announce this device. Listening runs in the background; opening the peer list does not transmit. A received `DeviceAnnounce` exposes the sender ID and signals that the peer chose to be discoverable. Selecting one offers an unencrypted DM after a warning. This does not save the peer as a contact. Pairing, encryption, and saving discovered devices are not wired up yet.
 
 ## Chats (Merged Message + Send)
 **No separate SEND screen** - everything is in one chat view.
@@ -114,14 +106,8 @@ CHATS
 ```
 SETTINGS
 ├── Device
-│   ├── View Device ID (hex)
-│   ├── Firmware Version
+│   ├── Device Info (device ID and firmware version)
 │   └── Reset Identity (confirm)
-├── Contacts
-│   ├── Broadcast Device ID  (send DeviceAnnounce)
-│   ├── Search for Devices   (discover announces, prompt for shared password)
-│   ├── View/Edit/Delete     (select contact -> edit name/delete)
-│   └── Blacklist
 ├── Frequency
 │   └── Change frequency (show current, cycle; may require restart)
 └── GPS
@@ -129,9 +115,7 @@ SETTINGS
 ```
 
 ### Contact Discovery & Pairing
-**Broadcaster**: `Settings > Contacts > Broadcast Device ID` → queue `DeviceAnnounce` packet (broadcast, empty payload, `PacketType::DeviceAnnounce = 0x05`)
-
-**Searcher**: `Settings > Contacts > Search for Devices` → discover mode for ~10-15s, collect announces (ignore self). Select device → prompt for shared password. Derive key with `crypto::derive_pair_key(password, &my_id, &peer_id)` (sort IDs, domain `communicator-pair-v1`). Save contact with derived key.
+`Contacts > Listen for Announces` displays IDs from valid, unencrypted broadcast `DeviceAnnounce` packets. `Contacts > Announce My Device` queues one such packet with this device's ID in its `from` header. To discover each other, both devices can announce; one can also announce while the other only listens. A peer can be messaged without being saved, but the direct message is plaintext and requires explicit confirmation before each send. Do not send secrets. Password-based pairing and encrypted messaging still need a secure key-agreement protocol and are not connected to the UI.
 
 ### Clicking device ID vs custom name
 - In chat list: if contact has custom name → show it; else show shortened hex
@@ -160,17 +144,14 @@ enum Screen {
 }
 ```
 
-## Implementation Order
-1. **Data layer** - integrate `ui/state.rs`, conversation/message types with storage
-2. **GPS snapshot sharing** - `embassy_sync::watch` in `gps_task`, top bar display
-3. **Navigation/Input** - Key mapping for 5x5 grid + arrows, screen stack
-4. **Top bar** - Always render first
-5. **ChatsList + ChatView** - Merged UI, broadcast as pseudo-convo
-6. **3-dot menu + SEND COORDS** - Context menu in input area
-7. **Contact discovery** - DeviceAnnounce send/receive, search UI, pairwise key derivation
-8. **Flash message persistence** - Save/load logical sent and received messages; decide history cap and pruning policy
-9. **Settings pages** - Device/Contacts/Frequency/GPS
-10. **Polish** - Unread counts, toasts, blacklisting
+## Remaining work
+
+1. Integrate persistent chat-history append/read with the send/receive paths and define retention/pruning behavior.
+2. Add and validate the physical button-expander input task; the default fake navigator is only a logical input source.
+3. Add an explicit user action for sharing the local GPS position if location transmission is desired.
+4. Add user-facing errors for queue-full partial fragment sends and storage capacity when history persistence is integrated.
+5. Consider retry policy and delivery-state persistence separately; an ACK check is not proof of display or storage.
+6. Continue UI polish such as unread counts and additional contact controls.
 
 ## Code Layout
 - TFT driver and board initialization helpers live in `src/bin/hardware/display.rs`.
@@ -181,7 +162,7 @@ enum Screen {
 
 ## Notes
 - Don't implement groups yet (v2). Focus on solid DMs + broadcast first.
-- Discovery uses existing announce mechanism, no key exchange over radio.
+- Discovery (passive or announce/response) is not authentication; shared-secret pairing uses authenticated key confirmation and never sends the secret.
 - GPS polling stays enabled; settings can show current fix and time status.
 - Multiple recipients: send separate packets per contact (each encrypted with their key).
-- Messages stored decrypted in flash for UI responsiveness.
+- Current conversation messages and ACK indicators are in-memory only; no chat records are written to flash yet.

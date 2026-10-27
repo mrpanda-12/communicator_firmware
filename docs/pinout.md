@@ -1,4 +1,4 @@
-# Pinout Plan
+w# Pinout Plan
 
 This is the proposed external wiring for the Waveshare ESP32-S3-LR1121-HF-Kit. GPIO assignments below use the 21 exposed module GPIOs from the supplied pinout image. Verify connector positions against the kit's schematic before soldering; this document is a wiring plan, not a confirmed board-layout drawing.
 
@@ -67,12 +67,14 @@ Use hardware SPI3 for the display; SPI2 remains dedicated to the LR1121. The cur
 | GPIO10 | CS | Dedicated display chip select, active low. |
 | GPIO9 | D/C | Data/command select. |
 | GPIO8 | RESET | Display reset. |
-| GPIO7 | LED / BL | Backlight enable; use PWM only if the breakout supports it and current is within its rating. |
+| GPIO7 | LED / BL | Active-high backlight input driven by ESP32-S3 LEDC PWM at 20 kHz. Brightness is stored as `display_brightness` from 0-100 percent; the default is 80. |
 | Not connected | MISO / SDO | Not needed for write-only display operation. |
 | 3V3 | VCC / logic supply | Prefer 3.3 V. Check the specific TFT breakout's power and logic-level circuit. |
 | GND | GND | Common ground. |
 
 The TFT breakout's microSD socket is currently unused. Firmware storage uses the ESP32-S3's dedicated internal-flash partition.
+
+The module description identifies `LED` as an active-high backlight control input and specifies 3.3 V logic, so GPIO7 can drive its PWM input directly. Power the module from 3.3 V. If the particular board revision exposes the bare backlight LEDs instead of a logic-level input, use a suitable transistor driver and current limiting rather than driving the LEDs from GPIO7. The firmware loads the saved percentage at startup; changing it currently requires saving a new value under the `display_brightness` setting and rebooting because physical settings controls are not connected yet.
 
 ### MCP23017 Button Matrix
 

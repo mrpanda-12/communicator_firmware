@@ -1,12 +1,20 @@
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    channel::Channel,
+    watch::{Receiver, Watch},
+};
 
-use crate::radio::{radio_error::RadioError, types::FrequencyBand};
+use crate::radio::{
+    radio_error::RadioError,
+    types::{FrequencyBand, RadioConfig},
+};
 
 const CONTROL_CAPACITY: usize = 1;
 
 /// 1/ Carry local control requests to one radio's worker.
 pub struct RadioControl {
     frequency_changes: Channel<CriticalSectionRawMutex, u32, CONTROL_CAPACITY>,
+    config_updates: Watch<CriticalSectionRawMutex, RadioConfig, 1>,
 }
 
 impl RadioControl {
@@ -14,6 +22,7 @@ impl RadioControl {
     pub const fn new() -> Self {
         Self {
             frequency_changes: Channel::new(),
+            config_updates: Watch::new(),
         }
     }
 
@@ -31,6 +40,16 @@ impl RadioControl {
     /// 4/ Let the owning worker wait for its next control request.
     pub(crate) async fn next_frequency_change(&self) -> u32 {
         self.frequency_changes.receive().await
+    }
+
+    /// 5/ Publish the radio's active config whenever the worker applies a change.
+    pub(crate) fn publish_config(&self, config: RadioConfig) {
+        self.config_updates.sender().send(config);
+    }
+
+    /// 6/ Give the UI a receiver for live frequency and transmit-power updates.
+    pub fn config_receiver(&self) -> Option<Receiver<'_, CriticalSectionRawMutex, RadioConfig, 1>> {
+        self.config_updates.receiver()
     }
 }
 

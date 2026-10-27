@@ -13,9 +13,23 @@ pub mod ui;
 
 static GPS_SNAPSHOT: Watch<CriticalSectionRawMutex, ui::GpsSnapshot, 2> = Watch::new();
 
+const FIRMWARE_VERSION: &str = "0.0.6";
+const RADIO_CONFIG: RadioConfig = RadioConfig {
+    frequency_band: FrequencyBand::SubGhz,
+    bandwidth: LoRaBandwidth::Khz125,
+    pa_mode: PaMode::HighPower,
+    tx_power_dbm: 22,
+    ..RadioConfig::new(869_400_000)
+};
+
 use crate::{
     hardware::{flash::FlashStore, gps::Gps, lr1121::lr1121::Lr1121, pinout},
-    network::packet_handler::PacketHandler,
+    network::{
+        discovery::DeviceDiscovery,
+        message_delivery::IncomingMessageQueue,
+        packet_handler::PacketHandler,
+        pairing::PairingCoordinator,
+    },
     packet::{
         packet_data::{DEFAULT_HOP_LIMIT, PacketData},
         packet_type::PacketType,
@@ -38,7 +52,12 @@ use esp_backtrace as _;
 // Keep esp-println's defmt-espflash global logger linked for defmt output.
 use esp_hal::{
     clock::CpuClock,
-    gpio::{Level, Output, OutputConfig},
+    gpio::{DriveMode, Level, Output, OutputConfig},
+    ledc::{
+        LSGlobalClkSource, Ledc, LowSpeed,
+        channel::{self, ChannelIFace},
+        timer::{self, TimerIFace},
+    },
     peripherals,
     rng::{Trng, TrngSource},
     spi::{
@@ -74,9 +93,9 @@ fn init_display_spi(
             .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
     )
-    .expect("Failed to initialize display SPI3")
-    .with_sck(sck)
-    .with_mosi(mosi)
+        .expect("Failed to initialize display SPI3")
+        .with_sck(sck)
+        .with_mosi(mosi)
 }
 
 /// 2/ Open the flash map over the reserved range from the real partition layout.
@@ -153,10 +172,10 @@ fn init_radio<'q>(
             .with_frequency(Rate::from_mhz(1))
             .with_mode(Mode::_0),
     )
-    .expect("Failed to initialize SPI2")
-    .with_sck(radio_pins.spi_sck)
-    .with_mosi(radio_pins.spi_mosi)
-    .with_miso(radio_pins.spi_miso);
+        .expect("Failed to initialize SPI2")
+        .with_sck(radio_pins.spi_sck)
+        .with_mosi(radio_pins.spi_mosi)
+        .with_miso(radio_pins.spi_miso);
 
     let lr1121 = Lr1121::new(
         spi,
@@ -165,17 +184,9 @@ fn init_radio<'q>(
         radio_pins.reset,
         radio_pins.irq,
     )
-    .expect("Failed to initialize LR1121");
+        .expect("Failed to initialize LR1121");
 
-    let radio_config = RadioConfig {
-        frequency_band: FrequencyBand::SubGhz,
-        bandwidth: LoRaBandwidth::Khz125,
-        pa_mode: PaMode::HighPower,
-        tx_power_dbm: 22,
-        ..RadioConfig::new(869_400_000)
-    };
-
-    Radio::new(radio_config, lr1121, radio_queue, radio_control)
+    Radio::new(RADIO_CONFIG, lr1121, radio_queue, radio_control)
         .expect("Failed to configure LR1121")
 }
 
@@ -227,6 +238,23 @@ async fn main(_spawner: Spawner) -> ! {
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
     let mut flash_buffer = [0u8; 512];
     let (mut storage, device_id) = initialize_storage(flash_store, &trng, &mut flash_buffer).await;
+    let display_brightness =
+        ui::display_settings::load_brightness(&mut storage, &mut flash_buffer).await;
+    let mut contacts = ui::contact::ContactBook::new();
+    match storage.load_contacts(&mut flash_buffer).await {
+        Ok(saved_contacts) => {
+            for contact in saved_contacts {
+                if Some(contact.device_id) != device_id {
+                    let _ = contacts.add_paired_direct(
+                        contact.device_id,
+                        contact.custom_name.as_str(),
+                        contact.key,
+                    );
+                }
+            }
+        }
+        Err(_) => defmt::warn!("Could not load saved contacts from flash"),
+    }
 
     let mut display_buffer = [0u8; 512];
     let display_cs = Output::new(peripherals.GPIO10, Level::High, OutputConfig::default());
@@ -242,10 +270,32 @@ async fn main(_spawner: Spawner) -> ! {
         embassy_time::Delay,
         &mut display_buffer,
     );
-    let _display_backlight = Output::new(peripherals.GPIO7, Level::High, OutputConfig::default());
+    // 6/ Drive the module's active-high backlight input with hardware PWM.
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+    let mut backlight_timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    backlight_timer
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty10Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_khz(20),
+        })
+        .expect("Failed to configure display backlight PWM timer");
+    let mut display_backlight =
+        ledc.channel::<LowSpeed>(channel::Number::Channel0, peripherals.GPIO7);
+    display_backlight
+        .configure(channel::config::Config {
+            timer: &backlight_timer,
+            duty_pct: display_brightness,
+            drive_mode: DriveMode::PushPull,
+        })
+        .expect("Failed to configure display backlight PWM channel");
 
     let radio_queue = RadioQueue::new();
     let radio_control = RadioControl::new();
+    let discovery = DeviceDiscovery::new();
+    let incoming_messages = IncomingMessageQueue::new();
+    let pairing = PairingCoordinator::new();
     let radio = init_radio(
         peripherals.SPI2,
         peripherals.GPIO40,
@@ -263,7 +313,15 @@ async fn main(_spawner: Spawner) -> ! {
     let mut packet_handler = PacketHandler::new();
     let radio_worker = radio.run_worker(None, async |packet| {
         packet_handler
-            .handle_packet(packet, &radio_queue, &mut storage, &mut flash_buffer)
+            .handle_packet(
+                packet,
+                &radio_queue,
+                &discovery,
+                &incoming_messages,
+                &pairing,
+                &mut storage,
+                &mut flash_buffer,
+            )
             .await;
     });
     let gps_fut = gps_task(gps);
@@ -292,7 +350,7 @@ async fn main(_spawner: Spawner) -> ! {
                 DEFAULT_HOP_LIMIT,
                 DEFAULT_HOP_LIMIT,
             )
-            .expect("valid test packet");
+                .expect("valid test packet");
 
             if radio_queue.add_packet(&packet).is_err() {
                 defmt::warn!("Test packet queue is full; dropping packet");
@@ -313,6 +371,21 @@ async fn main(_spawner: Spawner) -> ! {
     GPS_SNAPSHOT.sender().send(ui::gps_snapshot(None, None));
     let ui_fut = ui::run(
         display,
+        device_id,
+        contacts,
+        FIRMWARE_VERSION,
+        &pairing,
+        &incoming_messages,
+        pairing
+            .event_receiver()
+            .expect("Pairing event watch should be initialized"),
+        discovery
+            .receiver()
+            .expect("Discovery watch should be initialized"),
+        &radio_queue,
+        radio_control
+            .config_receiver()
+            .expect("Radio config watch should be initialized"),
         GPS_SNAPSHOT
             .receiver()
             .expect("GPS snapshot watch should be initialized"),

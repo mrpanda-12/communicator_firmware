@@ -8,12 +8,18 @@ version      = "0.1.0"
 name = "communicator"
 path = "./src/bin/main.rs"
 
+[features]
+default = ["fake-navigator"]
+fake-navigator = []
+
 [dependencies]
 esp-hal = { version = "~1.2.2", features = ["defmt", "esp32s3", "unstable"] }
 esp-storage = { version = "0.10.0", features = ["embedded-storage", "esp32s3"] }
 sequential-storage = { version = "8.0.2", default-features = false }
 embassy-embedded-hal = "0.6.0"
 sha2 = { version = "0.11.1", default-features = false }
+sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
+pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes"] }
 nmea = { version = "0.8.0", default-features = false, features = ["GGA", "RMC"] }
 chrono = { version = "0.4", default-features = false }
@@ -41,6 +47,7 @@ esp-println = { version = "0.18.0", features = ["defmt-espflash", "esp32s3"] }
 critical-section = "1.2.0"
 ed25519-dalek = "3.0.0"
 heapless = "0.9.3"
+libm = "0.2.16"
 embedded-hal = "1.0.0"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
