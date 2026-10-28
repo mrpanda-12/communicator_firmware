@@ -1,57 +1,125 @@
-use alloc::vec::Vec;
 use heapless::String;
 use sequential_storage::map::{SerializationError, Value};
 
-/// One bounded page of history, independent of the selected backend.
-pub struct MessagePage {
-    pub messages: Vec<StoredMessage>,
-    pub next_offset: u32,
-    pub done: bool,
+use crate::packet::packet_data::MAX_LOGICAL_MESSAGE_SIZE;
+
+/// Storage key attributed to broadcast history.
+pub const BROADCAST_ID: [u8; 16] = [0xff; 16];
+
+/// One conversation: the public broadcast or a direct peer.
+///
+/// This is the only conversation vocabulary; the UI, the receive path, and the
+/// share it, and storage derives its keys from the peer ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationId {
+    Broadcast,
+    Direct([u8; 16]),
 }
 
-/// Maximum UTF-8 payload bytes carried by one text/coordinate message.
-pub const MAX_MESSAGE_PAYLOAD: usize = 200;
+impl ConversationId {
+    /// Map a peer ID to its conversation; the all-zero ID means broadcast.
+    pub fn from_peer(peer_id: [u8; 16]) -> Self {
+        if peer_id == [0; 16] {
+            Self::Broadcast
+        } else {
+            Self::Direct(peer_id)
+        }
+    }
+
+    pub fn peer_id(self) -> [u8; 16] {
+        match self {
+            Self::Broadcast => [0; 16],
+            Self::Direct(peer_id) => peer_id,
+        }
+    }
+
+    pub fn is_broadcast(self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
+
+    /// Storage key of this conversation's history.
+    pub fn storage_id(self) -> [u8; 16] {
+        match self {
+            Self::Broadcast => BROADCAST_ID,
+            Self::Direct(peer_id) => peer_id,
+        }
+    }
+}
+
+/// Direction of one message relative to this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Sent,
+    Received,
+}
+
+/// Body bytes one message can carry, matching the protocol limit.
+pub const MAX_MESSAGE_PAYLOAD: usize = MAX_LOGICAL_MESSAGE_SIZE;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageKind {
     Text,
-    Coords { lat: f32, lon: f32 },
+    Coords {
+        latitude_microdegrees: i32,
+        longitude_microdegrees: i32,
+    },
 }
 
+/// One chat message in its flash record form.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredMessage {
+    /// Per-conversation record ordinal; display order comes from the record index.
     pub id: u32,
     pub from_me: bool,
     pub timestamp: u32,
     pub kind: MessageKind,
     pub text: String<MAX_MESSAGE_PAYLOAD>,
     pub packet_id: u16,
+    pub message_id: u16,
+    pub sender_id: [u8; 16],
+    pub encrypted: bool,
+    /// Set when our peer acknowledged the message; not meaningful for received rows.
+    pub acknowledged: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConversationKind {
-    Broadcast,
-    Dm([u8; 16]),
+impl StoredMessage {
+    /// Build one record that is ready to append for a complete message.
+    pub fn new(
+        conversation_ordinal: u32,
+        direction: Direction,
+        timestamp: u32,
+        kind: MessageKind,
+        text: &str,
+        packet_id: u16,
+        message_id: u16,
+        sender_id: [u8; 16],
+        encrypted: bool,
+    ) -> Self {
+        let mut stored_text = String::new();
+        let _ = stored_text.push_str(text);
+        Self {
+            id: conversation_ordinal,
+            from_me: direction == Direction::Sent,
+            timestamp,
+            kind,
+            text: stored_text,
+            packet_id,
+            message_id,
+            sender_id,
+            encrypted,
+            acknowledged: false,
+        }
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Conversation {
-    pub kind: ConversationKind,
-    pub last_activity: u32,
-    pub unread_count: u8,
-    pub display_name: String<32>,
-}
-
-/// Legacy in-memory convenience type. Persist message histories as indexed records.
-#[derive(Clone, Debug)]
-pub struct MessageStore {
-    pub messages: Vec<StoredMessage>,
-}
-
-const MESSAGE_FIXED_BYTES: usize = 1 + 4 + 4 + 2 + 1 + 1;
+// id, from_me, timestamp, packet_id, message_id, sender_id, encrypted, kind, text_len.
+const MESSAGE_FIXED_BYTES: usize = 4 + 1 + 4 + 2 + 2 + 16 + 1 + 1 + 2;
+/// One trailing byte records the acknowledged flag.
+const ACK_FLAG_BYTES: usize = 1;
 
 impl<'a> Value<'a> for StoredMessage {
     fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, SerializationError> {
+        // Coordinates add eight bytes; text messages add only their text.
         let coordinate_bytes = match &self.kind {
             MessageKind::Text => 0,
             MessageKind::Coords { .. } => 8,
@@ -59,49 +127,62 @@ impl<'a> Value<'a> for StoredMessage {
         let required = MESSAGE_FIXED_BYTES
             .checked_add(coordinate_bytes)
             .and_then(|n| n.checked_add(self.text.len()))
+            .and_then(|n| n.checked_add(ACK_FLAG_BYTES))
             .ok_or(SerializationError::InvalidData)?;
         if buffer.len() < required {
             return Err(SerializationError::BufferTooSmall);
         }
 
         let mut offset = 0;
-        buffer[offset] = u8::from(self.from_me);
-        offset += 1;
         buffer[offset..offset + 4].copy_from_slice(&self.id.to_le_bytes());
         offset += 4;
+        buffer[offset] = u8::from(self.from_me);
+        offset += 1;
         buffer[offset..offset + 4].copy_from_slice(&self.timestamp.to_le_bytes());
         offset += 4;
         buffer[offset..offset + 2].copy_from_slice(&self.packet_id.to_le_bytes());
         offset += 2;
+        buffer[offset..offset + 2].copy_from_slice(&self.message_id.to_le_bytes());
+        offset += 2;
+        buffer[offset..offset + 16].copy_from_slice(&self.sender_id);
+        offset += 16;
+        buffer[offset] = u8::from(self.encrypted);
+        offset += 1;
 
         match &self.kind {
             MessageKind::Text => {
                 buffer[offset] = 0x01;
                 offset += 1;
             }
-            MessageKind::Coords { lat, lon } => {
+            MessageKind::Coords {
+                latitude_microdegrees,
+                longitude_microdegrees,
+            } => {
                 buffer[offset] = 0x02;
                 offset += 1;
-                buffer[offset..offset + 4].copy_from_slice(&lat.to_le_bytes());
+                buffer[offset..offset + 4].copy_from_slice(&latitude_microdegrees.to_le_bytes());
                 offset += 4;
-                buffer[offset..offset + 4].copy_from_slice(&lon.to_le_bytes());
+                buffer[offset..offset + 4].copy_from_slice(&longitude_microdegrees.to_le_bytes());
                 offset += 4;
             }
         }
 
-        buffer[offset] = self.text.len() as u8;
-        offset += 1;
+        buffer[offset..offset + 2].copy_from_slice(&(self.text.len() as u16).to_le_bytes());
+        offset += 2;
         buffer[offset..offset + self.text.len()].copy_from_slice(self.text.as_bytes());
         offset += self.text.len();
+        buffer[offset] = u8::from(self.acknowledged);
+        offset += 1;
         Ok(offset)
     }
 
     fn deserialize_from(buffer: &'a [u8]) -> Result<(Self, usize), SerializationError> {
-        // Minimum header through the kind marker. Coordinate messages need 8 extra bytes.
-        if buffer.len() < 12 {
+        // The shortest record is a text message with no text.
+        if buffer.len() < MESSAGE_FIXED_BYTES + ACK_FLAG_BYTES {
             return Err(SerializationError::BufferTooSmall);
         }
         let mut offset = 0;
+        let id = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
         let from_me = match buffer[offset] {
             0 => false,
             1 => true,
@@ -109,30 +190,17 @@ impl<'a> Value<'a> for StoredMessage {
         };
         offset += 1;
 
-        let id = u32::from_le_bytes(
-            buffer
-                .get(offset..offset + 4)
-                .ok_or(SerializationError::BufferTooSmall)?
-                .try_into()
-                .map_err(|_| SerializationError::InvalidFormat)?,
-        );
-        offset += 4;
-        let timestamp = u32::from_le_bytes(
-            buffer
-                .get(offset..offset + 4)
-                .ok_or(SerializationError::BufferTooSmall)?
-                .try_into()
-                .map_err(|_| SerializationError::InvalidFormat)?,
-        );
-        offset += 4;
-        let packet_id = u16::from_le_bytes(
-            buffer
-                .get(offset..offset + 2)
-                .ok_or(SerializationError::BufferTooSmall)?
-                .try_into()
-                .map_err(|_| SerializationError::InvalidFormat)?,
-        );
-        offset += 2;
+        let timestamp = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
+        let packet_id = u16::from_le_bytes(read_array::<2>(buffer, &mut offset)?);
+        let message_id = u16::from_le_bytes(read_array::<2>(buffer, &mut offset)?);
+        let sender_id = read_array::<16>(buffer, &mut offset)?;
+
+        let encrypted = match buffer[offset] {
+            0 => false,
+            1 => true,
+            _ => return Err(SerializationError::InvalidFormat),
+        };
+        offset += 1;
 
         let kind_tag = *buffer
             .get(offset)
@@ -141,31 +209,19 @@ impl<'a> Value<'a> for StoredMessage {
         let kind = match kind_tag {
             0x01 => MessageKind::Text,
             0x02 => {
-                let lat = f32::from_le_bytes(
-                    buffer
-                        .get(offset..offset + 4)
-                        .ok_or(SerializationError::BufferTooSmall)?
-                        .try_into()
-                        .map_err(|_| SerializationError::InvalidFormat)?,
-                );
-                offset += 4;
-                let lon = f32::from_le_bytes(
-                    buffer
-                        .get(offset..offset + 4)
-                        .ok_or(SerializationError::BufferTooSmall)?
-                        .try_into()
-                        .map_err(|_| SerializationError::InvalidFormat)?,
-                );
-                offset += 4;
-                MessageKind::Coords { lat, lon }
+                let latitude_microdegrees =
+                    i32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
+                let longitude_microdegrees =
+                    i32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
+                MessageKind::Coords {
+                    latitude_microdegrees,
+                    longitude_microdegrees,
+                }
             }
             _ => return Err(SerializationError::InvalidFormat),
         };
 
-        let text_len = *buffer
-            .get(offset)
-            .ok_or(SerializationError::BufferTooSmall)? as usize;
-        offset += 1;
+        let text_len = u16::from_le_bytes(read_array::<2>(buffer, &mut offset)?) as usize;
         if text_len > MAX_MESSAGE_PAYLOAD {
             return Err(SerializationError::InvalidData);
         }
@@ -182,6 +238,15 @@ impl<'a> Value<'a> for StoredMessage {
             .map_err(|_| SerializationError::InvalidData)?;
         offset = text_end;
 
+        // The trailing flag defaults to unacknowledged for records saved before
+        // the field existed.
+        let acknowledged = match buffer.get(offset) {
+            Some(0) | None => false,
+            Some(1) => true,
+            _ => return Err(SerializationError::InvalidFormat),
+        };
+        offset += 1;
+
         Ok((
             Self {
                 id,
@@ -190,8 +255,29 @@ impl<'a> Value<'a> for StoredMessage {
                 kind,
                 text,
                 packet_id,
+                message_id,
+                sender_id,
+                encrypted,
+                acknowledged,
             },
             offset,
         ))
     }
+}
+
+fn read_array<const N: usize>(
+    buffer: &[u8],
+    offset: &mut usize,
+) -> Result<[u8; N], SerializationError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(SerializationError::InvalidData)?;
+    let bytes = buffer
+        .get(*offset..end)
+        .ok_or(SerializationError::BufferTooSmall)?;
+    let array = bytes
+        .try_into()
+        .map_err(|_| SerializationError::InvalidFormat)?;
+    *offset = end;
+    Ok(array)
 }

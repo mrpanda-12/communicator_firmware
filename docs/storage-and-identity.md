@@ -2,9 +2,16 @@
 
 ## Storage policy
 
-`storage::storage_manager::StorageManager` is the application-facing API. The current implementation uses the dedicated internal-flash partition for settings, device identity, contacts and message history. There is no SD-card backend or runtime storage-location setting.
+`storage::storage_manager::StorageManager` is the application-facing API. It uses the dedicated internal-flash partition for settings, device identity, contacts and message history. There is no SD-card backend or runtime storage-location setting.
 
-Storage provides persistence primitives for chat history, but the current chat send/receive paths do not append messages to flash. Conversation messages are currently held in the UI's bounded in-memory view and are lost on restart. The append examples below describe the storage API, not an integrated application path.
+Chat history has exactly two writers, both calling `add_messages` directly:
+
+- the receive path (`packet_handler.rs`) after decrypting and reassembling an accepted message, and
+- the UI send path (`ui/mod.rs`) right after the fragments are accepted by the TX queue.
+
+The UI never caches messages across screens: it reads the records it needs per event. See [Message delivery](messaging.md) for the notifications that coordinate this.
+
+`storage::session::Flash` is the shared handle to the device and its scratch buffer. `Flash::with(async |session| ...)` runs one storage call with exclusive access and returns before anything else needs the lock; RX, the UI, and the flush task all go through it, so no caller has to manage the guard.
 
 | Data | Backend | API |
 | --- | --- | --- |
@@ -84,6 +91,8 @@ Identity is stored in flash as exactly 16 bytes. Create one only when absent; re
 
 `Contact` stores a 16-byte device ID, a `KEY_SIZE` derived key and a custom UTF-8 name with capacity 32 bytes. The key is the lookup key for the flash map. `display_name()` returns the custom name or the ID as 32 uppercase hexadecimal characters. With the current 32-byte AES key, its fixed record is 80 bytes. `main.rs` uses a 512-byte reusable flash scratch buffer. This leaves room for the largest current message plus map key and storage overhead; increase it if message or record sizes grow.
 
+Peers that message this device without a saved contact do **not** get a flash record: they exist only as runtime rows in the UI's contact book until a real pairing creates one, and their block state is therefore session-only.
+
 Contact keys are serialized without application-level encryption. Paired direct messages use AES-256-GCM in the packet path, but the contact key itself is not protected at the application serialization layer; see [Security status](#security-status).
 
 ## Saving and loading messages
@@ -101,49 +110,50 @@ use crate::storage::message::{MessageKind, StoredMessage, MAX_MESSAGE_PAYLOAD};
 let mut text = String::<MAX_MESSAGE_PAYLOAD>::new();
 text.push_str(input_text).map_err(|_| "message is too long")?;
 
-let message = StoredMessage {
-    id: u32::from(message_id),
-    from_me: true,
-    timestamp: timestamp_seconds,
-    kind: MessageKind::Text,
+let stored = StoredMessage::new(
+    u32::from(message_id),
+    Direction::Sent,
+    0, // timestamp seconds; no wall clock is available yet
+    MessageKind::Text,
     text,
-    packet_id,
-};
+    first.packet_id,
+    first.message_id,
+    device_id,
+    encrypted,
+);
 
 storage
-    .append_messages(&peer_device_id, core::slice::from_ref(&message), &mut flash_buffer)
+    .append_messages(&conversation.storage_id(), &[stored], &mut flash_buffer)
     .await?;
 ```
 
-For a sent broadcast, call `append_broadcast_messages` instead of `append_messages`. It stores the history under `[0xff; 16]`; the radio packet's broadcast destination remains `[0; 16]`.
+For a sent broadcast, `Conversation::storage_id()` maps `broadcast` to
+`[0xff; 16]`; the radio packet's broadcast destination remains `[0; 16]`.
 
-The current UI records a sent message in its in-memory conversation after every fragment is accepted into the TX queue; it does not append that message to flash. Queue acceptance is not proof of over-the-air delivery. The receiver sends an ACK after an accepted direct text or coordinate message reaches its chat queue, but this does not prove that the message was displayed or persisted. When the sender receives an ACK for an encrypted direct message, the matching in-memory chat row gets a green check; plaintext and broadcast messages are not marked. This status is not persisted. `StoredMessage` currently has no delivery-state field.
+The UI persists a sent message after every fragment is accepted into the TX queue. Queue acceptance is not proof of over-the-air delivery. The receiver sends an ACK after an accepted direct text or coordinate message is persisted, but this does not prove that the message was displayed. When the sender receives an ACK for an encrypted direct message, the matching sent record's `acknowledged` flag is rewritten in flash, and the row's grey "SENDING.." becomes a green "OK"; plaintext and broadcast messages are not marked and never change once sent.
 
 ### Save a received message
 
 After RX processing has validated and, for a paired direct message, authenticated/decrypted a message addressed to this device, build a `StoredMessage` with `from_me: false`. Use the sender's device ID as the direct conversation key. Store a received broadcast with `append_broadcast_messages`. Do not persist relayed packets as chat messages; forwarding and local chat delivery are separate operations.
 
-The current receive path delivers accepted direct text and coordinates to the chat UI but does not append them to persistent history. Text is decrypted per fragment, reassembled up to 512 bytes, then UTF-8-validated before UI delivery. A direct-message ACK is queued only after all required authentication, payload validation, and successful enqueueing to the in-memory chat queue. Do not store encrypted bytes as display text; decode/decrypt first.
+The current receive path persists accepted direct text and coordinates directly: text is decrypted per fragment, reassembled up to 512 bytes, then UTF-8-validated before a record is appended. A direct-message ACK is queued only after all required authentication, payload validation, and persistence succeed. Do not store encrypted bytes as display text; decode/decrypt first.
+
+Deleting history is part of the API: `delete_conversation(device_id)` removes a peer's records and `delete_all_conversations()` clears every conversation, both used by the contact-manage and chats screens. Deletions bump the storage revision, so list previews update without a full redraw.
 
 ### Read conversation history
 
 Start at offset zero when opening a conversation. Render the returned records, then request another page with its `next_offset` if `done` is false. For a paginated UI, retain the cursor or reload earlier pages when the user scrolls back. The cursor is an index into that conversation, not a global message ID.
 
-```rust
-let mut message_buffer = [0u8; 512];
+The UI keeps it simple and reads only recent history:
 
-let mut offset = 0;
-loop {
-    let page = storage
-        .load_messages_page(&peer_id, offset, 32, &mut message_buffer)
-        .await?;
-    // Render or process page.messages, then drop the page before loading another.
-    offset = page.next_offset;
-    if page.done {
-        break;
-    }
-}
+```rust
+// The four most recent records of one conversation, oldest first.
+let records = storage
+    .load_recent_messages(&conversation.storage_id(), 4, &mut flash_buffer)
+    .await?;
 ```
+
+Paged reads still exist for older history:
 
 For broadcast history, use `load_broadcast_messages_page(offset, count, buffer)`. The page size limits the number returned in one call. The largest current message is a coordinate message with a 200-byte text payload (221 serialized bytes); the 512-byte scratch buffer accommodates one record and map overhead. Returned `page.messages` is a RAM vector containing up to the requested page size, so keep that size modest.
 
@@ -154,5 +164,5 @@ There is currently no history limit, pruning or compaction policy in `StorageMan
 - Paired direct text, coordinate, and ACK payloads use AES-256-GCM with immutable packet-header context as AAD; unpaired introductions, unpaired coordinates, and their ACKs may be plaintext and unauthenticated.
 - Pair keys are derived with PBKDF2-HMAC-SHA256 from the shared secret and both sorted public device IDs. Device IDs alone are not secret key material.
 - Contact records hold derived keys in plaintext at the application serialization layer.
-- A received-message ACK carries the acknowledged logical message ID as a two-byte big-endian payload. It indicates acceptance into the receiver's in-memory chat queue, not display or persistent storage. Only a matching encrypted direct-message row gets a green check; ACK status is volatile, and plaintext ACKs for unpaired introductions are unauthenticated.
-- Text fragmentation/reassembly is bounded to 16 packets and 512 application bytes; incomplete assemblies are volatile and may be evicted. Persistent chat-history integration is not implemented. Received GPS navigation relies on local GPS fixes and is not a compass or road-routing system. Discovery IDs remain unauthenticated, and relays forward protected packets without decrypting them.
+- A received-message ACK exists only for an encrypted direct message. Its payload names the original sender, recipient, and logical message ID and is authenticated with the contact key. It indicates acceptance by the receiver's storage, not display. Only a matching encrypted direct-message row gets the green check, and the flag is persisted with the message record.
+- Text fragmentation/reassembly is bounded to 16 packets and 512 application bytes; incomplete assemblies are volatile and may be evicted. Received GPS navigation relies on local GPS fixes and is not a compass or road-routing system. Discovery IDs remain unauthenticated, and relays forward protected packets without decrypting them.

@@ -6,6 +6,8 @@ use crate::packet::packet_type::PacketType;
 pub const PROTOCOL_VERSION: u8 = 1;
 
 pub const HEADER_SIZE: usize = 43;
+
+/// Header bytes covered by AES-GCM; the trailing hop limit is excluded.
 pub const AUTHENTICATED_HEADER_SIZE: usize = HEADER_SIZE - 1;
 pub const MAX_PACKET_SIZE: usize = 255;
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
@@ -159,19 +161,39 @@ impl PacketData {
         HEADER_SIZE + self.payload.len()
     }
 
-    pub fn authenticated_header(&self) -> [u8; AUTHENTICATED_HEADER_SIZE] {
-        let mut header = [0; AUTHENTICATED_HEADER_SIZE];
+    /// Write the fixed header in wire order, including the mutable hop limit.
+    pub(crate) fn write_header(&self, header: &mut [u8; HEADER_SIZE]) {
+        // Stores the protocol version at byte 0.
         header[0] = self.version;
+        // Stores the big-endian packet ID across bytes 1-2.
         header[1..3].copy_from_slice(&self.packet_id.to_be_bytes());
+        // Stores the big-endian message ID across bytes 3-4.
         header[3..5].copy_from_slice(&self.message_id.to_be_bytes());
+        // Stores the fragment index and count in bytes 5-6.
         header[5] = self.fragment_index;
         header[6] = self.fragment_count;
+        // Stores the sender device ID across bytes 7-22.
         header[7..23].copy_from_slice(&self.from);
+        // Stores the recipient device ID across bytes 23-38.
         header[23..39].copy_from_slice(&self.to);
+        // Stores the encryption flag at byte 39.
         header[39] = u8::from(self.is_encrypted);
+        // Stores the packet type at byte 40.
         header[40] = self.packet_type as u8;
+        // Stores the original hop limit at byte 41.
         header[41] = self.initial_hop_limit;
-        header
+        // Stores the remaining hop limit at byte 42; relays may lower it.
+        header[42] = self.hop_limit;
+    }
+
+    /// Return the immutable header bytes used as AES-GCM associated data.
+    pub fn authenticated_header(&self) -> [u8; AUTHENTICATED_HEADER_SIZE] {
+        let mut header = [0; HEADER_SIZE];
+        self.write_header(&mut header);
+        // The hop limit is the last header byte and the only mutable field.
+        let mut authenticated = [0; AUTHENTICATED_HEADER_SIZE];
+        authenticated.copy_from_slice(&header[..AUTHENTICATED_HEADER_SIZE]);
+        authenticated
     }
 
     pub fn application_payload_len(&self) -> Option<usize> {

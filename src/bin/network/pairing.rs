@@ -5,23 +5,12 @@ use embassy_sync::{
 
 use crate::{
     crypto::{self, KEY_SIZE},
-    packet::{packet_data::{DEFAULT_HOP_LIMIT, GCM_OVERHEAD, PacketData}, packet_type::PacketType},
+    network::types::{PairingEvent, PairingStage, PendingPairing},
+    packet::{
+        packet_data::{DEFAULT_HOP_LIMIT, GCM_OVERHEAD, PacketData},
+        packet_type::PacketType,
+    },
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingPairing {
-    pub peer_id: [u8; 16],
-    pub key: [u8; KEY_SIZE],
-    pub request_nonce: Option<[u8; crypto::NONCE_SIZE]>,
-    pub response_nonce: Option<[u8; crypto::NONCE_SIZE]>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PairingEvent {
-    pub peer_id: [u8; 16],
-    pub succeeded: bool,
-    pub key: [u8; KEY_SIZE],
-}
 
 pub struct PairingCoordinator {
     pending: Watch<CriticalSectionRawMutex, Option<PendingPairing>, 1>,
@@ -87,13 +76,6 @@ impl Default for PairingCoordinator {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PairingStage {
-    Request = 0,
-    Challenge = 1,
-    Finish = 2,
 }
 
 pub fn pairing_stage(packet: &PacketData) -> Option<PairingStage> {

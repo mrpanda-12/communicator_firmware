@@ -16,6 +16,8 @@ pub const ACK_GREEN: Rgb565 = Rgb565::new(0, 63, 0);
 pub const BLUE: Rgb565 = Rgb565::new(0, 20, 48);
 pub const SELECTED: Rgb565 = Rgb565::new(8, 35, 50);
 pub const MUTED: Rgb565 = Rgb565::new(35, 43, 52);
+/// Unverified peers (heard on air, never paired) in the chats list.
+pub const UNKNOWN: Rgb565 = Rgb565::new(60, 35, 0);
 pub const WARNING: Rgb565 = Rgb565::new(31, 40, 0);
 
 /// 1/ Draw one text line with the compact system font or the larger page-title font.

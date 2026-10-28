@@ -24,7 +24,7 @@ The LR1121 RF switch is controlled by the radio's own DIO pins through `SetDioAs
 
 ## Peripheral Wiring
 
-The GPS and TFT wiring below is configured in the current firmware. MCP23017 wiring is still a plan; there is no I2C button driver or physical button input task yet.
+The GPS and TFT wiring below is configured in the current firmware. The MCP23017 matrix wiring also matches `hardware/keypad.rs`; the expander has not been tested on hardware yet, and the firmware keeps running (with no keypad input) when it does not answer.
 
 ### u-blox NEO-M6N GPS
 
@@ -78,28 +78,78 @@ The module description identifies `LED` as an active-high backlight control inpu
 
 ### MCP23017 Button Matrix
 
-Connect the expander to I2C and use its 16 GPIO pins for a 4-row by 5-column matrix (nine expander pins total).
+The expander drives a 5-row by 5-column matrix: ten matrix pins, plus power, I2C and the interrupt. Add one diode per key in series with the switch, as shown below.
 
-| ESP32-S3 GPIO | MCP23017 | Notes |
+#### Solder list
+
+Pin numbers are for the PDIP-28, SOIC-28 and SSOP-28 packages, which share the same numbering; the QFN-28 package is numbered differently, so use the port names there. Most breakout boards silkscreen the port names too, in which case follow the names.
+
+The datasheet names the ports GPA0-GPA7 and GPB0-GPB7; breakouts usually print them as **PA0-PA7** and **PB0-PB7**, which is what the table uses.
+
+| MCP pin | Label | Connect to |
 | ---: | --- | --- |
-| GPIO17 | SDA | I2C data. |
-| GPIO18 | SCL | I2C clock. |
-| GPIO16 | INTA or INTB | Active-low interrupt output; configure open-drain/polarity consistently with the pull-up. |
-| 3V3 | VDD | Use 3.3 V logic. |
-| GND | VSS | Common ground. |
-| 3V3 | A0, A1, A2 | Example address strap for address `0x20`; change only if the bus has another device at that address. |
-| GND | RESET | Hold reset high, or connect to a controlled reset GPIO if required by the breakout. |
+| 9 | VDD | 3V3 (3.3 V logic only) |
+| 10 | VSS | GND |
+| 15 | A0 | GND |
+| 16 | A1 | GND |
+| 17 | A2 | GND |
+| 18 | RESET | 3V3 through 10 kΩ (or a controlled ESP32 GPIO if reset is needed) |
+| 12 | SCL | ESP32-S3 GPIO18, with 4.7 kΩ pull-up to 3V3 |
+| 13 | SDA | ESP32-S3 GPIO17, with 4.7 kΩ pull-up to 3V3 |
+| 20 | INTA | ESP32-S3 GPIO16; firmware enables the internal pull-up, an external 10 kΩ is optional |
+| 19 | INTB | leave open (IOCON mirrors INTB onto INTA) |
+| 11, 14 | NC | leave open |
+| 21 | PA0 | row 0 |
+| 22 | PA1 | row 1 |
+| 23 | PA2 | row 2 |
+| 24 | PA3 | row 3 |
+| 25 | PA4 | column 0 |
+| 26 | PA5 | column 1 |
+| 27 | PA6 | column 2 |
+| 28 | PA7 | column 3 |
+| 1 | PB0 | column 4 |
+| 2 | PB1 | row 4 |
+| 3-8 | PB2-PB7 | leave open (unused pulled-up inputs) |
 
-Suggested matrix allocation:
+On a typical breakout one header runs PB0-PB7 and the other runs PA7-PA0, so the two sides are in opposite order. Follow the printed label, not the pin position, and if the board only numbers the pins use the table above.
 
-| MCP23017 pins | Matrix role |
-| --- | --- |
-| GPA0-GPA3 | Row inputs with pull-ups |
-| GPA4-GPA7 | Column drive outputs |
-| GPB0 | Fifth column drive output |
-| GPB1-GPB7 | Spare |
+Strap A0, A1 and A2 low: that is address `0x20`, which is what the firmware uses. Tying any of them high changes the address and the keypad stops answering. If your breakout already ties A0-A2 to GND, do not also strap them elsewhere.
 
-Firmware can idle all columns as low outputs so a pressed key pulls a row low and triggers the MCP23017 interrupt. For scanning, change all columns to inputs, then make one column a low output at a time and sample the four pulled-up rows; restore the idle state afterward. Configure the interrupt polarity/open-drain option and its pull-up according to the MCP23017 breakout and datasheet. If simultaneous multi-key rollover is required, add a diode per key; otherwise a 4×5 matrix can ghost when multiple keys are pressed.
+Parts for one keypad: one MCP23017, 24 keys, 24 × 1N4148 (or 1N4148W), 2 × 4.7 kΩ pull-ups for SDA/SCL, and 1 × 10 kΩ for RESET.
+
+#### Key grid and diode orientation
+
+Every cell is the key switch in series with a diode:
+
+```text
+row line ────[ key ]────|>|──── column line
+                         ^
+                         diode band (cathode) faces the column
+```
+
+The cell at row `R` and column `C` holds this key:
+
+| row \ column | C0 PA4 | C1 PA5 | C2 PA6 | C3 PA7 | C4 PB0 |
+| --- | --- | --- | --- | --- | --- |
+| R0 PA0 | `0` | `1` | `2` | `3` | `SEND` |
+| R1 PA1 | `4` | `5` | `6` | `7` | `BACK` |
+| R2 PA2 | `8` | `9` | `A` | `B` | `ENTER` |
+| R3 PA3 | `C` | `D` | `E` | `F` | `HELP` |
+| R4 PB1 | `UP` | `DOWN` | `LEFT` | `RIGHT` | unused |
+
+- In the drawing, the bar of `|>|` is the diode cathode and faces the column wire; the plain end (anode) faces the row. Orient the physical part the same way.
+- Switch and diode are simply in series, so either order works along the cell: row → switch → diode → column, or row → diode → switch → column. Only the diode direction matters. A convenient build is: one key leg to the row wire, the other key leg to the diode anode, diode cathode (band) to the column wire.
+- One diode per key. Through-hole 1N4148 is fine; for a PCB use 1N4148W or a BAT54 in the same orientation.
+- The diode is what makes multiple simultaneous keys safe. A scan drives one column low and the other four high, then reads the pulled-up rows. Without the diodes, three keys forming a rectangle connect a driven-high column through two switches to the low column, so the two column outputs fight each other far above the expander's 25 mA per-pin rating; in a floating-column design the same rectangle also produces a phantom fourth key. With the diodes, current can only flow row → key → column.
+- Level check: the 100 kΩ row pull-up limits current to about 33 µA, so a silicon diode drops only ~0.3 V, far below the expander's `0.3 x VDD` input-low threshold. Reverse leakage is nanoamps, so unpressed keys cannot pull a row low.
+- One cell is unused: row 4 column 4. Do not fit a key there.
+- Build tip: bus five row wires horizontally and five column wires vertically, and put each key plus its diode across one row/column crossing. Keep the diode close to the key and check the band direction before soldering all 25.
+
+The matrix is interrupt-driven. Columns idle low, so pressing a key pulls its pulled-up row low and the expander's interrupt-on-change latches INTA low; the worker waits for that falling edge on GPIO16 instead of polling. On a wake it drives one column low while the other four go high, reads the rows, then restores the idle-low state and reads the ports once more to clear the latch. A key must read the same for three 10 ms scans after the edge before it counts as a press, and a burst also runs while a change is still settling, so a bouncing contact cannot lose an event. Idle I2C traffic is zero; each press costs a short burst of scans.
+
+At address `0x20` over a 400 kHz bus, the driver configures the expander as: `IOCON=0x44` (INTB mirrored onto INTA, open-drain active-low output), `IODIRA=0x0F`, `IODIRB=0xFD` (only PB0 is an output), `IPOL=0` (active-low rows), `GPPUA=0x0F`, `GPPUB=0xFE`, `INTCON=0` (interrupt on any change), `GPINTENA=0x0F`, `GPINTENB=0x02` (rows only), and idle `OLATA=0x00` / `OLATB=0x00`. Registers are written one at a time in the reset default BANK=0, byte mode. If the expander does not answer, the driver reconfigures on the next attempt and the UI simply gets no key events.
+
+SEND is the first action key so it sits at the top of the function column, and HELP opens the on-screen legend. Hex digits are typed as ASCII pairs, so `4` then `5` types `E` (`0x45`); the composer shows the pending digit while it waits for its pair.
 
 ## Consolidated GPIO Plan
 
@@ -117,7 +167,7 @@ Firmware can idle all columns as low outputs so a pressed key pulls a row low an
 | 11 | TFT MOSI (SPI3 hardware). |
 | 12 | TFT SCLK (SPI3 hardware). |
 | 13-15 | Spare. |
-| 16 | MCP23017 interrupt. |
+| 16 | MCP23017 INTA interrupt (open-drain, active-low) for keypad wake-up. |
 | 17 | I2C SDA to MCP23017. |
 | 18 | I2C SCL to MCP23017. |
 | 38-42, 45-46 | LR1121 signals; do not reassign. |
@@ -131,7 +181,7 @@ GPIO27-GPIO32 are not used by the current application. They are not in the suppl
 2. Verify each breakout's supply voltage, logic levels, pull-ups, and current draw. Power the TFT backlight from a suitable supply, not directly from a GPIO.
 3. Verify GPS NMEA output on GPIO4/5 on the target board.
 4. Verify ILI9341 updates on SPI3 using GPIO12/11 and its CS/D-C/RESET pins.
-5. If adding the MCP23017, bring it up on GPIO17/18, verify address `0x20`, then test rows/columns and the interrupt on GPIO16.
+5. If adding the MCP23017, bring it up on GPIO17/18, verify address `0x20`, confirm INTA on GPIO16 pulses low on a press and returns high after the scan, then test all five rows and columns through the 5x5 keypad layout. Press three keys that form a rectangle to confirm the per-key diodes prevent a phantom fourth key.
 6. Keep LR1121 and GPS GPIO assignments unchanged when wiring the button expander.
 
 ## References

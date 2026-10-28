@@ -2,80 +2,92 @@ use core::fmt::Write;
 
 use heapless::{String, Vec};
 
-use crate::{crypto::KEY_SIZE, network::message_delivery::MESSAGE_TEXT_CAPACITY};
+pub use crate::storage::contact::Contact;
+pub use crate::storage::message::ConversationId;
 
 const MAX_CONTACTS: usize = 32;
 const CONTACT_NAME_CAPACITY: usize = 32;
+/// Characters of the last message shown under a contact row.
+pub const PREVIEW_CHARS: usize = 22;
+/// Text capacity of a preview line, wide enough to never truncate a label.
+const PREVIEW_BYTES: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConversationKind {
-    Broadcast,
-    Direct([u8; 16]),
-}
-
+/// One addressable contact: identity, optional pair key, chat preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConversationContact {
-    pub kind: ConversationKind,
+pub struct ContactEntry {
+    pub kind: ConversationId,
     pub custom_name: String<CONTACT_NAME_CAPACITY>,
-    pub unread_count: u8,
-    pub key: Option<[u8; KEY_SIZE]>,
+    pub key: Option<[u8; 32]>,
+    pub blocked: bool,
+    pub preview: String<PREVIEW_BYTES>,
+    /// Whether the preview line is our own last message.
+    pub preview_from_me: bool,
+    /// Whether that last message of ours was acknowledged.
+    pub preview_acknowledged: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConversationMessage {
-    pub peer_id: [u8; 16],
-    pub sender_id: [u8; 16],
-    pub message_id: u16,
-    pub from_local: bool,
-    pub encrypted: bool,
-    pub acknowledged: bool,
-    pub coordinates: Option<(i32, i32)>,
-    pub text: String<MESSAGE_TEXT_CAPACITY>,
-}
-
-impl ConversationContact {
-    /// 1/ Keep the public broadcast conversation visible as the first contact.
+impl ContactEntry {
+    /// 1/ Keep the public broadcast conversation visible as the first entry.
     pub fn broadcast() -> Self {
         Self {
-            kind: ConversationKind::Broadcast,
+            kind: ConversationId::Broadcast,
             custom_name: String::new(),
-            unread_count: 0,
             key: None,
+            blocked: false,
+            preview: String::new(),
+            preview_from_me: false,
+            preview_acknowledged: false,
         }
     }
 
-    pub fn direct(device_id: [u8; 16], name: &str) -> Self {
+    pub fn paired(device_id: [u8; 16], name: &str, key: [u8; 32], blocked: bool) -> Self {
         let mut custom_name = String::new();
         let _ = custom_name.push_str(name);
         Self {
-            kind: ConversationKind::Direct(device_id),
+            kind: ConversationId::Direct(device_id),
             custom_name,
-            unread_count: 0,
-            key: None,
+            key: Some(key),
+            blocked,
+            preview: String::new(),
+            preview_from_me: false,
+            preview_acknowledged: false,
         }
     }
 
-    pub fn paired_direct(device_id: [u8; 16], name: &str, key: [u8; KEY_SIZE]) -> Self {
-        let mut contact = Self::direct(device_id, name);
-        contact.key = Some(key);
-        contact
+    /// A peer heard on the air but never paired or saved as a contact.
+    /// It gets a plain list row until the user blocks or deletes it.
+    pub fn unknown(device_id: [u8; 16]) -> Self {
+        Self {
+            kind: ConversationId::Direct(device_id),
+            custom_name: String::new(),
+            key: None,
+            blocked: false,
+            preview: String::new(),
+            preview_from_me: false,
+            preview_acknowledged: false,
+        }
     }
 
-    pub const fn is_deletable(&self) -> bool {
-        !matches!(self.kind, ConversationKind::Broadcast)
+    pub fn is_deletable(&self) -> bool {
+        !matches!(self.kind, ConversationId::Broadcast)
+    }
+
+    /// True when this entry describes an air-heard peer that was never paired.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self.kind, ConversationId::Direct(_)) && self.key.is_none()
     }
 
     /// 2/ Format the broadcast label, custom contact name, or short device ID.
     pub fn display_name(&self) -> String<CONTACT_NAME_CAPACITY> {
         let mut label = String::new();
         match self.kind {
-            ConversationKind::Broadcast => {
+            ConversationId::Broadcast => {
                 let _ = label.push_str("BROADCAST [PUBLIC]");
             }
-            ConversationKind::Direct(_) if !self.custom_name.is_empty() => {
+            ConversationId::Direct(_) if !self.custom_name.is_empty() => {
                 let _ = label.push_str(self.custom_name.as_str());
             }
-            ConversationKind::Direct(device_id) => {
+            ConversationId::Direct(device_id) => {
                 let security = if self.key.is_some() {
                     "PAIRED"
                 } else {
@@ -100,83 +112,143 @@ pub enum ContactBookError {
     InvalidIndex,
 }
 
+/// The live address book. Flash keeps one `Contact` per paired device; the book
+/// holds previews too, so the chat list renders without touching flash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContactBook {
-    entries: Vec<ConversationContact, MAX_CONTACTS>,
+    entries: Vec<ContactEntry, MAX_CONTACTS>,
 }
 
 impl ContactBook {
     /// 3/ Seed the contact list with the reserved broadcast conversation.
     pub fn new() -> Self {
         let mut entries = Vec::new();
-        let _ = entries.push(ConversationContact::broadcast());
+        let _ = entries.push(ContactEntry::broadcast());
         Self { entries }
     }
 
-    pub fn entries(&self) -> &[ConversationContact] {
+    pub fn entries(&self) -> &[ContactEntry] {
         self.entries.as_slice()
     }
 
-    pub fn get(&self, index: usize) -> Option<&ConversationContact> {
+    pub fn entry(&self, index: usize) -> Option<&ContactEntry> {
         self.entries.get(index)
+    }
+
+    pub fn entry_mut(&mut self, index: usize) -> Option<&mut ContactEntry> {
+        self.entries.get_mut(index)
+    }
+
+    /// Visible list rows of this book, skipping blocked entries.
+    ///
+    /// Returns the *storage indices* in display order; renderer and key
+    /// handling always translate through this helper.
+    pub fn visible_indices(&self, skip_broadcast: bool) -> Vec<usize, MAX_CONTACTS> {
+        let mut indices = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.blocked {
+                continue;
+            }
+            if skip_broadcast && index == 0 {
+                continue;
+            }
+            let _ = indices.push(index);
+        }
+        indices
+    }
+
+    pub fn entry_by_kind(&self, kind: ConversationId) -> Option<&ContactEntry> {
+        self.entries.iter().find(|entry| entry.kind == kind)
     }
 
     pub fn contains_direct(&self, device_id: &[u8; 16]) -> bool {
         self.entries
             .iter()
-            .any(|contact| contact.kind == ConversationKind::Direct(*device_id))
+            .any(|entry| entry.kind == ConversationId::Direct(*device_id))
     }
 
-    pub fn add_direct(&mut self, device_id: [u8; 16], name: &str) -> Result<(), ContactBookError> {
-        if device_id == [0; 16] {
-            return Err(ContactBookError::ReservedBroadcastId);
-        }
-        if self.contains_direct(&device_id) {
-            return Ok(());
-        }
-        self.entries
-            .push(ConversationContact::direct(device_id, name))
-            .map_err(|_| ContactBookError::Full)
-    }
-
-    pub fn add_paired_direct(
-        &mut self,
-        device_id: [u8; 16],
-        name: &str,
-        key: [u8; KEY_SIZE],
-    ) -> Result<(), ContactBookError> {
-        if device_id == [0; 16] {
-            return Err(ContactBookError::ReservedBroadcastId);
-        }
-        if let Some(contact) = self
-            .entries
-            .iter_mut()
-            .find(|contact| contact.kind == ConversationKind::Direct(device_id))
-        {
-            contact.custom_name.clear();
-            let _ = contact.custom_name.push_str(name);
-            contact.key = Some(key);
-            return Ok(());
-        }
-        self.entries
-            .push(ConversationContact::paired_direct(device_id, name, key))
-            .map_err(|_| ContactBookError::Full)
-    }
-
-    pub fn direct_key(&self, device_id: &[u8; 16]) -> Option<&[u8; KEY_SIZE]> {
+    pub fn direct_index(&self, device_id: &[u8; 16]) -> Option<usize> {
         self.entries
             .iter()
-            .find(|contact| contact.kind == ConversationKind::Direct(*device_id))?
+            .position(|entry| entry.kind == ConversationId::Direct(*device_id))
+    }
+
+    pub fn direct_key(&self, device_id: &[u8; 16]) -> Option<&[u8; 32]> {
+        self.entries
+            .iter()
+            .find(|entry| entry.kind == ConversationId::Direct(*device_id))?
             .key
             .as_ref()
     }
 
-    /// 4/ Refuse deletion of the broadcast entry while allowing direct contacts to be removed.
-    pub fn remove(&mut self, index: usize) -> Result<ConversationContact, ContactBookError> {
-        let Some(contact) = self.entries.get(index) else {
+    /// Insert or overwrite a direct entry from a persisted contact record.
+    pub fn adopt(&mut self, contact: &Contact) -> Result<(), ContactBookError> {
+        if contact.device_id == [0; 16] {
+            return Err(ContactBookError::ReservedBroadcastId);
+        }
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == ConversationId::Direct(contact.device_id))
+        {
+            existing.custom_name = contact.custom_name.clone();
+            existing.key = Some(contact.key);
+            existing.blocked = contact.blocked;
+            return Ok(());
+        }
+        self.entries
+            .push(ContactEntry::paired(
+                contact.device_id,
+                contact.custom_name.as_str(),
+                contact.key,
+                contact.blocked,
+            ))
+            .map_err(|_| ContactBookError::Full)
+    }
+
+    /// Register an unpaired sender so it shows up in the chats list.
+    /// Returns `false` when an entry for this device already exists.
+    pub fn note_unknown(&mut self, device_id: [u8; 16]) -> bool {
+        if self.contains_direct(&device_id) {
+            return false;
+        }
+        self.entries.push(ContactEntry::unknown(device_id)).is_ok()
+    }
+
+    /// Seed one chat-list preview from flash at boot or after an event.
+    pub fn seed_preview(
+        &mut self,
+        kind: ConversationId,
+        preview: &str,
+        from_me: bool,
+        acknowledged: bool,
+    ) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.kind == kind) else {
+            return;
+        };
+        entry.preview.clear();
+        let _ = entry.preview.push_str(preview);
+        entry.preview_from_me = from_me;
+        entry.preview_acknowledged = acknowledged;
+    }
+
+    /// 4/ A blocked peer is hidden everywhere until it is unblocked again.
+    pub fn set_blocked(&mut self, device_id: &[u8; 16], blocked: bool) -> bool {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.kind == ConversationId::Direct(*device_id))
+            .is_some_and(|entry| {
+                entry.blocked = blocked;
+                true
+            })
+    }
+
+    /// 5/ Delete a direct contact entry; broadcast stays.
+    pub fn remove(&mut self, index: usize) -> Result<ContactEntry, ContactBookError> {
+        let Some(entry) = self.entries.get(index) else {
             return Err(ContactBookError::InvalidIndex);
         };
-        if !contact.is_deletable() {
+        if !entry.is_deletable() {
             return Err(ContactBookError::BroadcastCannotBeDeleted);
         }
         Ok(self.entries.remove(index))
@@ -187,4 +259,22 @@ impl Default for ContactBook {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Cut one preview line for a message body.
+pub fn preview_text(text: &str, coordinates: Option<(i32, i32)>) -> String<PREVIEW_BYTES> {
+    let mut preview = String::new();
+    match coordinates {
+        Some(_) => {
+            let _ = preview.push_str("[GPS]");
+        }
+        None => {
+            for character in text.chars().take(PREVIEW_CHARS) {
+                if preview.push(character).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    preview
 }

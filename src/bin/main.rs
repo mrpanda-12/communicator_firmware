@@ -6,6 +6,7 @@
 pub mod crypto;
 pub mod hardware;
 pub mod network;
+pub mod notify;
 pub mod packet;
 pub mod radio;
 pub mod storage;
@@ -23,12 +24,15 @@ const RADIO_CONFIG: RadioConfig = RadioConfig {
 };
 
 use crate::{
-    hardware::{flash::FlashStore, gps::Gps, lr1121::lr1121::Lr1121, pinout},
+    hardware::{
+        flash::FlashStore,
+        gps::Gps,
+        keypad::{Keypad, KEYPAD_EVENTS},
+        lr1121::lr1121::Lr1121,
+        pinout,
+    },
     network::{
-        discovery::DeviceDiscovery,
-        message_delivery::IncomingMessageQueue,
-        packet_handler::PacketHandler,
-        pairing::PairingCoordinator,
+        discovery::DeviceDiscovery, packet_handler::PacketHandler, pairing::PairingCoordinator,
     },
     packet::{
         packet_data::{DEFAULT_HOP_LIMIT, PacketData},
@@ -40,7 +44,10 @@ use crate::{
         radio::Radio,
         types::{FrequencyBand, LoRaBandwidth, PaMode, RadioConfig},
     },
-    storage::storage_manager::StorageManager,
+    storage::{
+        session::{FLASH_BUFFER_SIZE, Flash, FlashSession},
+        storage_manager::StorageManager,
+    },
 };
 
 use embassy_executor::Spawner;
@@ -52,7 +59,8 @@ use esp_backtrace as _;
 // Keep esp-println's defmt-espflash global logger linked for defmt output.
 use esp_hal::{
     clock::CpuClock,
-    gpio::{DriveMode, Level, Output, OutputConfig},
+    gpio::{DriveMode, Input, InputConfig, Level, Output, OutputConfig, Pull},
+    i2c::master::{Config as I2cConfig, I2c},
     ledc::{
         LSGlobalClkSource, Ledc, LowSpeed,
         channel::{self, ChannelIFace},
@@ -151,7 +159,7 @@ async fn initialize_storage(
 
     (storage, device_id)
 }
-
+/// 2/ Open SPI2 for the LR1121 and apply the fixed configuration.
 fn init_radio<'q>(
     spi2: peripherals::SPI2<'static>,
     gpio40: peripherals::GPIO40<'static>,
@@ -188,6 +196,61 @@ fn init_radio<'q>(
 
     Radio::new(RADIO_CONFIG, lr1121, radio_queue, radio_control)
         .expect("Failed to configure LR1121")
+}
+
+/// 5/ Open the MCP23017 button expander on I2C0 with its interrupt on GPIO16.
+fn init_keypad(
+    i2c0: peripherals::I2C0<'static>,
+    sda: peripherals::GPIO17<'static>,
+    scl: peripherals::GPIO18<'static>,
+    irq: peripherals::GPIO16<'static>,
+) -> Keypad<I2c<'static, esp_hal::Blocking>> {
+    let bus = I2c::new(
+        i2c0,
+        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+    )
+    .expect("Failed to initialize keypad I2C")
+    .with_sda(sda)
+    .with_scl(scl);
+    // INTA is open-drain active-low, so the ESR pull-up sets the idle level.
+    let irq = Input::new(irq, InputConfig::default().with_pull(Pull::Up));
+    Keypad::new(bus, irq)
+}
+
+/// Fill each chat-list row preview from the newest stored record in flash.
+///
+/// The full chat rows load when the user opens the conversation in the UI;
+/// boot only reads one record per conversation, not its whole history.
+async fn seed_chat_previews(
+    storage: &mut StorageManager<'static>,
+    buffer: &mut [u8],
+    contacts: &mut ui::contact::ContactBook,
+) {
+    for entry in contacts.visible_indices(false).iter() {
+        let Some(entry) = contacts.entry(*entry) else { continue };
+        let storage_id = entry.kind.storage_id();
+        let newest = storage
+            .load_recent_messages(&storage_id, 1, buffer)
+            .await
+            .ok()
+            .and_then(|records| records.first().cloned());
+        let Some(record) = newest else { continue };
+        let coordinates = match &record.kind {
+            crate::storage::message::MessageKind::Text => None,
+            crate::storage::message::MessageKind::Coords {
+                latitude_microdegrees,
+                longitude_microdegrees,
+            } => Some((*latitude_microdegrees, *longitude_microdegrees)),
+        };
+        let preview =
+            ui::contact::preview_text(record.text.as_str(), coordinates);
+        contacts.seed_preview(
+            entry.kind,
+            preview.as_str(),
+            record.from_me,
+            record.acknowledged,
+        );
+    }
 }
 
 fn init_gps(
@@ -236,25 +299,30 @@ async fn main(_spawner: Spawner) -> ! {
     // 5/ Initialize custom storage backends and persistent application values.
     let flash_store = init_flash_storage(peripherals.FLASH);
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
-    let mut flash_buffer = [0u8; 512];
+    let mut flash_buffer = [0u8; FLASH_BUFFER_SIZE];
     let (mut storage, device_id) = initialize_storage(flash_store, &trng, &mut flash_buffer).await;
     let display_brightness =
         ui::display_settings::load_brightness(&mut storage, &mut flash_buffer).await;
+    let timezone_offset_minutes =
+        ui::display_settings::load_timezone_offset(&mut storage, &mut flash_buffer).await;
     let mut contacts = ui::contact::ContactBook::new();
     match storage.load_contacts(&mut flash_buffer).await {
         Ok(saved_contacts) => {
             for contact in saved_contacts {
-                if Some(contact.device_id) != device_id {
-                    let _ = contacts.add_paired_direct(
-                        contact.device_id,
-                        contact.custom_name.as_str(),
-                        contact.key,
-                    );
+                // Never adopt this device's own record as a contact entry.
+                if Some(contact.device_id) == device_id {
+                    continue;
                 }
+                let _ = contacts.adopt(&contact);
             }
         }
         Err(_) => defmt::warn!("Could not load saved contacts from flash"),
     }
+    seed_chat_previews(&mut storage, &mut flash_buffer, &mut contacts).await;
+    let flash = Flash::new(FlashSession {
+        storage,
+        buffer: [0u8; FLASH_BUFFER_SIZE],
+    });
 
     let mut display_buffer = [0u8; 512];
     let display_cs = Output::new(peripherals.GPIO10, Level::High, OutputConfig::default());
@@ -294,7 +362,6 @@ async fn main(_spawner: Spawner) -> ! {
     let radio_queue = RadioQueue::new();
     let radio_control = RadioControl::new();
     let discovery = DeviceDiscovery::new();
-    let incoming_messages = IncomingMessageQueue::new();
     let pairing = PairingCoordinator::new();
     let radio = init_radio(
         peripherals.SPI2,
@@ -309,6 +376,12 @@ async fn main(_spawner: Spawner) -> ! {
         &radio_control,
     );
     let gps = init_gps(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5);
+    let keypad = init_keypad(
+        peripherals.I2C0,
+        peripherals.GPIO17,
+        peripherals.GPIO18,
+        peripherals.GPIO16,
+    );
 
     let mut packet_handler = PacketHandler::new();
     let radio_worker = radio.run_worker(None, async |packet| {
@@ -317,14 +390,19 @@ async fn main(_spawner: Spawner) -> ! {
                 packet,
                 &radio_queue,
                 &discovery,
-                &incoming_messages,
                 &pairing,
-                &mut storage,
-                &mut flash_buffer,
+                &flash,
             )
             .await;
     });
     let gps_fut = gps_task(gps);
+    // The keypad worker owns the expander bus and calls back once per debounced
+    // press; the callback posts the key to the UI, like the radio RX callback.
+    let keypad_worker = keypad.run_worker(async |key| {
+        if KEYPAD_EVENTS.try_send(key).is_err() {
+            defmt::warn!("Keypad event dropped: UI event queue is full");
+        }
+    });
     let test_packet_producer = async {
         let mut packet_id = 1u16;
 
@@ -362,10 +440,13 @@ async fn main(_spawner: Spawner) -> ! {
     };
 
     let services_fut = async {
-        match select(radio_worker, gps_fut).await {
-            Either::First(Ok(())) => defmt::error!("Radio worker stopped"),
-            Either::First(Err(_)) => defmt::error!("Radio worker failed"),
-            Either::Second(_) => defmt::error!("GPS task stopped"),
+        match select(select(radio_worker, gps_fut), keypad_worker).await {
+            Either::First(Either::First(result)) => match result {
+                Ok(()) => defmt::error!("Radio worker stopped"),
+                Err(_) => defmt::error!("Radio worker failed"),
+            },
+            Either::First(Either::Second(_)) => defmt::error!("GPS task stopped"),
+            Either::Second(_) => defmt::error!("Keypad worker stopped"),
         }
     };
     GPS_SNAPSHOT.sender().send(ui::gps_snapshot(None, None));
@@ -374,8 +455,9 @@ async fn main(_spawner: Spawner) -> ! {
         device_id,
         contacts,
         FIRMWARE_VERSION,
+        timezone_offset_minutes,
         &pairing,
-        &incoming_messages,
+        &flash,
         pairing
             .event_receiver()
             .expect("Pairing event watch should be initialized"),
@@ -389,6 +471,7 @@ async fn main(_spawner: Spawner) -> ! {
         GPS_SNAPSHOT
             .receiver()
             .expect("GPS snapshot watch should be initialized"),
+        &KEYPAD_EVENTS,
     );
     let services_and_ui_fut = async {
         match select(services_fut, ui_fut).await {

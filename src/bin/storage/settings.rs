@@ -39,6 +39,12 @@ impl StorageKey {
         Self::from_parts(b'n', device_id)
     }
 
+    /// True for the message-record and message-count namespaces, whatever the
+    /// device ID is, so "delete all chats" can enumerate every conversation.
+    pub(crate) fn is_conversation_message(&self) -> bool {
+        matches!(self.bytes.first(), Some(b'm' | b'n'))
+    }
+
     fn from_parts(namespace: u8, value: &[u8]) -> Self {
         // All current callers use values <= 31 bytes. Keep a runtime assertion
         // here to make a future accidental oversized internal key fail loudly.

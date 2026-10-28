@@ -1,6 +1,8 @@
 mod chat;
+mod help;
 mod menu;
 mod navigation;
+mod popup;
 mod settings;
 mod style;
 mod top_bar;
@@ -11,6 +13,8 @@ use embedded_graphics::{
     prelude::{DrawTarget, Point, Primitive, Size},
     primitives::{PrimitiveStyle, Rectangle},
 };
+
+use crate::storage::message::ConversationId;
 
 use super::{
     GpsSnapshot,
@@ -23,7 +27,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     display.clear(style::BLACK)?;
-    top_bar::draw(display, gps)?;
+    top_bar::draw(display, gps, state.timezone_offset_minutes)?;
     draw_page(display, state)
 }
 
@@ -38,19 +42,24 @@ pub fn draw_if_changed<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    // The previous offset is captured before `previous_state` is replaced.
     let Some(old_state) = previous_state.as_ref() else {
         draw(display, state, gps)?;
         *previous_state = Some(state.clone());
         *previous_gps = Some(gps);
         return Ok(());
     };
+    let old_timezone_offset = old_state.timezone_offset_minutes;
 
     if old_state != state {
         draw_state_changes(display, old_state, state)?;
         *previous_state = Some(state.clone());
     }
-    if *previous_gps != Some(gps) {
-        top_bar::draw(display, gps)?;
+    // The timezone lives in the state, so an offset change repaints the bar too.
+    if *previous_gps != Some(gps)
+        || old_timezone_offset != state.timezone_offset_minutes
+    {
+        top_bar::draw(display, gps, state.timezone_offset_minutes)?;
         *previous_gps = Some(gps);
     }
 
@@ -65,6 +74,18 @@ fn draw_state_changes<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    // The help panel and the toast both cover the page, so showing or hiding
+    // either repaints everything underneath instead of patching one region.
+    if previous.help_open || state.help_open {
+        clear_page_area(display)?;
+        draw_page(display, state)?;
+        return Ok(());
+    }
+    if previous.popup.is_some() != state.popup.is_some() {
+        clear_page_area(display)?;
+        draw_page(display, state)?;
+        return Ok(());
+    }
     match (&previous.screen, &state.screen) {
         (Screen::MainMenu { selected: old }, Screen::MainMenu { selected }) => {
             menu::update_main_selection(display, *old, *selected)
@@ -87,15 +108,16 @@ where
             settings::update_selection(display, *section, *old, *selected)
         }
         (Screen::ChatsList { selected: old }, Screen::ChatsList { selected })
-            if previous.contacts == state.contacts =>
+            if previous.contacts == state.contacts && previous.messages == state.messages =>
         {
-            menu::update_contact_selection(display, &state.contacts, *old, *selected)
+            menu::update_chat_selection(display, &state.contacts, *old, *selected)
         }
         (
             Screen::ChatView {
                 conversation: old_conversation,
                 unencrypted_dm: old_unencrypted,
                 input: old_input,
+                pending_hex: old_pending_hex,
                 menu_open: old_menu_open,
                 selected_message: old_selected_message,
                 ..
@@ -104,6 +126,7 @@ where
                 conversation,
                 unencrypted_dm,
                 input,
+                pending_hex,
                 menu_open,
                 selected_message,
                 ..
@@ -120,12 +143,12 @@ where
             if old_conversation != conversation || old_unencrypted != unencrypted_dm {
                 chat::draw_header(display, *conversation, *unencrypted_dm)?;
             }
-            if old_input != input {
-                chat::draw_input(display, input.as_str())?;
+            if old_input != input || old_pending_hex != pending_hex {
+                chat::draw_input(display, input.as_str(), *pending_hex)?;
             }
             if old_menu_open != menu_open {
                 if *menu_open {
-                    chat::draw_context_menu(display, *unencrypted_dm)?;
+                    chat::draw_context_menu(display)?;
                 } else {
                     chat::clear_context_menu(display)?;
                 }
@@ -153,11 +176,45 @@ fn draw_page<D>(display: &mut D, state: &UiState) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    draw_screen(display, state)?;
+    if state.help_open {
+        help::draw(display)?;
+    }
+    if let Some(popup) = &state.popup {
+        popup::draw(display, popup)?;
+    }
+    Ok(())
+}
+
+fn draw_screen<D>(display: &mut D, state: &UiState) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     match &state.screen {
         Screen::MainMenu { selected } => menu::draw_main(display, *selected),
-        Screen::ChatsList { selected } => menu::draw_contacts(display, &state.contacts, *selected),
+        Screen::ChatsList { selected } => {
+            menu::draw_chat_list(display, &state.contacts, *selected)
+        }
         Screen::ContactsList { selected } => {
             menu::draw_contact_manager(display, &state.contacts, *selected)
+        }
+        Screen::ContactManage {
+            device_id,
+            selected,
+            from_chats,
+        } => {
+            let blocked = state
+                .contacts
+                .entry_by_kind(ConversationId::Direct(*device_id))
+                .is_some_and(|entry| entry.blocked);
+            settings::draw_contact_manage(
+                display,
+                device_id,
+                *selected,
+                *from_chats,
+                blocked,
+                state.device_id,
+            )
         }
         Screen::DeviceSearch { selected } => {
             settings::draw_device_search(display, &state.discovered_devices, *selected)
@@ -170,8 +227,11 @@ where
             settings::draw_unencrypted_dm_warning(display, device_id)
         }
         Screen::PairingEntry {
-            device_id, secret, ..
-        } => settings::draw_pairing_entry(display, device_id, secret.as_str()),
+            device_id,
+            secret,
+            pending_hex,
+            ..
+        } => settings::draw_pairing_entry(display, device_id, secret.as_str(), *pending_hex),
         Screen::PairingStatus { device_id, status } => {
             settings::draw_pairing_status(display, device_id, *status)
         }
@@ -200,29 +260,34 @@ where
             state.device_id,
             state.firmware_version,
             state.radio_config,
+            state.timezone_offset_minutes,
         ),
         Screen::ChatView {
             conversation,
             unencrypted_dm,
             input,
+            pending_hex,
             menu_open,
             selected_message,
             ..
-        } => chat::draw(
-            display,
-            *conversation,
-            &state.messages,
-            input.as_str(),
-            *menu_open,
-            *unencrypted_dm,
-            *unencrypted_dm
-                || match conversation {
-                    super::state::ConversationKind::Direct(device_id) => {
-                        state.contacts.direct_key(device_id).is_some()
-                    }
-                    super::state::ConversationKind::Broadcast => false,
-                },
-            *selected_message,
-        ),
+        } => {
+            let send_enabled = match conversation {
+                ConversationId::Broadcast => true,
+                ConversationId::Direct(device_id) => {
+                    *unencrypted_dm || state.contacts.direct_key(device_id).is_some()
+                }
+            };
+            chat::draw(
+                display,
+                *conversation,
+                &state.messages,
+                input.as_str(),
+                *pending_hex,
+                *menu_open,
+                *unencrypted_dm,
+                send_enabled,
+                *selected_message,
+            )
+        }
     }
 }

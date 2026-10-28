@@ -4,8 +4,7 @@ use embassy_sync::{
 };
 use heapless::Vec;
 
-pub const MAX_DISCOVERED_DEVICES: usize = 8;
-pub type DiscoveryList = Vec<[u8; 16], MAX_DISCOVERED_DEVICES>;
+use crate::network::types::DiscoveryList;
 
 /// 1/ Keep a bounded list of device IDs heard in accepted packets.
 pub struct DeviceDiscovery {
@@ -49,4 +48,3 @@ fn remember_device(devices: &mut DiscoveryList, device_id: [u8; 16]) {
     }
     let _ = devices.push(device_id);
 }
-

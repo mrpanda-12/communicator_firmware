@@ -4,7 +4,7 @@ use embedded_graphics::{pixelcolor::Rgb565, prelude::DrawTarget};
 use heapless::String;
 
 use crate::{
-    network::discovery::DiscoveryList,
+    network::types::DiscoveryList,
     radio::types::RadioConfig,
     ui::state::{PairingUiStatus, SettingsSection},
 };
@@ -17,7 +17,7 @@ use super::{
 /// 1/ Draw one category's setting rows or the selected row's detail page.
 pub fn draw<D>(display: &mut D, section: SettingsSection, selected: usize) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     menu::draw_settings_section(display, section, selected)
 }
@@ -30,7 +30,7 @@ pub fn update_selection<D>(
     selected: usize,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     menu::update_settings_section_selection(display, section, previous, selected)
 }
@@ -43,9 +43,10 @@ pub fn draw_item<D>(
     device_id: Option<[u8; 16]>,
     firmware_version: &str,
     radio_config: RadioConfig,
+    timezone_offset_minutes: i32,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(display, section.title(), 12, 38, CYAN, true)?;
     text(display, section.item_label(item), 12, 78, WHITE, false)?;
@@ -53,6 +54,8 @@ where
         draw_device_info(display, device_id, firmware_version)?;
     } else if section == SettingsSection::Frequency && item == 0 {
         draw_radio_info(display, radio_config)?;
+    } else if section.is_timezone_item(item) {
+        draw_timezone_offset(display, timezone_offset_minutes)?;
     } else {
         text(
             display,
@@ -66,6 +69,68 @@ where
     text(display, "BACK: OPTIONS", 8, 218, WHITE, false)
 }
 
+/// Show the current UTC offset and how to change it.
+fn draw_timezone_offset<D>(
+    display: &mut D,
+    timezone_offset_minutes: i32,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let sign = if timezone_offset_minutes < 0 { "-" } else { "+" };
+    let absolute = timezone_offset_minutes.unsigned_abs();
+    let mut offset = String::<16>::new();
+    let _ = write!(offset, "{sign}{:02}:{:02}", absolute / 60, absolute % 60);
+    text(display, offset.as_str(), 12, 104, WHITE, false)?;
+    text(
+        display,
+        "UP/DOWN ADJUST (30 MIN STEPS)",
+        12,
+        134,
+        MUTED,
+        false,
+    )?;
+    text(display, "CHANGE IS SAVED AT ONCE", 12, 154, MUTED, false)
+}
+
+/// Show the delete and block actions for one contact.
+pub fn draw_contact_manage<D>(
+    display: &mut D,
+    device_id: &[u8; 16],
+    selected: usize,
+    _from_chats: bool,
+    blocked: bool,
+    device_id_of: Option<[u8; 16]>,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let _ = device_id_of;
+    text(display, "MANAGE CONTACT", 12, 38, CYAN, true)?;
+    let mut identity = String::<40>::new();
+    let nothing = format_device_id(device_id);
+    let _ = identity.push_str(nothing.as_str());
+    text(display, identity.as_str(), 12, 72, WHITE, false)?;
+    draw_option(display, "DELETE CHAT + CONTACT", 112, selected == 0)?;
+    draw_option(
+        display,
+        match blocked {
+            true => "UNBLOCK CONTACT",
+            false => "BLOCK CONTACT",
+        },
+        142,
+        selected == 1,
+    )?;
+    text(
+        display,
+        "BACK: BACK TO LIST",
+        8,
+        218,
+        MUTED,
+        false,
+    )
+}
+
 /// 4/ Display recent sender IDs heard passively in any valid packet.
 pub fn draw_device_search<D>(
     display: &mut D,
@@ -73,17 +138,10 @@ pub fn draw_device_search<D>(
     selected: usize,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(display, "NEARBY PEERS", 12, 38, CYAN, true)?;
-    text(
-        display,
-        "PASSIVE + SCAN DISCOVERY",
-        12,
-        68,
-        MUTED,
-        false,
-    )?;
+    text(display, "PASSIVE + SCAN DISCOVERY", 12, 68, MUTED, false)?;
     if let Some(device_id) = discovered.get(selected) {
         text(display, "UP/DOWN SELECTS A DEVICE", 12, 94, MUTED, false)?;
         let identity = format_device_id(device_id);
@@ -102,7 +160,7 @@ pub fn draw_discovered_device<D>(
     selected: usize,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(display, "NEARBY PEER", 12, 38, CYAN, true)?;
     let identity = format_device_id(device_id);
@@ -116,20 +174,33 @@ pub fn draw_pairing_entry<D>(
     display: &mut D,
     device_id: &[u8; 16],
     secret: &str,
+    pending_hex: Option<u8>,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(display, "PAIR WITH SHARED SECRET", 12, 38, CYAN, true)?;
     let identity = format_device_id(device_id);
     text(display, identity.as_str(), 12, 72, WHITE, false)?;
-    let mut masked = String::<64>::new();
+    let mut masked = String::<66>::new();
     for _ in secret.bytes() {
         let _ = masked.push('*');
     }
+    // A half-typed hex pair and the input cursor stay visible while masking.
+    if let Some(digit) = pending_hex {
+        let _ = write!(masked, "{digit:X}");
+    }
+    let _ = masked.push('_');
     text(display, masked.as_str(), 12, 112, WHITE, false)?;
     text(display, "USE 16+ RANDOM CHARACTERS", 12, 146, MUTED, false)?;
-    text(display, "LOWER ID STARTS; OTHER WAITS", 12, 168, MUTED, false)?;
+    text(
+        display,
+        "LOWER ID STARTS; OTHER WAITS",
+        12,
+        168,
+        MUTED,
+        false,
+    )?;
     text(display, "ENTER: PAIR   BACK: CANCEL", 8, 218, WHITE, false)
 }
 
@@ -139,7 +210,7 @@ pub fn draw_pairing_status<D>(
     status: PairingUiStatus,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(display, "SECURE PAIRING", 12, 38, CYAN, true)?;
     let identity = format_device_id(device_id);
@@ -157,7 +228,7 @@ where
 
 fn draw_option<D>(display: &mut D, label: &str, y: i32, selected: bool) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(
         display,
@@ -167,7 +238,14 @@ where
         CYAN,
         false,
     )?;
-    text(display, label, 30, y, if selected { WHITE } else { MUTED }, false)
+    text(
+        display,
+        label,
+        30,
+        y,
+        if selected { WHITE } else { MUTED },
+        false,
+    )
 }
 
 /// 7/ Show the outcome of a user-requested broadcast announcement.
@@ -176,7 +254,7 @@ pub fn draw_announcement_status<D>(
     status: crate::ui::state::AnnouncementStatus,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     use crate::ui::state::AnnouncementStatus;
 
@@ -209,7 +287,7 @@ where
 /// 6/ Require an explicit acknowledgement before opening an unencrypted DM.
 pub fn draw_unencrypted_dm_warning<D>(display: &mut D, device_id: &[u8; 16]) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     text(
         display,
@@ -252,7 +330,7 @@ fn format_device_id(device_id: &[u8; 16]) -> String<40> {
 /// 8/ Show the configured frequency and transmit power without duplicating radio values.
 fn draw_radio_info<D>(display: &mut D, config: RadioConfig) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     let whole_mhz = config.frequency_hz / 1_000_000;
     let fraction_khz = (config.frequency_hz % 1_000_000) / 1_000;
@@ -272,7 +350,7 @@ fn draw_device_info<D>(
     firmware_version: &str,
 ) -> Result<(), D::Error>
 where
-    D: DrawTarget<Color=Rgb565>,
+    D: DrawTarget<Color = Rgb565>,
 {
     if let Some(device_id) = device_id {
         let mut identity = String::<56>::new();

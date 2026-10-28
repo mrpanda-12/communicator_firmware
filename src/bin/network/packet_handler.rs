@@ -1,560 +1,449 @@
-use crate::packet::packet_type::PacketType;
+//! Receive path for radio frames: validate, deduplicate, dispatch, acknowledge, relay.
+//! Design notes: `docs/packet-handler.md`; message delivery: `docs/messaging.md`.
+
+use core::str::from_utf8;
+
+use heapless::Vec;
+
 use crate::{
     crypto,
     network::{
         discovery::DeviceDiscovery,
-        message_delivery::{IncomingMessage, IncomingMessageQueue},
+        pairing::{
+            PairingCoordinator, build_challenge_packet, build_finish_packet, pairing_stage,
+            verify_pairing_packet,
+        },
+        types::PairingStage,
     },
+    notify,
     packet::{
-        fragment::Defragmenter,
-        packet_data::{MAX_PAYLOAD_SIZE, PacketData},
+        fragment::{Defragmenter, ReassembledMessage},
+        packet_data::{
+            AUTHENTICATED_HEADER_SIZE, DEFAULT_HOP_LIMIT, GCM_OVERHEAD, MAX_PAYLOAD_SIZE,
+            PacketData,
+        },
         packet_deserializer::PacketDeserializer,
+        packet_type::PacketType,
     },
     radio::queue::{Packet, QueueError, RadioQueue},
-    storage::{contact::Contact, storage_manager::StorageManager},
+    storage::{
+        contact::Contact,
+        message::{Direction, MessageKind, StoredMessage},
+        session::Flash,
+    },
 };
-use core::str::from_utf8;
-use heapless::Vec;
+use crate::storage::message::ConversationId;
 
-const SEEN_PACKET_CACHE_CAPACITY: usize = 64;
+/// Fragment keys remembered for duplicate suppression.
+const SEEN_CAPACITY: usize = 64;
+/// Accepted fragments remembered for a repeated acknowledgement.
+const ACCEPTED_CAPACITY: usize = 64;
+/// Acknowledgement payload: original sender, recipient, and message ID.
+const ACK_PAYLOAD_SIZE: usize = 16 + 16 + 2;
+/// Keeps a locally chosen packet ID inside the lower 15 bits after wrapping.
+const RESPONSE_ID_MASK: u16 = 0x7fff;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct PacketKey {
+/// Plaintext of one received fragment.
+type Payload = Vec<u8, MAX_PAYLOAD_SIZE>;
+/// Key of one paired contact.
+type PairKey = [u8; crypto::KEY_SIZE];
+
+/// One authenticated fragment, kept so a retransmit still gets its ACK.
+struct Accepted {
     sender: [u8; 16],
     packet_id: u16,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct AcceptedMessage {
-    packet_key: PacketKey,
     message_id: u16,
     fingerprint: [u8; 32],
-    encryption_key: Option<[u8; crypto::KEY_SIZE]>,
+    key: PairKey,
 }
 
+/// Verifies frames, rebuilds logical messages, and answers their senders.
 pub struct PacketHandler {
-    seen_packets: Vec<PacketKey, SEEN_PACKET_CACHE_CAPACITY>,
-    accepted_messages: Vec<AcceptedMessage, SEEN_PACKET_CACHE_CAPACITY>,
-    defragmenter: Defragmenter,
-    next_response_packet_id: u16,
+    /// `(sender, packet_id)` of every fragment already processed.
+    seen: Vec<([u8; 16], u16), SEEN_CAPACITY>,
+    /// Fragments of messages that were authenticated and delivered.
+    accepted: Vec<Accepted, ACCEPTED_CAPACITY>,
+    /// Rebuilds one logical message from its fragments.
+    fragments: Defragmenter,
+    /// Next packet ID for a locally generated response.
+    next_id: u16,
 }
 
 impl PacketHandler {
     pub fn new() -> Self {
         Self {
-            seen_packets: Vec::new(),
-            accepted_messages: Vec::new(),
-            defragmenter: Defragmenter::new(),
-            next_response_packet_id: 0,
+            seen: Vec::new(),
+            accepted: Vec::new(),
+            fragments: Defragmenter::new(),
+            next_id: 0,
         }
     }
 
+    /// Process one frame until it is delivered, relayed, acknowledged, or dropped.
     pub async fn handle_packet(
         &mut self,
-        packet: Packet,
-        tx_queue: &RadioQueue,
+        frame: Packet,
+        tx: &RadioQueue,
         discovery: &DeviceDiscovery,
-        incoming_messages: &IncomingMessageQueue,
-        pairing: &super::pairing::PairingCoordinator,
-        storage: &mut StorageManager<'static>,
-        flash_buffer: &mut [u8],
+        pairing: &PairingCoordinator,
+        flash: &Flash,
     ) {
-        // Decode packet
-        let mut packet: PacketData = match PacketDeserializer::deserialize(packet.as_slice()) {
-            Ok(packet) => packet,
-            Err(_) => {
-                defmt::warn!("RX invalid packet ({} bytes)", packet.len());
-                return;
-            }
-        };
-
-        // Validate packet and return on error
-        if packet.validate().is_err() {
-            defmt::warn!("RX rejected packet with invalid fields");
+        // Drop frames that do not parse.
+        let Some(mut packet) = parse_frame(&frame) else {
             return;
-        }
-
-        // Get or create device id
-        let device_id = match storage.load_device_id(flash_buffer).await {
-            Ok(Some(device_id)) => device_id,
-            Ok(None) => {
-                defmt::warn!("RX ignored: this device has no stored identity");
-                return;
-            }
-            Err(_) => {
-                defmt::warn!("RX ignored: could not load this device's identity");
-                return;
-            }
         };
-
-        // Drop our own packets if another node relays them back to us.
+        // Refuse traffic while this device has no identity.
+        let Some(device_id) = load_device_id(flash).await else {
+            return;
+        };
+        // Drop packets this device sent and a relay echoed back.
         if packet.from == device_id {
             defmt::debug!("RX ignored: packet originated from this device");
             return;
         }
 
+        // Classify the destination once for every branch below.
         let broadcast = packet.is_broadcast();
-        let addressed_to_this_device = packet.is_for(&device_id);
+        let here = packet.is_for(&device_id);
 
-        // Drop packets already seen in the bounded duplicate cache.
-        let packet_key = PacketKey {
-            sender: packet.from,
-            packet_id: packet.packet_id,
-        };
-        if !self.remember_packet(packet_key) {
-            self.acknowledge_accepted_retry(
-                &packet,
-                packet_key,
-                device_id,
-                tx_queue,
-                broadcast,
-                addressed_to_this_device,
-            );
-            defmt::debug!(
-                "RX duplicate dropped: sender packet id={}",
-                packet.packet_id
-            );
+        // Answer a retransmit from the accepted cache and stop.
+        if self.is_duplicate(packet.from, packet.packet_id) {
+            self.repeat_ack(&packet, device_id, broadcast, here, tx);
+            defmt::debug!("RX duplicate dropped: id={}", packet.packet_id);
             return;
         }
 
+        // Record the sender so the UI can offer it.
         discovery.remember(packet.from);
+        // Log one line per accepted frame.
+        log_frame(&packet, broadcast, here);
 
-        if let Some(response) =
-            build_announce_response(&packet, device_id, self.next_response_packet_id)
-        {
-            self.next_response_packet_id = self.next_response_packet_id.wrapping_add(1) & 0x7fff;
-            match tx_queue.add_packet(&response) {
-                Ok(()) => defmt::debug!("Queued device announce response"),
-                Err(QueueError::Full) => {
-                    defmt::warn!("Could not respond to announce: TX queue is full")
-                }
-                Err(QueueError::Packet(_) | QueueError::PacketTooLong { .. }) => {
-                    defmt::warn!("Could not build device announce response")
-                }
-            }
-        }
-
-        // Dev info
-        defmt::info!(
-            "RX from= {} type={} id={} message={} encrypted={} broadcast={} addressed_here={} hops={}/{} bytes={}",
-            packet.from,
-            packet.packet_type as u8,
-            packet.packet_id,
-            packet.message_id,
-            packet.is_encrypted,
-            broadcast,
-            addressed_to_this_device,
-            packet.hop_limit,
-            packet.initial_hop_limit,
-            packet.encoded_len(),
-        );
-
+        // Dispatch by type; consumed traffic stops here.
         match packet.packet_type {
-            PacketType::PairingConfirm if !broadcast && addressed_to_this_device => {
-                self.handle_pairing_confirmation(
-                    &packet,
-                    device_id,
-                    tx_queue,
-                    pairing,
-                    storage,
-                    flash_buffer,
-                )
-                .await;
+            PacketType::PairingConfirm if !broadcast && here => {
+                self.advance_pairing(&packet, device_id, tx, pairing, flash)
+                    .await;
+                return;
+            }
+            PacketType::Ack if !broadcast && here => {
+                self.accept_ack(&packet, flash).await;
                 return;
             }
             PacketType::Text if broadcast && !packet.is_encrypted => {
-                self.handle_broadcast_text(&packet, incoming_messages);
+                self.accept_broadcast_text(&packet, flash).await;
             }
-            PacketType::Ack if !broadcast && addressed_to_this_device => {
-                deliver_acknowledgement(&packet, storage, flash_buffer, incoming_messages).await;
+            PacketType::Text if !broadcast && here => {
+                self.accept_direct_text(&packet, device_id, tx, flash).await;
                 return;
             }
-            PacketType::Text if !broadcast && addressed_to_this_device => {
-                self.handle_direct_text_packet(
-                    &packet,
-                    device_id,
-                    tx_queue,
-                    storage,
-                    flash_buffer,
-                    incoming_messages,
-                )
-                .await;
-                return;
-            }
-            PacketType::Coordinates if broadcast || addressed_to_this_device => {
-                self.handle_coordinates_packet(
-                    &packet,
-                    device_id,
-                    tx_queue,
-                    storage,
-                    flash_buffer,
-                    incoming_messages,
-                )
-                .await;
+            PacketType::Coordinates if broadcast || here => {
+                self.accept_coordinates(&packet, device_id, tx, flash).await;
                 if !broadcast {
                     return;
                 }
             }
+            // Relay everything else further down.
             _ => {}
         }
 
-        if broadcast {
-            forward_packet(&mut packet, tx_queue);
-            if packet.is_encrypted {
-                return;
-            }
-            // todo!("Handle broadcast packet");
-        }
-
-        if !addressed_to_this_device {
-            forward_packet(&mut packet, tx_queue);
-            return;
-        }
-
-        // todo!("Handle packet addressed to this device")
-    }
-
-    // Remember a packet once and evict the oldest key when the cache fills.
-    fn remember_packet(&mut self, key: PacketKey) -> bool {
-        if self.seen_packets.contains(&key) {
-            return false;
-        }
-
-        if self.seen_packets.is_full() {
-            self.seen_packets.remove(0);
-        }
-
-        // The cache has a free slot after evicting its oldest key if needed.
-        let _ = self.seen_packets.push(key);
-        true
-    }
-
-    fn handle_broadcast_text(
-        &mut self,
-        packet: &PacketData,
-        incoming_messages: &IncomingMessageQueue,
-    ) {
-        let result = self.defragmenter.push(
-            packet.clone(),
-            packet.payload.as_slice(),
-            packet_fingerprint(packet),
-        );
-        match result {
-            Ok(Some(message)) => {
-                deliver_text_payload(
-                    incoming_messages,
-                    [0; 16],
-                    message.first_packet.from,
-                    message.payload.as_slice(),
-                    false,
-                    message.first_packet.message_id,
-                );
-            }
-            Ok(None) => {}
-            Err(_) => defmt::warn!("Rejected malformed broadcast text fragments"),
+        // Relay broadcasts and traffic addressed to another device.
+        if broadcast || !here {
+            forward(&mut packet, tx);
         }
     }
 
-    async fn handle_direct_text_packet(
+    /// Record one fragment key; true when it was already seen.
+    fn is_duplicate(&mut self, sender: [u8; 16], packet_id: u16) -> bool {
+        // Report a repeated key so the caller can drop the duplicate.
+        let key = (sender, packet_id);
+        if self.seen.contains(&key) {
+            return true;
+        }
+        // Evict the oldest key to keep one slot free.
+        if self.seen.is_full() {
+            self.seen.remove(0);
+        }
+        let _ = self.seen.push(key);
+        false
+    }
+
+    /// Repeat the ACK for a fragment that was already accepted and delivered.
+    fn repeat_ack(
         &mut self,
         packet: &PacketData,
         device_id: [u8; 16],
-        tx_queue: &RadioQueue,
-        storage: &mut StorageManager<'static>,
-        flash_buffer: &mut [u8],
-        incoming_messages: &IncomingMessageQueue,
+        broadcast: bool,
+        here: bool,
+        tx: &RadioQueue,
     ) {
-        // Authenticate each radio fragment before storing its plaintext for reassembly.
-        let (plaintext, encryption_key) =
-            match decode_direct_payload(packet, storage, flash_buffer).await {
-                Ok(decoded) => decoded,
-                Err(()) => return,
-            };
-        let result = self.defragmenter.push(
-            packet.clone(),
-            plaintext.as_slice(),
-            packet_fingerprint(packet),
-        );
-        let message = match result {
-            Ok(Some(message)) => message,
-            Ok(None) => return,
-            Err(_) => {
-                defmt::warn!("Rejected malformed direct-message fragments");
-                return;
-            }
+        // Repeat only for direct text and coordinates.
+        if broadcast
+            || !here
+            || !matches!(
+                packet.packet_type,
+                PacketType::Text | PacketType::Coordinates
+            )
+        {
+            return;
+        }
+
+        // Match sender, packet, message, and content so a reused ID stays silent.
+        let content = fingerprint(packet);
+        let Some(key) = self
+            .accepted
+            .iter()
+            .find(|accepted| {
+                accepted.sender == packet.from
+                    && accepted.packet_id == packet.packet_id
+                    && accepted.message_id == packet.message_id
+                    && accepted.fingerprint == content
+            })
+            .map(|accepted| accepted.key)
+        else {
+            return;
         };
 
-        if !deliver_text_payload(
-            incoming_messages,
-            packet.from,
-            packet.from,
-            message.payload.as_slice(),
-            message.encrypted,
-            message.first_packet.message_id,
-        ) {
-            return;
-        }
-
-        // Cache every fragment only after the complete message has reached the UI queue.
-        for fragment in message.accepted_fragments {
-            self.remember_accepted_message(AcceptedMessage {
-                packet_key: PacketKey {
-                    sender: packet.from,
-                    packet_id: fragment.packet_id,
-                },
-                message_id: packet.message_id,
-                fingerprint: fragment.fingerprint,
-                encryption_key,
-            });
-        }
-        self.queue_ack(&message.first_packet, device_id, encryption_key, tx_queue);
+        // Repeat the ACK with the key that accepted the original fragment.
+        self.send_ack(packet, device_id, key, tx);
     }
 
-    async fn handle_coordinates_packet(
+    /// Deliver one complete plaintext broadcast message.
+    async fn accept_broadcast_text(&mut self, packet: &PacketData, flash: &Flash) {
+        // Rebuild the logical message from its fragments.
+        let Some(message) = self.reassemble(packet, packet.payload.as_slice(), "broadcast text")
+        else {
+            return;
+        };
+        // Deliver it to the public conversation.
+        deliver_text(ConversationId::Broadcast, &message, flash).await;
+    }
+
+    /// Deliver one direct message, then acknowledge it when authenticated.
+    async fn accept_direct_text(
         &mut self,
         packet: &PacketData,
         device_id: [u8; 16],
-        tx_queue: &RadioQueue,
-        storage: &mut StorageManager<'static>,
-        flash_buffer: &mut [u8],
-        incoming_messages: &IncomingMessageQueue,
+        tx: &RadioQueue,
+        flash: &Flash,
     ) {
+        // Apply the pair-key rules before reassembly.
+        let Some((plaintext, pair_key)) = decrypt_direct(packet, flash).await else {
+            return;
+        };
+        // Rebuild the logical message from its decrypted fragments.
+        let Some(message) = self.reassemble(packet, plaintext.as_slice(), "direct text") else {
+            return;
+        };
+
+        // Deliver once; skip the ACK when storage refuses the text.
+        let conversation = ConversationId::Direct(packet.from);
+        if !deliver_text(conversation, &message, flash).await {
+            return;
+        }
+        // Acknowledge only authenticated traffic.
+        let Some(key) = pair_key else {
+            return;
+        };
+
+        // Cache every fragment so a retransmit can be acknowledged again.
+        let message_id = message.first_packet.message_id;
+        for fragment in message.accepted_fragments.iter() {
+            self.remember(Accepted {
+                sender: packet.from,
+                packet_id: fragment.packet_id,
+                message_id,
+                fingerprint: fragment.fingerprint,
+                key,
+            });
+        }
+        // Tell the sender the whole message arrived.
+        self.send_ack(&message.first_packet, device_id, key, tx);
+    }
+
+    /// Deliver one position row, then acknowledge it when authenticated.
+    async fn accept_coordinates(
+        &mut self,
+        packet: &PacketData,
+        device_id: [u8; 16],
+        tx: &RadioQueue,
+        flash: &Flash,
+    ) {
+        // Reject a coordinate message split across fragments.
         if packet.fragment_count != 1 {
             defmt::warn!("Rejected fragmented coordinate packet");
             return;
         }
+
+        // Decode a broadcast payload as-is, or authenticate a direct one.
         let broadcast = packet.is_broadcast();
-        let (payload, encryption_key) = if broadcast {
+        let (payload, pair_key) = if broadcast {
+            // Reject broadcast coordinates that claim to be encrypted.
             if packet.is_encrypted {
                 defmt::warn!("Rejected encrypted broadcast coordinates");
                 return;
             }
-            let Ok(payload) = heapless::Vec::from_slice(packet.payload.as_slice()) else {
+            let Ok(payload) = Payload::from_slice(packet.payload.as_slice()) else {
                 return;
             };
             (payload, None)
         } else {
-            match decode_direct_payload(packet, storage, flash_buffer).await {
-                Ok(decoded) => decoded,
-                Err(()) => return,
-            }
+            let Some(decoded) = decrypt_direct(packet, flash).await else {
+                return;
+            };
+            decoded
         };
-        let Some((latitude_microdegrees, longitude_microdegrees)) =
-            decode_coordinates(payload.as_slice())
-        else {
+
+        // Reject a payload that is not two WGS84 coordinates.
+        let Some((latitude, longitude)) = decode_coordinates(payload.as_slice()) else {
             defmt::warn!("Rejected invalid coordinate payload");
             return;
         };
 
-        let accepted = incoming_messages.try_send(IncomingMessage::Coordinates {
-            peer_id: if broadcast { [0; 16] } else { packet.from },
-            sender_id: packet.from,
-            message_id: packet.message_id,
-            latitude_microdegrees,
-            longitude_microdegrees,
-            encrypted: encryption_key.is_some(),
-        });
-        if accepted.is_err() {
-            defmt::warn!("Could not deliver coordinates: conversation queue is full");
-            return;
-        }
-
-        if !broadcast {
-            let packet_key = PacketKey {
-                sender: packet.from,
-                packet_id: packet.packet_id,
-            };
-            self.remember_accepted_message(AcceptedMessage {
-                packet_key,
-                message_id: packet.message_id,
-                fingerprint: packet_fingerprint(packet),
-                encryption_key,
-            });
-            self.queue_ack(packet, device_id, encryption_key, tx_queue);
-        }
-    }
-
-    fn remember_accepted_message(&mut self, accepted: AcceptedMessage) {
-        if let Some(index) = self
-            .accepted_messages
-            .iter()
-            .position(|known| known.packet_key == accepted.packet_key)
-        {
-            self.accepted_messages.remove(index);
-        }
-        if self.accepted_messages.is_full() {
-            self.accepted_messages.remove(0);
-        }
-        let _ = self.accepted_messages.push(accepted);
-    }
-
-    fn acknowledge_accepted_retry(
-        &mut self,
-        packet: &PacketData,
-        packet_key: PacketKey,
-        device_id: [u8; 16],
-        tx_queue: &RadioQueue,
-        broadcast: bool,
-        addressed_to_this_device: bool,
-    ) {
-        if !matches!(
-            packet.packet_type,
-            PacketType::Text | PacketType::Coordinates
-        ) || broadcast
-            || !addressed_to_this_device
-        {
-            return;
-        }
-        let fingerprint = packet_fingerprint(packet);
-        if let Some(accepted) = self
-            .accepted_messages
-            .iter()
-            .find(|accepted| {
-                accepted.packet_key == packet_key
-                    && accepted.message_id == packet.message_id
-                    && accepted.fingerprint == fingerprint
-            })
-            .copied()
-        {
-            self.queue_ack(packet, device_id, accepted.encryption_key, tx_queue);
-        }
-    }
-
-    fn queue_ack(
-        &mut self,
-        received: &PacketData,
-        device_id: [u8; 16],
-        encryption_key: Option<[u8; crypto::KEY_SIZE]>,
-        tx_queue: &RadioQueue,
-    ) {
-        let packet_id = self.next_response_packet_id;
-        self.next_response_packet_id = self.next_response_packet_id.wrapping_add(1) & 0x7fff;
-        let message_id_payload = received.message_id.to_be_bytes();
-        let encrypted_payload = [0; crate::packet::packet_data::GCM_OVERHEAD];
-        let payload = if encryption_key.is_some() {
-            encrypted_payload.as_slice()
-        } else {
-            message_id_payload.as_slice()
-        };
-        let mut ack = match PacketData::new(
-            packet_id,
-            packet_id,
+        // Save the row to its conversation and tell the UI it arrived.
+        let conversation = ConversationId::from_peer(packet.from);
+        let stored = StoredMessage::new(
+            u32::from(packet.message_id),
+            Direction::Received,
             0,
-            1,
-            device_id,
-            received.from,
-            encryption_key.is_some(),
-            PacketType::Ack,
-            payload,
-            crate::packet::packet_data::DEFAULT_HOP_LIMIT,
-            crate::packet::packet_data::DEFAULT_HOP_LIMIT,
-        ) {
-            Ok(ack) => ack,
-            Err(_) => {
-                defmt::warn!("Could not construct message acknowledgement");
-                return;
-            }
-        };
+            MessageKind::Coords {
+                latitude_microdegrees: latitude,
+                longitude_microdegrees: longitude,
+            },
+            "",
+            packet.packet_id,
+            packet.message_id,
+            packet.from,
+            pair_key.is_some(),
+        );
+        save_message(conversation, &stored, flash).await;
 
-        if let Some(key) = encryption_key {
-            if crypto::encrypt_packet_payload(&mut ack, &key, &message_id_payload).is_err() {
-                defmt::warn!("Could not authenticate message acknowledgement");
-                return;
-            }
+        // Answer only an authenticated row.
+        let Some(key) = pair_key else {
+            return;
+        };
+        self.remember(Accepted {
+            sender: packet.from,
+            packet_id: packet.packet_id,
+            message_id: packet.message_id,
+            fingerprint: fingerprint(packet),
+            key,
+        });
+        self.send_ack(packet, device_id, key, tx);
+    }
+
+    /// Authenticate an acknowledgement and mark the sent message delivered.
+    async fn accept_ack(&mut self, packet: &PacketData, flash: &Flash) {
+        // Decrypt with the sender's pair key; a plaintext ACK proves nothing.
+        let Some((payload, pair_key)) = decrypt_direct(packet, flash).await else {
+            return;
+        };
+        if pair_key.is_none() {
+            defmt::warn!("Rejected unauthenticated ACK");
+            return;
         }
 
-        match tx_queue.add_packet(&ack) {
-            Ok(()) => defmt::debug!("Queued ACK for message {}", received.message_id),
-            Err(QueueError::Full) => defmt::warn!("Could not queue message ACK: TX queue is full"),
-            Err(QueueError::Packet(_) | QueueError::PacketTooLong { .. }) => {
-                defmt::warn!("Could not queue invalid message ACK")
-            }
+        // Require the payload to name this exchange.
+        let Some(message_id) = decode_ack(payload.as_slice(), &packet.from, &packet.to) else {
+            defmt::warn!("Rejected ACK: payload names another exchange");
+            return;
+        };
+
+        // Flip our records to the delivered state and tell the UI.
+        let marked = flash
+            .with(async |session| {
+                session
+                    .storage
+                    .mark_acknowledged(&packet.from, message_id, &mut session.buffer)
+                    .await
+            })
+            .await;
+        match marked {
+            Ok(0) => defmt::warn!("Received ACK for a message that is not stored"),
+            Ok(_) => notify::changed(),
+            Err(_) => defmt::warn!("Could not mark the acknowledged message in flash"),
         }
     }
 
-    async fn handle_pairing_confirmation(
+    /// Advance the pending handshake by one stage, then save the pair key.
+    async fn advance_pairing(
         &mut self,
         packet: &PacketData,
         device_id: [u8; 16],
-        tx_queue: &RadioQueue,
-        pairing: &super::pairing::PairingCoordinator,
-        storage: &mut StorageManager<'static>,
-        flash_buffer: &mut [u8],
+        tx: &RadioQueue,
+        pairing: &PairingCoordinator,
+        flash: &Flash,
     ) {
+        // Ignore traffic that does not belong to the pending handshake.
         let Some(pending) = pairing.pending() else {
             return;
         };
-        if pending.peer_id != packet.from || device_id == packet.from {
+        if pending.peer_id != packet.from {
             return;
         }
-        use super::pairing::{PairingStage, pairing_stage, verify_pairing_packet};
+        let key = pending.key;
+        let fail = || pairing.finish(packet.from, false, key);
 
         match (device_id > packet.from, pairing_stage(packet)) {
+            // Answer a verified request with a challenge and keep waiting.
             (true, Some(PairingStage::Request)) => {
-                if !verify_pairing_packet(packet, &pending.key, PairingStage::Request, None, None) {
-                    pairing.finish(packet.from, false, pending.key);
+                if !verify_pairing_packet(packet, &key, PairingStage::Request, None, None) {
+                    fail();
                     return;
                 }
-                let Some(request_nonce) = packet_nonce(packet, 1) else {
-                    pairing.finish(packet.from, false, pending.key);
+                let Some(request_nonce) = read_nonce(packet, 1) else {
+                    fail();
                     return;
                 };
-                let response = super::pairing::build_challenge_packet(
-                    &pending.key,
-                    self.next_response_packet_id,
-                    device_id,
-                    packet.from,
-                    request_nonce,
-                );
-                self.next_response_packet_id =
-                    self.next_response_packet_id.wrapping_add(1) & 0x7fff;
-                let Some((response, response_nonce)) = response else {
-                    pairing.finish(packet.from, false, pending.key);
+                let request_id = self.take_id();
+                let Some((response, response_nonce)) =
+                    build_challenge_packet(&key, request_id, device_id, packet.from, request_nonce)
+                else {
+                    fail();
                     return;
                 };
                 pairing.set_request_nonce(packet.from, request_nonce);
                 pairing.set_response_nonce(packet.from, response_nonce);
-                if tx_queue.add_packet(&response).is_err() {
-                    pairing.finish(packet.from, false, pending.key);
+                if tx.add_packet(&response).is_err() {
+                    fail();
                 }
                 return;
             }
+            // Answer a verified challenge with the closing packet.
             (false, Some(PairingStage::Challenge)) => {
                 let Some(request_nonce) = pending.request_nonce else {
                     return;
                 };
                 if !verify_pairing_packet(
                     packet,
-                    &pending.key,
+                    &key,
                     PairingStage::Challenge,
                     Some(request_nonce),
                     None,
                 ) {
-                    pairing.finish(packet.from, false, pending.key);
+                    fail();
                     return;
                 }
-                let Some(response_nonce) = packet_nonce(packet, 1 + crypto::NONCE_SIZE) else {
-                    pairing.finish(packet.from, false, pending.key);
+                let Some(response_nonce) = read_nonce(packet, 1 + crypto::NONCE_SIZE) else {
+                    fail();
                     return;
                 };
-                let Some(response) = super::pairing::build_finish_packet(
-                    &pending.key,
-                    self.next_response_packet_id,
+                let Some(response) = build_finish_packet(
+                    &key,
+                    self.take_id(),
                     device_id,
                     packet.from,
                     request_nonce,
                     response_nonce,
                 ) else {
-                    pairing.finish(packet.from, false, pending.key);
+                    fail();
                     return;
                 };
-                self.next_response_packet_id =
-                    self.next_response_packet_id.wrapping_add(1) & 0x7fff;
-                if tx_queue.add_packet(&response).is_err() {
-                    pairing.finish(packet.from, false, pending.key);
+                if tx.add_packet(&response).is_err() {
+                    fail();
                     return;
                 }
             }
+            // Verify the closing packet that proves both sides hold the key.
             (true, Some(PairingStage::Finish)) => {
                 let (Some(request_nonce), Some(response_nonce)) =
                     (pending.request_nonce, pending.response_nonce)
@@ -563,120 +452,301 @@ impl PacketHandler {
                 };
                 if !verify_pairing_packet(
                     packet,
-                    &pending.key,
+                    &key,
                     PairingStage::Finish,
                     Some(request_nonce),
                     Some(response_nonce),
                 ) {
-                    pairing.finish(packet.from, false, pending.key);
+                    fail();
                     return;
                 }
             }
+            // Ignore a stage this side is not waiting for.
             _ => return,
         }
 
+        // Store the pair key so later direct traffic can be authenticated.
         let contact = Contact {
             device_id: packet.from,
-            key: pending.key,
+            key,
             custom_name: heapless::String::new(),
+            blocked: false,
         };
-        if storage.save_contact(&contact, flash_buffer).await.is_ok() {
-            pairing.finish(packet.from, true, pending.key);
+        let saved = flash
+            .with(async |session| {
+                session
+                    .storage
+                    .save_contact(&contact, &mut session.buffer)
+                    .await
+                    .is_ok()
+            })
+            .await;
+        if saved {
+            pairing.finish(packet.from, true, key);
         } else {
-            pairing.finish(packet.from, false, pending.key);
+            fail();
         }
     }
-}
 
-fn packet_nonce(packet: &PacketData, offset: usize) -> Option<[u8; crypto::NONCE_SIZE]> {
-    packet
-        .payload
-        .get(offset..offset + crypto::NONCE_SIZE)?
-        .try_into()
-        .ok()
-}
-
-fn build_announce_response(
-    announce: &PacketData,
-    device_id: [u8; 16],
-    packet_id: u16,
-) -> Option<PacketData> {
-    match (
-        announce.packet_type,
-        announce.is_broadcast(),
-        announce.is_encrypted,
-        announce.payload.is_empty(),
-        announce.from == [0; 16],
-    ) {
-        (PacketType::DeviceAnnounce, true, false, true, false) => {}
-        _ => return None,
-    }
-
-    PacketData::new(
-        packet_id,
-        packet_id,
-        0,
-        1,
-        device_id,
-        announce.from,
-        false,
-        PacketType::DeviceAnnounceResponse,
-        &[],
-        crate::packet::packet_data::DEFAULT_HOP_LIMIT,
-        crate::packet::packet_data::DEFAULT_HOP_LIMIT,
-    )
-    .ok()
-}
-
-async fn decode_direct_payload(
-    packet: &PacketData,
-    storage: &mut StorageManager<'static>,
-    flash_buffer: &mut [u8],
-) -> Result<
-    (
-        heapless::Vec<u8, MAX_PAYLOAD_SIZE>,
-        Option<[u8; crypto::KEY_SIZE]>,
-    ),
-    (),
-> {
-    let (plaintext, key) = match storage.load_contact(&packet.from, flash_buffer).await {
-        Ok(Some(contact)) if packet.is_encrypted => {
-            match crypto::decrypt_packet_payload(packet, &contact.key) {
-                Ok(plaintext) => (plaintext, Some(contact.key)),
-                Err(_) => {
-                    defmt::warn!("Rejected encrypted packet: authentication failed");
-                    return Err(());
-                }
+    /// Feed one fragment to the reassembler; warn when the set conflicts.
+    fn reassemble(
+        &mut self,
+        packet: &PacketData,
+        plaintext: &[u8],
+        kind: &str,
+    ) -> Option<ReassembledMessage> {
+        match self
+            .fragments
+            .push(packet.clone(), plaintext, fingerprint(packet))
+        {
+            // `Ok(None)` means more fragments are still missing.
+            Ok(message) => message,
+            Err(_) => {
+                defmt::warn!("Rejected malformed {} fragments", kind);
+                None
             }
         }
-        Ok(Some(_)) => {
-            defmt::warn!("Rejected plaintext packet for paired contact");
-            return Err(());
+    }
+
+    /// Store one accepted fragment, replacing an older copy of the same fragment.
+    fn remember(&mut self, accepted: Accepted) {
+        // Drop any earlier record for this fragment so the newest copy survives.
+        if let Some(index) = self.accepted.iter().position(|known| {
+            known.sender == accepted.sender && known.packet_id == accepted.packet_id
+        }) {
+            self.accepted.remove(index);
         }
-        Ok(None) if packet.is_encrypted => {
-            defmt::warn!("Rejected encrypted packet: contact key is missing");
-            return Err(());
+        // Evict the oldest record to keep one slot free.
+        if self.accepted.is_full() {
+            self.accepted.remove(0);
         }
-        Ok(None) => (packet.payload.as_slice().to_vec(), None),
-        Err(_) => {
-            defmt::warn!("Rejected packet: contact lookup failed");
-            return Err(());
+        let _ = self.accepted.push(accepted);
+    }
+
+    /// Queue one authenticated acknowledgement for an accepted message.
+    fn send_ack(
+        &mut self,
+        received: &PacketData,
+        device_id: [u8; 16],
+        key: PairKey,
+        tx: &RadioQueue,
+    ) {
+        // Name the original sender, this device, and the logical message.
+        let mut acknowledgement = [0; ACK_PAYLOAD_SIZE];
+        acknowledgement[..16].copy_from_slice(&received.from);
+        acknowledgement[16..32].copy_from_slice(&device_id);
+        acknowledgement[32..].copy_from_slice(&received.message_id.to_be_bytes());
+
+        // Reserve the GCM overhead; encryption below replaces the payload.
+        let mut ack = match PacketData::new(
+            self.take_id(),
+            received.message_id,
+            0,
+            1,
+            device_id,
+            received.from,
+            true,
+            PacketType::Ack,
+            &[0; GCM_OVERHEAD],
+            DEFAULT_HOP_LIMIT,
+            DEFAULT_HOP_LIMIT,
+        ) {
+            Ok(ack) => ack,
+            Err(_) => {
+                defmt::warn!("Could not build message acknowledgement");
+                return;
+            }
+        };
+        // Authenticate the ACK with the key that protected the message.
+        if crypto::encrypt_packet_payload(&mut ack, &key, &acknowledgement).is_err() {
+            defmt::warn!("Could not authenticate message acknowledgement");
+            return;
         }
-    };
-    let mut bounded_payload = heapless::Vec::new();
-    bounded_payload
-        .extend_from_slice(&plaintext)
-        .map_err(|_| ())?;
-    Ok((bounded_payload, key))
+
+        // Queue the ACK; a full queue leaves the sender without delivery state.
+        match tx.add_packet(&ack) {
+            Ok(()) => {}
+            Err(QueueError::Full) => defmt::warn!("Could not queue message ACK: TX queue is full"),
+            Err(_) => defmt::warn!("Could not queue invalid message ACK"),
+        }
+    }
+
+    /// Hand out the next locally chosen packet ID for a response.
+    fn take_id(&mut self) -> u16 {
+        let packet_id = self.next_id;
+        self.next_id = packet_id.wrapping_add(1) & RESPONSE_ID_MASK;
+        packet_id
+    }
 }
 
+impl Default for PacketHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse one raw frame into a packet, rejecting invalid header fields.
+fn parse_frame(frame: &Packet) -> Option<PacketData> {
+    // Reject a frame that does not match the wire format.
+    let packet = match PacketDeserializer::deserialize(frame.as_slice()) {
+        Ok(packet) => packet,
+        Err(_) => {
+            defmt::warn!("RX invalid packet ({} bytes)", frame.len());
+            return None;
+        }
+    };
+    // Reject a decoded packet with inconsistent flags, sizes, or hop limits.
+    if packet.validate().is_err() {
+        defmt::warn!("RX rejected packet with invalid fields");
+        return None;
+    }
+    Some(packet)
+}
+
+/// Read this device's stored identity, refusing traffic while it is missing.
+async fn load_device_id(flash: &Flash) -> Option<[u8; 16]> {
+    let loaded = flash
+        .with(async |session| session.storage.load_device_id(&mut session.buffer).await)
+        .await;
+    match loaded {
+        Ok(Some(device_id)) => Some(device_id),
+        Ok(None) => {
+            defmt::warn!("RX ignored: this device has no stored identity");
+            None
+        }
+        Err(_) => {
+            defmt::warn!("RX ignored: could not load this device's identity");
+            None
+        }
+    }
+}
+
+/// Apply the pair-key rules to a direct packet and return its plaintext.
+///
+/// The `Option<PairKey>` is `Some` only when the payload was authenticated.
+async fn decrypt_direct(packet: &PacketData, flash: &Flash) -> Option<(Payload, Option<PairKey>)> {
+    // Look up the key this sender is expected to use.
+    let looked_up = flash
+        .with(async |session| {
+            session
+                .storage
+                .load_contact(&packet.from, &mut session.buffer)
+                .await
+        })
+        .await;
+    let Ok(saved) = looked_up else {
+        defmt::warn!("Rejected packet: contact lookup failed");
+        return None;
+    };
+    // A blocked peer is dropped before any message of theirs is processed.
+    if saved.as_ref().is_some_and(|contact| contact.blocked) {
+        defmt::warn!("Dropped packet from a blocked contact");
+        return None;
+    }
+
+    match (saved, packet.is_encrypted) {
+        // Decrypt traffic from a paired contact and keep its key.
+        (Some(contact), true) => match crypto::decrypt_packet_payload(packet, &contact.key) {
+            Ok(plaintext) => Payload::from_slice(plaintext.as_slice())
+                .ok()
+                .map(|payload| (payload, Some(contact.key))),
+            Err(_) => {
+                defmt::warn!("Rejected encrypted packet: authentication failed");
+                None
+            }
+        },
+        // Reject plaintext from a contact that is expected to encrypt.
+        (Some(_), false) => {
+            defmt::warn!("Rejected plaintext packet for paired contact");
+            None
+        }
+        // Reject encrypted traffic from an unpaired sender that has no key.
+        (None, true) => {
+            defmt::warn!("Rejected encrypted packet: contact key is missing");
+            None
+        }
+        // Accept a plaintext introduction.
+        (None, false) => Payload::from_slice(packet.payload.as_slice())
+            .ok()
+            .map(|payload| (payload, None)),
+    }
+}
+
+/// Save one reassembled text message and toast the UI; false means it was refused.
+async fn deliver_text(
+    conversation: ConversationId,
+    message: &ReassembledMessage,
+    flash: &Flash,
+) -> bool {
+    // Reject a payload that is not valid UTF-8.
+    let Ok(text) = from_utf8(message.payload.as_slice()) else {
+        defmt::warn!("Rejected text message: payload is not UTF-8");
+        return false;
+    };
+    let first = &message.first_packet;
+
+    // Reject text longer than the record limit before it reaches flash.
+    if text.len() > crate::storage::message::MAX_MESSAGE_PAYLOAD {
+        defmt::warn!("Rejected text message: it exceeds the storage capacity");
+        return false;
+    }
+
+    let stored = StoredMessage::new(
+        u32::from(first.message_id),
+        Direction::Received,
+        0,
+        MessageKind::Text,
+        text,
+        first.packet_id,
+        first.message_id,
+        first.from,
+        message.encrypted,
+    );
+    save_message(conversation, &stored, flash).await;
+    true
+}
+
+/// Append one record to flash and toast the UI once it persisted.
+async fn save_message(conversation: ConversationId, stored: &StoredMessage, flash: &Flash) {
+    let saved = flash
+        .with(async |session| {
+            session
+                .storage
+                .append_messages(
+                    &conversation.storage_id(),
+                    core::slice::from_ref(stored),
+                    &mut session.buffer,
+                )
+                .await
+                .is_ok()
+        })
+        .await;
+    if saved {
+        let (text, coordinates) = match &stored.kind {
+            MessageKind::Text => (stored.text.as_str(), None),
+            MessageKind::Coords { latitude_microdegrees, longitude_microdegrees } => {
+                ("", Some((*latitude_microdegrees, *longitude_microdegrees)))
+            }
+        };
+        notify::receive(
+            conversation,
+            crate::ui::contact::preview_text(text, coordinates).as_str(),
+        );
+    } else {
+        defmt::warn!("Could not save the received message to flash");
+    }
+}
+
+/// Decode two big-endian coordinates and reject values outside the WGS84 range.
 fn decode_coordinates(payload: &[u8]) -> Option<(i32, i32)> {
+    // Require exactly one latitude and one longitude.
     if payload.len() != 8 {
         return None;
     }
     let latitude = i32::from_be_bytes(payload[..4].try_into().ok()?);
     let longitude = i32::from_be_bytes(payload[4..].try_into().ok()?);
-    // Reject out-of-range WGS84 values before exposing a received location to the UI.
+
+    // Reject out-of-range values before a location reaches the log.
     if !(-90_000_000..=90_000_000).contains(&latitude)
         || !(-180_000_000..=180_000_000).contains(&longitude)
     {
@@ -685,122 +755,53 @@ fn decode_coordinates(payload: &[u8]) -> Option<(i32, i32)> {
     Some((latitude, longitude))
 }
 
-fn deliver_text_payload(
-    incoming_messages: &IncomingMessageQueue,
-    peer_id: [u8; 16],
-    sender_id: [u8; 16],
-    payload: &[u8],
-    encrypted: bool,
-    message_id: u16,
-) -> bool {
-    let text = match from_utf8(payload) {
-        Ok(text) => text,
-        Err(_) => {
-            defmt::warn!("Rejected text message: payload is not UTF-8");
-            return false;
-        }
-    };
-    let mut message = heapless::String::<{ super::message_delivery::MESSAGE_TEXT_CAPACITY }>::new();
-    if message.push_str(text).is_err() {
-        defmt::warn!("Rejected text message: payload exceeds UI capacity");
-        return false;
-    }
-    match incoming_messages.try_send(IncomingMessage::Text {
-        peer_id,
-        sender_id,
-        message_id,
-        text: message,
-        encrypted,
-    }) {
-        Ok(()) => {
-            defmt::debug!("Delivered received text to conversation UI");
-            true
-        }
-        Err(_) => {
-            defmt::warn!("Could not deliver text: conversation queue is full");
-            false
-        }
-    }
-}
-
-async fn deliver_acknowledgement(
-    packet: &PacketData,
-    storage: &mut StorageManager<'static>,
-    flash_buffer: &mut [u8],
-    incoming_messages: &IncomingMessageQueue,
-) {
-    let message_id = match storage.load_contact(&packet.from, flash_buffer).await {
-        Ok(Some(contact)) if packet.is_encrypted => {
-            match crypto::decrypt_packet_payload(packet, &contact.key) {
-                Ok(payload) => acknowledgement_message_id(payload.as_slice()),
-                Err(_) => {
-                    defmt::warn!("Rejected ACK: authentication failed");
-                    return;
-                }
-            }
-        }
-        Ok(Some(_)) => {
-            defmt::warn!("Rejected plaintext ACK for paired contact");
-            return;
-        }
-        Ok(None) if packet.is_encrypted => {
-            defmt::warn!("Rejected encrypted ACK: contact key is missing");
-            return;
-        }
-        Ok(None) => acknowledgement_message_id(packet.payload.as_slice()),
-        Err(_) => {
-            defmt::warn!("Rejected ACK: contact lookup failed");
-            return;
-        }
-    };
-
-    let Some(message_id) = message_id else {
-        defmt::warn!("Rejected ACK: payload must contain exactly two bytes");
-        return;
-    };
-
-    match incoming_messages.try_send(IncomingMessage::Acknowledgement {
-        peer_id: packet.from,
-        message_id,
-    }) {
-        Ok(()) => defmt::debug!("Received ACK for message {}", message_id),
-        Err(_) => defmt::warn!("Could not deliver ACK to UI: conversation queue is full"),
-    }
-}
-
-fn acknowledgement_message_id(payload: &[u8]) -> Option<u16> {
-    if payload.len() != 2 {
+/// Read the acknowledged message's sender, recipient, and message ID.
+fn decode_ack(payload: &[u8], sender: &[u8; 16], recipient: &[u8; 16]) -> Option<u16> {
+    // Require exactly the three fields that identify one message.
+    if payload.len() != ACK_PAYLOAD_SIZE {
         return None;
     }
-    Some(u16::from_be_bytes([payload[0], payload[1]]))
+    // Reject an ACK that names another conversation or another sender.
+    if payload[..16] != *sender || payload[16..32] != *recipient {
+        return None;
+    }
+    Some(u16::from_be_bytes([payload[32], payload[33]]))
 }
 
-fn packet_fingerprint(packet: &PacketData) -> [u8; 32] {
+/// Read one nonce-sized slice of a pairing payload.
+fn read_nonce(packet: &PacketData, offset: usize) -> Option<[u8; crypto::NONCE_SIZE]> {
+    packet
+        .payload
+        .get(offset..offset + crypto::NONCE_SIZE)?
+        .try_into()
+        .ok()
+}
+
+/// Hash the immutable header and payload of one fragment.
+fn fingerprint(packet: &PacketData) -> [u8; 32] {
+    // Exclude the hop limit so a relayed copy still matches.
     let header = packet.authenticated_header();
     let payload = packet.payload.as_slice();
-    let mut bytes = [0; crate::packet::packet_data::AUTHENTICATED_HEADER_SIZE
-        + crate::packet::packet_data::MAX_PAYLOAD_SIZE];
+    let mut bytes = [0; AUTHENTICATED_HEADER_SIZE + MAX_PAYLOAD_SIZE];
     let header_len = header.len();
     bytes[..header_len].copy_from_slice(&header);
     bytes[header_len..header_len + payload.len()].copy_from_slice(payload);
     crypto::hash(&bytes[..header_len + payload.len()])
 }
 
-// Decrement a packet's remaining hops before queueing it for forwarding.
-fn forward_packet(packet: &mut PacketData, tx_queue: &RadioQueue) {
+/// Decrement the hop limit and queue the packet for relaying.
+fn forward(packet: &mut PacketData, tx: &RadioQueue) {
+    // Stop relaying once the packet has no hops left.
     if !packet.decrement_hop_limit() {
         defmt::debug!("Packet reached its hop limit; not forwarding");
         return;
     }
 
-    match tx_queue.add_packet(packet) {
+    // Queue the copy this device relays on behalf of the sender.
+    match tx.add_packet(packet) {
         Ok(()) => {}
-        Err(QueueError::Full) => {
-            defmt::warn!("Could not forward packet: TX queue is full");
-        }
-        Err(QueueError::Packet(_)) => {
-            defmt::warn!("Could not forward packet: validation failed");
-        }
+        Err(QueueError::Full) => defmt::warn!("Could not forward packet: TX queue is full"),
+        Err(QueueError::Packet(_)) => defmt::warn!("Could not forward packet: validation failed"),
         Err(QueueError::PacketTooLong { length, maximum }) => {
             defmt::warn!(
                 "Could not forward oversized packet: {} bytes (max {})",
@@ -809,4 +810,21 @@ fn forward_packet(packet: &mut PacketData, tx_queue: &RadioQueue) {
             );
         }
     }
+}
+
+/// Log one accepted frame together with its routing decisions.
+fn log_frame(packet: &PacketData, broadcast: bool, here: bool) {
+    defmt::info!(
+        "RX from= {} type={} id={} message={} encrypted={} broadcast={} addressed_here={} hops={}/{} bytes={}",
+        packet.from,
+        packet.packet_type as u8,
+        packet.packet_id,
+        packet.message_id,
+        packet.is_encrypted,
+        broadcast,
+        here,
+        packet.hop_limit,
+        packet.initial_hop_limit,
+        packet.encoded_len(),
+    );
 }

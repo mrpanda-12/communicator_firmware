@@ -1,15 +1,13 @@
 //! Application storage facade backed by the dedicated internal-flash partition.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::{format, string::String};
 use sequential_storage::map::{SerializationError, Value};
 
 use crate::{
     hardware::flash::{FlashStore, StoreError},
-    storage::{
-        contact::Contact,
-        message::{MessagePage, StoredMessage},
-    },
+    storage::contact::Contact,
 };
 
 const DEVICE_ID_KEY: &str = "device_id";
@@ -34,6 +32,7 @@ impl<'a> Value<'a> for DeviceIdRecord {
     }
 }
 
+/// Only the operations the firmware performs, mapped onto the storage map.
 pub struct StorageManager<'flash> {
     flash: FlashStore<'flash>,
 }
@@ -66,7 +65,7 @@ impl<'flash> StorageManager<'flash> {
     where
         for<'a> T: Value<'a>,
     {
-        self.flash.get(key, buffer).await.map_err(store_error)
+        self.flash.get::<T>(key, buffer).await.map_err(store_error)
     }
 
     pub async fn load_device_id(&mut self, buffer: &mut [u8]) -> Result<Option<[u8; 16]>, String> {
@@ -136,7 +135,7 @@ impl<'flash> StorageManager<'flash> {
     pub async fn append_messages(
         &mut self,
         device_id: &[u8; 16],
-        messages: &[StoredMessage],
+        messages: &[crate::storage::message::StoredMessage],
         buffer: &mut [u8],
     ) -> Result<(), String> {
         self.flash
@@ -145,38 +144,44 @@ impl<'flash> StorageManager<'flash> {
             .map_err(store_error)
     }
 
-    pub async fn append_broadcast_messages(
+    pub async fn load_recent_messages(
         &mut self,
-        messages: &[StoredMessage],
+        device_id: &[u8; 16],
+        max_messages: usize,
+        buffer: &mut [u8],
+    ) -> Result<Vec<crate::storage::message::StoredMessage>, String> {
+        self.flash
+            .load_recent_messages(device_id, max_messages, buffer)
+            .await
+            .map_err(store_error)
+    }
+
+    pub async fn mark_acknowledged(
+        &mut self,
+        device_id: &[u8; 16],
+        message_id: u16,
+        buffer: &mut [u8],
+    ) -> Result<usize, String> {
+        self.flash
+            .mark_acknowledged(device_id, message_id, buffer)
+            .await
+            .map_err(store_error)
+    }
+
+    pub async fn delete_conversation(
+        &mut self,
+        device_id: &[u8; 16],
         buffer: &mut [u8],
     ) -> Result<(), String> {
         self.flash
-            .append_messages(&[0xff; 16], messages, buffer)
+            .delete_conversation(device_id, buffer)
             .await
             .map_err(store_error)
     }
 
-    pub async fn load_messages_page(
-        &mut self,
-        device_id: &[u8; 16],
-        offset: u32,
-        max_messages: usize,
-        buffer: &mut [u8],
-    ) -> Result<MessagePage, String> {
+    pub async fn delete_all_conversations(&mut self, buffer: &mut [u8]) -> Result<(), String> {
         self.flash
-            .load_messages_page(device_id, offset, max_messages, buffer)
-            .await
-            .map_err(store_error)
-    }
-
-    pub async fn load_broadcast_messages_page(
-        &mut self,
-        offset: u32,
-        max_messages: usize,
-        buffer: &mut [u8],
-    ) -> Result<MessagePage, String> {
-        self.flash
-            .load_messages_page(&[0xff; 16], offset, max_messages, buffer)
+            .delete_all_conversations(buffer)
             .await
             .map_err(store_error)
     }

@@ -2,13 +2,15 @@ use crate::crypto::KEY_SIZE;
 use heapless::String;
 use sequential_storage::map::{SerializationError, Value};
 
-const CONTACT_RECORD_BYTES: usize = 16 + KEY_SIZE + 32;
+const CONTACT_RECORD_BYTES: usize = 16 + KEY_SIZE + 32 + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contact {
     pub device_id: [u8; 16],
     pub key: [u8; KEY_SIZE],
     pub custom_name: String<32>,
+    /// Blocked contacts are dropped on receive and hidden from both lists.
+    pub blocked: bool,
 }
 
 impl Contact {
@@ -37,8 +39,9 @@ impl<'a> Value<'a> for Contact {
         buffer[16..16 + KEY_SIZE].copy_from_slice(&self.key);
         encode_fixed_string(
             &self.custom_name,
-            &mut buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES],
+            &mut buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES - 1],
         );
+        buffer[CONTACT_RECORD_BYTES - 1] = u8::from(self.blocked);
         Ok(CONTACT_RECORD_BYTES)
     }
 
@@ -52,12 +55,15 @@ impl<'a> Value<'a> for Contact {
         let key = buffer[16..16 + KEY_SIZE]
             .try_into()
             .map_err(|_| SerializationError::InvalidFormat)?;
-        let custom_name = decode_fixed_string(&buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES])?;
+        let custom_name =
+            decode_fixed_string(&buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES - 1])?;
+        let blocked = buffer[CONTACT_RECORD_BYTES - 1] == 1;
         Ok((
             Self {
                 device_id,
                 key,
                 custom_name,
+                blocked,
             },
             CONTACT_RECORD_BYTES,
         ))
@@ -82,4 +88,3 @@ fn decode_fixed_string<const N: usize>(bytes: &[u8]) -> Result<String<N>, Serial
         .map_err(|_| SerializationError::InvalidData)?;
     Ok(value)
 }
-

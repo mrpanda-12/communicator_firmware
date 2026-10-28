@@ -1,6 +1,6 @@
 # Communicator Protocol Specification
 
-> **Status:** This document describes both current behavior and protocol constraints. Passive and announce/response discovery, shared-secret pairing, pair-key persistence, AES-GCM protection for paired direct text and ACKs, bounded text fragmentation/reassembly, accepted-message ACK generation, in-memory chat display, and received-coordinate navigation are implemented. Message history and ACK state are not persisted; discovery and unpaired introductions are intentionally unauthenticated/plaintext.
+> **Status:** This document describes both current behavior and protocol constraints. Passive discovery and one-shot announcements, shared-secret pairing, pair-key persistence, AES-GCM protection for paired direct text and ACKs, bounded text fragmentation/reassembly, accepted-message ACK generation, flash-backed chat storage with persisted ACK state, and received-coordinate navigation are implemented. Discovery and unpaired introductions are intentionally unauthenticated/plaintext.
 
 ## 1. Packet Format
 
@@ -30,7 +30,7 @@ Receivers must reject unsupported versions, invalid field values, and packets to
 Generate device IDs and nonces using a hardware true random source. Do not treat uptime or CPU clock values as cryptographic entropy. On ESP32-S3, use the HAL TRNG only while a supported entropy source is active, such as its ADC source or RF subsystem.
 
 1. Device ID Generation: Generate a 16-byte device ID using the hardware TRNG and persist it across restarts. Device IDs are public identifiers, not secrets or proof of identity.
-2. Pair-key derivation: Both people enter the same strong, high-entropy secret locally. The devices sort the two public IDs and derive a 32-byte key using PBKDF2-HMAC-SHA256 (100,000 iterations) with `communicator-pair-v2 || lower_id || higher_id` as salt/context. The secret is never sent. Use at least 16 random characters (or an equivalently high-entropy phrase); a short password remains vulnerable to offline guessing despite the KDF.
+2. Pair-key derivation: Both people enter the same strong, high-entropy secret locally (on the current keypad, two hex digits type one ASCII character). The devices sort the two public IDs and derive a 32-byte key using PBKDF2-HMAC-SHA256 (100,000 iterations) with `communicator-pair-v2 || lower_id || higher_id` as salt/context. The secret is never sent. Use at least 16 random characters (or an equivalently high-entropy phrase); a short password remains vulnerable to offline guessing despite the KDF.
 3. Authenticated confirmation: The lower device ID sends a proof, the higher ID returns a fresh challenge, and the lower ID sends a final proof bound to both nonces. Each frame uses AES-256-GCM authentication over its immutable packet context. A device persists the keyed contact only after verifying the relevant authenticated proof; captured old frames cannot satisfy a new challenge exchange.
 4. A saved contact maps the peer's public device ID to its 32-byte derived key. Identity regeneration changes the KDF context, so users must pair again with the new ID.
 
@@ -40,7 +40,7 @@ The sender splits logical text up to 512 bytes into at most 16 fragments. Each r
 
 The fixed header is 43 bytes. The sender uses the active band's encoded-packet limit when choosing each fragment size. On the 255-byte LoRa profiles, plaintext fragments carry up to 212 application bytes and AES-GCM fragments up to 184; on the 133-byte S-band profile, these limits are 90 and 62 bytes. Each encrypted fragment has its own 12-byte nonce and 16-byte tag. Encrypt each fragment independently after its fragment metadata is final, so the tag authenticates the fragment index/count and other immutable header fields.
 
-The receiver authenticates/decrypts each encrypted fragment before adding its plaintext to a bounded reassembly entry. It accepts no more than 16 fragments and 512 assembled bytes, checks that fragments agree on sender/message/recipient/type/encryption/original hop limit, and delivers or acknowledges text only after the complete UTF-8 message is accepted by the UI queue. Four incomplete assemblies are retained; when that cache is full, the oldest entry is evicted. There is no time-based retry or reassembly guarantee, so a missing fragment leaves no delivered message or ACK. Relays forward fragments independently without decrypting them.
+The receiver authenticates/decrypts each encrypted fragment before adding its plaintext to a bounded reassembly entry. It accepts no more than 16 fragments and 512 assembled bytes, checks that fragments agree on sender/message/recipient/type/encryption/original hop limit, and delivers or acknowledges text only after the complete UTF-8 message is persisted to chat storage. Four incomplete assemblies are retained; when that cache is full, the oldest entry is evicted. There is no time-based retry or reassembly guarantee, so a missing fragment leaves no delivered message or ACK. Relays forward fragments independently without decrypting them.
 
 If any fragment fails authentication, metadata consistency, size, or UTF-8 validation, do not display the logical message or generate its ACK. Duplicate packet IDs are filtered before reassembly; identical retries of already accepted fragments may trigger another ACK without duplicating the chat item.
 
@@ -64,13 +64,15 @@ The receiver must extract the 12-byte nonce first, then verify the 16-byte authe
 
 ### Direct-message acknowledgements (`Ack`, type `0x02`)
 
-After a direct text or coordinate message is accepted by the receiver—meaning required decryption/authentication and payload validation succeeded and it was enqueued for the in-memory chat UI—the receiver queues an `Ack` unicast to the sender. Its application payload is the acknowledged logical `message_id` as exactly two big-endian bytes. For paired contacts, the ACK payload is AES-256-GCM protected with the contact key and the ACK packet's immutable header as AAD. An ACK for an accepted unpaired plaintext introduction is also plaintext and unauthenticated. An identical retry of an already accepted direct packet may receive another ACK without creating another chat entry.
+An `Ack` is queued only for an encrypted direct message: the packet must be unicast (never broadcast) and must have been authenticated with the sender's stored contact key, and its decrypted payload must have passed validation and been persisted. Plaintext introductions, unauthenticated coordinates, and broadcast traffic are delivered without any acknowledgement.
 
-An ACK does not prove the message was rendered, read, or persisted. The chat UI marks a matching encrypted direct-message row with a green check only after receiving the ACK from that peer; plaintext introductions and broadcast rows never get this indicator. The check is volatile and is lost on restart. An unpaired plaintext ACK is unauthenticated and can be spoofed. The radio queue does not automatically retry transmissions, and ACK packet queueing can fail if the transmit queue is full.
+The ACK application payload is exactly 34 bytes and names the acknowledged message: the original sender's 16-byte device ID, the original recipient's 16-byte device ID, and the logical `message_id` as two big-endian bytes. The ACK header repeats that `message_id` and carries the acknowledging device as `from` and the original sender as `to`. The payload is AES-256-GCM protected with the contact key and the ACK packet's immutable header as AAD. A receiver rejects an ACK it cannot authenticate, and rejects one whose payload does not name this device as the original recipient and the ACK sender as the original sender. An identical retry of an already accepted direct packet may receive another ACK without creating another chat entry.
+
+An ACK does not prove the message was rendered or read. The chat UI marks a matching encrypted direct-message row with a green check only after receiving the authenticated ACK from that peer; the acknowledged flag is then written to the sender's stored message record, so the marker persists across reboots. Plaintext introductions and broadcast rows never get this indicator. The radio queue does not automatically retry transmissions, and ACK packet queueing can fail if the transmit queue is full.
 
 ### GPS coordinates (`Coordinates`, type `0x03`)
 
-A coordinate payload is exactly eight bytes: signed 32-bit latitude microdegrees followed by signed 32-bit longitude microdegrees, both big-endian. Valid ranges are `-90_000_000..=90_000_000` and `-180_000_000..=180_000_000`. The receiver may accept an unencrypted coordinate from an unpaired sender, but paired contacts must send authenticated encrypted packets; malformed coordinates are discarded. A valid received coordinate appears as a selectable `GPS` row in the matching conversation. The UI currently receives coordinates but does not expose a command to transmit the local position.
+A coordinate payload is exactly eight bytes: signed 32-bit latitude microdegrees followed by signed 32-bit longitude microdegrees, both big-endian. Valid ranges are `-90_000_000..=90_000_000` and `-180_000_000..=180_000_000`. The receiver may accept an unencrypted coordinate from an unpaired sender, but paired contacts must send authenticated encrypted packets; malformed coordinates are discarded. An unencrypted coordinate is displayed without an acknowledgement. A valid received coordinate appears as a selectable `GPS` row in the matching conversation. The UI currently receives coordinates but does not expose a command to transmit the local position.
 
 Select the GPS row with Up/Down and press Enter to open navigation. The screen calculates great-circle distance and absolute target bearing from the latest local GPS fix. It estimates the user's course from successive fixes after at least five metres of movement, then reports a left/right/straight turn toward the target. No compass sensor is available. GPS drift, stale fixes, low movement, and poor satellite geometry can make the course estimate unavailable or noisy; the screen asks the user to move to establish direction and does not provide turn-by-turn road routing.
 
@@ -138,7 +140,7 @@ Duplicate suppression must not be applied when enqueuing: retries intentionally 
 
 ### Forwarding and Duplicate Detection
 
-The packet handler has a volatile 64-entry duplicate cache and hop-limited forwarding. It learns the origin ID of each accepted non-self, non-duplicate packet. Locally addressed direct text is delivered to the crypto handler: paired senders require authenticated decryption, unknown senders may send plaintext introductions, and paired contacts never accept plaintext fallback. Accepted text is delivered to the chat UI in a bounded in-memory view; persistent conversation history is not yet connected. The receiver queues an ACK only after the direct text is accepted into that UI queue; see the ACK semantics above.
+The packet handler has a volatile 64-entry duplicate cache and hop-limited forwarding. It learns the origin ID of each accepted non-self, non-duplicate packet. Locally addressed direct text is delivered to the crypto handler: paired senders require authenticated decryption, unknown senders may send plaintext introductions, and paired contacts never accept plaintext fallback. Accepted text is written to chat storage and the UI is notified with a popup and a revision. The receiver queues an ACK only after the record persisted; see the ACK semantics above.
 
 For each received packet:
 
@@ -182,14 +184,14 @@ Provide a work buffer large enough for the largest serialized key and value, rou
 - To: 0x0000...0000 (broadcast)
 - Payload: empty
 - Encryption: false
-- Purpose: Active discovery request. It is unauthenticated and reveals the sender's public device ID; receivers may relay it and respond.
+- Purpose: Active discovery request. It is unauthenticated and reveals the sender's public device ID; receivers may relay it and record the sender, but this firmware never answers one automatically.
 
 #### DeviceAnnounceResponse (`0x07`)
 - Type: `0x07`
 - To: The requesting device ID (unicast)
 - Payload: Empty
 - Encryption: false
-- Purpose: Return the responder's public ID in the `from` header. This proves neither identity nor possession of a pairing secret.
+- Purpose: Return the responder's public ID in the `from` header. This proves neither identity nor possession of a pairing secret. This firmware parses the type but never sends it: a device reveals its ID by sending an introduction, message, or pairing frame to a peer the user selected.
 
 #### PairingConfirm (`0x08`)
 - Type: `0x08`
@@ -199,4 +201,4 @@ Provide a work buffer large enough for the largest serialized key and value, rou
 
 #### Discovery and unpaired introductions
 
-Discovery is passive as well as active: accepted valid packet origins are added to the bounded nearby list, and a user can also scan with `DeviceAnnounce`/`DeviceAnnounceResponse`. A quiet device that sends no traffic and does not answer a scan remains undiscoverable. Discovery IDs are public and unauthenticated. A discovered unpaired peer can receive an explicitly warned plaintext introduction; pair with a strong shared secret before sending private information.
+Discovery is passive as well as active: accepted valid packet origins are added to the bounded nearby list, and a user can also broadcast a `DeviceAnnounce`. No automatic reply is sent, so a device is listed by the peers it has actually transmitted to; a quiet device that never announces or sends traffic stays undiscoverable. Discovery IDs are public and unauthenticated. A discovered unpaired peer can receive an explicitly warned plaintext introduction; pair with a strong shared secret before sending private information.
