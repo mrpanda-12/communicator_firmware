@@ -48,6 +48,21 @@ cargo build --release
 
 Compiling requires the Xtensa linker, which the espup environment provides; `build.rs` stops with setup instructions when it is missing. The Cargo runner is configured to flash and monitor using `partitions.csv`; flashing a board is a separate hardware operation.
 
+### Debug console
+
+`--features debug-console` adds a reader task on the USB-serial/JTAG port for developer commands. Type a line in the `espflash monitor` window and press Enter:
+
+| Line | Effect |
+| --- | --- |
+| `ids` | Log the next packet ID and the last message ID. |
+| `reset-ids` | Set both counters to zero in RAM and in flash. |
+
+```sh
+cargo run --release --features debug-console
+```
+
+Without the feature the module is not compiled at all: no reader task, no USB peripheral setup, and no console strings in the image. Resetting the IDs means the next packets reuse IDs peers may still remember, so expect duplicates to be dropped after a reset; it exists for test setups, not for the UI.
+
 No host test suite currently exercises the full firmware. A small set of tests is embedded in `ui/render/top_bar.rs`, but the configured target is Xtensa. Do not treat formatting or a successful compile as evidence of RF, display, GPS, flash-endurance, or keypad operation. The keypad and radio need a board for physical verification.
 
 ## First boot and radio pairing
@@ -63,7 +78,7 @@ Broadcast traffic and explicitly selected unpaired introductions are plaintext. 
 
 ## Important limits
 
-- The wire `packet_id` and `message_id` fields are 32-bit values. Local packet IDs come from one flash-persisted counter shared by the UI, radio receive responses, pairing packets, and diagnostic sender; it wraps only after 4,294,967,296 reservations. The stored value stays at least 1024 IDs ahead of the running counter, so a power loss can skip IDs but never replay one. The settings screen's PACKET IDS page shows the last packet and message ID, the next ID, and the remaining percentage.
+- The wire `packet_id` and `message_id` fields are 32-bit values. Local packet IDs come from one flash-persisted counter shared by the UI, radio receive responses, pairing packets, and diagnostic sender; it wraps only after 4,294,967,296 reservations. Each reservation persists the advanced counter before using it, so a power loss skips at most one interrupted reservation and never replays a sent ID. The settings screen's PACKET IDS page shows the last packet and message ID, the next ID, and the remaining percentage.
 - Protocol version 2 is not backward compatible: both boards must run firmware that uses the 47-byte header. A board running version 1 rejects version 2 frames, and the reverse is also true. Chat records written by version 1 firmware use the narrower ID layout and cannot be read by this firmware; delete the old conversations from the settings screens after upgrading.
 - The TX queue holds 32 encoded packets. The outbox keeps two messages for delivery; a third message is refused on screen and stays in the composer. The outbox is not persisted, so a reboot cancels pending retries.
 - A direct message is retransmitted after 20 s while the peer has not acknowledged it, up to three transmissions in total. A retry reuses the original encoded fragments, so the receiver's duplicate cache suppresses a second stored row. Broadcast and plaintext sends are not retried.

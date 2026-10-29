@@ -48,7 +48,9 @@ A device ID is 16 random bytes created from the ESP32-S3 TRNG and stored in flas
 
 The `packet_id` and `message_id` fields are 32-bit. Locally generated packets take IDs from one process-wide allocator whose counter is stored in flash under the `packet_ids` setting. A fragmented chat message reserves one contiguous block: the first value is the message ID and each fragment increments `packet_id` by its index. Pairing, ACK, announcement, and diagnostic sends reserve one ID each from the same allocator.
 
-At boot the firmware resumes at the stored counter and immediately stores a checkpoint two windows (2048 IDs) ahead. A checkpoint task renews it once the running counter comes within one window of the stored value; a power loss can therefore skip up to 2048 IDs but never replay one, because the next boot starts at or beyond the stored value. The counter wraps after 4,294,967,296 reservations. The settings screen's PACKET IDS page shows the last assigned packet and message ID, the next ID, and the percentage of the 32-bit space left.
+Every reservation writes the advanced counter to flash before any of its IDs can reach the air, then hands out the range. A reboot therefore resumes at the first unused ID: an ID that was sent is never replayed, and only a reservation interrupted before it was queued is skipped. Holding the flash session for the whole reserve-and-write keeps concurrent producers from claiming the same range. The counter wraps after 4,294,967,296 reservations. The settings screen's PACKET IDS page shows the last assigned packet and message ID, the next ID, and the percentage of the 32-bit space left.
+
+A `debug-console` build (see below) can reset the counter to zero over the cable for test setups.
 
 `message_id` is used to correlate a whole logical message and to identify an ACK target. It is not an encryption nonce: AES-GCM has its own random 12-byte nonce per encrypted packet.
 

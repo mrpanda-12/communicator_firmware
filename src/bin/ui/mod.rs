@@ -206,7 +206,7 @@ where
         if state.take_pending_announcement() {
             let status = match state.device_id {
                 Some(device_id) => {
-                    let packet_id = crate::packet::packet_data::reserve_local_packet_ids(1);
+                    let packet_id = flash.reserve_packet_ids(1).await;
                     match PacketData::new(
                         packet_id,
                         packet_id,
@@ -255,17 +255,19 @@ where
                 .is_some_and(|device_id| device_id < pending.peer_id)
             {
                 let device_id = state.device_id;
-                let packet_id = crate::packet::packet_data::reserve_local_packet_ids(1);
-                let request = build_request_packet(
+                let packet_id = flash.reserve_packet_ids(1).await;
+                let queued = match build_request_packet(
                     &pending.key,
                     packet_id,
                     device_id.unwrap(),
                     pending.peer_id,
-                );
-                let queued = request.is_some_and(|(packet, nonce)| {
-                    pairing.set_request_nonce(pending.peer_id, nonce);
-                    radio_queue.add_packet(&packet).is_ok()
-                });
+                ) {
+                    Some((packet, nonce)) => {
+                        pairing.set_request_nonce(pending.peer_id, nonce);
+                        radio_queue.add_packet(&packet).is_ok()
+                    }
+                    None => false,
+                };
                 if queued {
                     state.set_pairing_status(pending.peer_id, PairingUiStatus::RequestSent);
                 } else {
@@ -439,7 +441,7 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
             return;
         }
     };
-    let packet_id = crate::packet::packet_data::reserve_local_packet_ids(fragment_count);
+    let packet_id = flash.reserve_packet_ids(fragment_count).await;
     let built = build_message_packets(
         packet_id,
         device_id,

@@ -48,7 +48,7 @@ The radio and keypad workers own their hardware instead of sharing mutable perip
     → UI history revision reload
 ```
 
-The local packet-ID allocator is a shared 32-bit sequence persisted in flash. It reserves a contiguous range for a fragmented message; pairing, ACK, announcement, diagnostic, and chat producers all draw from that same allocator. At boot the counter resumes at the stored value, and a checkpoint task keeps the stored value at least 1024 IDs ahead of the running counter, so a power loss can skip IDs but never reuse one. The wire fields are 32 bits wide, so the counter wraps only after 4,294,967,296 reservations. The Packet IDs settings page shows the counters and the remaining percentage.
+The local packet-ID allocator is a shared 32-bit sequence persisted in flash. It reserves a contiguous range for a fragmented message; pairing, ACK, announcement, diagnostic, and chat producers all draw from that same allocator. Each reservation persists the advanced counter before the IDs are handed out, so at boot the counter resumes at the first unused ID and a power loss can skip an interrupted reservation but never replay a sent one. The wire fields are 32 bits wide, so the counter wraps only after 4,294,967,296 reservations. The Packet IDs settings page shows the counters and the remaining percentage.
 
 The outbox owns a message until the peer acknowledges it: an outbox task retries fragments that the TX queue refused and retransmits the whole message after 20 s, up to three transmissions. An authenticated ACK cancels the retry. There is no persistent TX queue, so a reboot loses pending retries. Details and failure behavior are in [messaging workflow](messaging.md).
 

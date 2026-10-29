@@ -74,7 +74,7 @@ Settings are named keys with values serialized without a type tag, so a setting'
 | --- | --- | --- | --- |
 | `display_brightness` | `u8` | 80 | Values above 100 are rejected and the default is used. Applied to GPIO7 PWM at boot; no runtime adjustment screen exists. |
 | `timezone_offset_minutes` | `i32` | 0 | Clamped range −720…840 minutes (UTC−12:00…UTC+14:00). Out-of-range values fall back to 0. Changed from the GPS settings screen and written as it changes. |
-| `packet_ids` | two `u32` little-endian values: packet ID and message ID | 0 | Packet-ID checkpoint. Loaded at boot as the next ID, then advanced two windows (2048 IDs) and rewritten before any producer sends. A checkpoint task renews it whenever the running counter comes within one window (1024 IDs) of the stored value. |
+| `packet_ids` | two `u32` little-endian values: packet ID and message ID | 0 | Next packet ID and the base ID of the last reservation. Loaded at boot, then rewritten by every reservation before the IDs are used, so a reboot resumes at the first unused ID. |
 
 Identity is stored under the setting key `device_id` as exactly 16 bytes.
 

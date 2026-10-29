@@ -20,9 +20,7 @@ use crate::{
     notify,
     packet::{
         fragment::{Defragmenter, ReassembledMessage},
-        packet_data::{
-            DEFAULT_HOP_LIMIT, GCM_OVERHEAD, MAX_PAYLOAD_SIZE, PacketData, reserve_local_packet_ids,
-        },
+        packet_data::{DEFAULT_HOP_LIMIT, GCM_OVERHEAD, MAX_PAYLOAD_SIZE, PacketData},
         packet_deserializer::PacketDeserializer,
         packet_type::PacketType,
     },
@@ -104,7 +102,8 @@ impl PacketHandler {
 
         // Answer a retransmit from the accepted cache and stop.
         if self.is_duplicate(packet.from, packet.packet_id) {
-            self.repeat_ack(&packet, device_id, broadcast, here, tx);
+            self.repeat_ack(&packet, device_id, broadcast, here, tx, flash)
+                .await;
             defmt::debug!("RX duplicate dropped: id={}", packet.packet_id);
             return;
         }
@@ -164,13 +163,14 @@ impl PacketHandler {
     }
 
     /// Repeat the ACK for a fragment that was already accepted and delivered.
-    fn repeat_ack(
+    async fn repeat_ack(
         &mut self,
         packet: &PacketData,
         device_id: [u8; 16],
         broadcast: bool,
         here: bool,
         tx: &RadioQueue,
+        flash: &Flash,
     ) {
         // Repeat only for direct text and coordinates.
         if broadcast
@@ -200,7 +200,7 @@ impl PacketHandler {
         };
 
         // Repeat the ACK with the key that accepted the original fragment.
-        self.send_ack(packet, device_id, key, tx);
+        self.send_ack(packet, device_id, key, tx, flash).await;
     }
 
     /// Deliver one complete plaintext broadcast message.
@@ -253,7 +253,8 @@ impl PacketHandler {
             });
         }
         // Tell the sender the whole message arrived.
-        self.send_ack(&message.first_packet, device_id, key, tx);
+        self.send_ack(&message.first_packet, device_id, key, tx, flash)
+            .await;
     }
 
     /// Deliver one position row, then acknowledge it when authenticated.
@@ -326,7 +327,7 @@ impl PacketHandler {
             fingerprint: fingerprint(packet),
             key,
         });
-        self.send_ack(packet, device_id, key, tx);
+        self.send_ack(packet, device_id, key, tx, flash).await;
     }
 
     /// Authenticate an acknowledgement and mark the sent message delivered.
@@ -396,7 +397,7 @@ impl PacketHandler {
                     fail();
                     return;
                 };
-                let request_id = reserve_local_packet_ids(1);
+                let request_id = flash.reserve_packet_ids(1).await;
                 let Some((response, response_nonce)) =
                     build_challenge_packet(&key, request_id, device_id, packet.from, request_nonce)
                 else {
@@ -429,9 +430,10 @@ impl PacketHandler {
                     fail();
                     return;
                 };
+                let response_id = flash.reserve_packet_ids(1).await;
                 let Some(response) = build_finish_packet(
                     &key,
-                    reserve_local_packet_ids(1),
+                    response_id,
                     device_id,
                     packet.from,
                     request_nonce,
@@ -526,12 +528,13 @@ impl PacketHandler {
     }
 
     /// Queue one authenticated acknowledgement for an accepted message.
-    fn send_ack(
+    async fn send_ack(
         &mut self,
         received: &PacketData,
         device_id: [u8; 16],
         key: PairKey,
         tx: &RadioQueue,
+        flash: &Flash,
     ) {
         // Name the original sender, this device, and the logical message.
         let mut acknowledgement = [0; ACK_PAYLOAD_SIZE];
@@ -541,7 +544,7 @@ impl PacketHandler {
 
         // Reserve the GCM overhead; encryption below replaces the payload.
         let mut ack = match PacketData::new(
-            reserve_local_packet_ids(1),
+            flash.reserve_packet_ids(1).await,
             received.message_id,
             0,
             1,

@@ -22,31 +22,17 @@ pub const GCM_OVERHEAD: usize = GCM_NONCE_SIZE + GCM_TAG_SIZE;
 
 pub const DEFAULT_HOP_LIMIT: u8 = 3;
 
-/// IDs one checkpoint reserves ahead of the stored counter.
-pub const ID_RESERVATION_WINDOW: u32 = 1024;
-
 /// Allocate packet IDs from one counter shared by all local producers.
 /// A batch reservation keeps fragments of one message consecutive and prevents
 /// the UI, protocol responses, and diagnostic producer from colliding.
 static LOCAL_PACKET_ID: AtomicU32 = AtomicU32::new(0);
-/// Highest counter value already written to flash.
-static PERSISTED_LIMIT: AtomicU32 = AtomicU32::new(0);
 /// First ID of the most recent reservation, reported as the last message ID.
 static LAST_MESSAGE_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Load the persisted counters before any producer runs.
+/// Set both counters: once at boot from flash, then from the reserved range.
 pub fn set_local_packet_ids(next: u32, last_message_id: u32) {
     LOCAL_PACKET_ID.store(next, Ordering::Relaxed);
     LAST_MESSAGE_ID.store(last_message_id, Ordering::Relaxed);
-}
-
-/// Reserve `count` consecutive local packet IDs and return the first ID.
-///
-/// Returns 32-bit wire values that wrap after 4,294,967,296 reservations.
-pub fn reserve_local_packet_ids(count: u16) -> u32 {
-    let first = LOCAL_PACKET_ID.fetch_add(u32::from(count), Ordering::Relaxed);
-    LAST_MESSAGE_ID.store(first, Ordering::Relaxed);
-    first
 }
 
 /// Report the ID the next reservation starts from.
@@ -57,28 +43,6 @@ pub fn current_packet_id() -> u32 {
 /// Report the first ID of the most recent reservation.
 pub fn last_message_id() -> u32 {
     LAST_MESSAGE_ID.load(Ordering::Relaxed)
-}
-
-/// Record the counter value a checkpoint has persisted.
-pub fn set_persisted_limit(limit: u32) {
-    PERSISTED_LIMIT.store(limit, Ordering::Relaxed);
-}
-
-/// Report the counters to persist once the running value comes within one
-/// window of the stored limit.
-///
-/// The checkpoint stays two windows ahead of the running counter, so a delayed
-/// write or a power loss can skip IDs but never replay one.
-pub fn checkpoint_target() -> Option<(u32, u32)> {
-    let current = LOCAL_PACKET_ID.load(Ordering::Relaxed);
-    let persisted = PERSISTED_LIMIT.load(Ordering::Relaxed);
-    if current == u32::MAX || current.saturating_add(ID_RESERVATION_WINDOW) < persisted {
-        return None;
-    }
-    Some((
-        current.saturating_add(2 * ID_RESERVATION_WINDOW),
-        last_message_id(),
-    ))
 }
 
 #[derive(Clone)]

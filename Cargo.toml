@@ -1,4 +1,7 @@
 [package]
+# Only the explicit `communicator` target below is a binary; files next to
+# `main.rs` are modules of it, not separate bins.
+autobins     = false
 edition      = "2024"
 name         = "communicator"
 rust-version = "1.95"
@@ -7,6 +10,11 @@ version      = "0.1.0"
 [[bin]]
 name = "communicator"
 path = "./src/bin/main.rs"
+
+[features]
+# Build with `--features debug-console` for the `ids`/`reset-ids` serial commands.
+# Off by default so a production image has no console reader task.
+debug-console = []
 
 [dependencies]
 esp-hal = { version = "~1.2.2", features = ["defmt", "esp32s3", "unstable"] }

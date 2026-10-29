@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 pub mod crypto;
+#[cfg(feature = "debug-console")]
+pub mod debug_console;
 pub mod hardware;
 pub mod network;
 pub mod notify;
@@ -246,34 +248,17 @@ async fn gps_task(mut gps: Gps<'static>) -> ! {
     }
 }
 
+/// A background service that stopped; every variant restarts the firmware.
+enum StoppedService<R> {
+    Radio(R),
+    Gps,
+    Keypad,
+}
+
 /// Restart the firmware when a service task stops serving the application.
 fn restart_firmware(reason: &str) -> ! {
     defmt::error!("{}; restarting the firmware", reason);
     esp_hal::system::software_reset()
-}
-
-/// Persist the packet-ID counter once it reaches the saved window limit.
-async fn id_checkpoint_task(flash: &Flash) -> ! {
-    loop {
-        Timer::after(Duration::from_secs(1)).await;
-        let Some((limit, message_id)) = packet::packet_data::checkpoint_target() else {
-            continue;
-        };
-        let saved = flash
-            .with(async |session| {
-                session
-                    .storage
-                    .save_packet_ids(limit, message_id, &mut session.buffer)
-                    .await
-                    .is_ok()
-            })
-            .await;
-        if saved {
-            packet::packet_data::set_persisted_limit(limit);
-        } else {
-            defmt::warn!("Could not persist the packet-ID checkpoint");
-        }
-    }
 }
 
 /// Keep the outbox draining: retry fragments the TX queue refused and
@@ -314,8 +299,8 @@ async fn main(_spawner: Spawner) -> ! {
     let mut flash_buffer = [0u8; FLASH_BUFFER_SIZE];
     let (mut storage, device_id) = initialize_storage(flash_store, &trng, &mut flash_buffer).await;
 
-    // Resume the stored packet-ID counter and reserve the next window in flash
-    // before any producer can send.
+    // Resume the packet-ID counter at the first ID the stored value reserved.
+    // Each later reservation persists its own range before using it.
     let saved_ids = storage
         .load_packet_ids(&mut flash_buffer)
         .await
@@ -324,14 +309,6 @@ async fn main(_spawner: Spawner) -> ! {
     let next_id = saved_ids.map(|ids| ids.packet_id).unwrap_or(0);
     let last_message_id = saved_ids.map(|ids| ids.message_id).unwrap_or(0);
     packet::packet_data::set_local_packet_ids(next_id, last_message_id);
-    let limit = next_id.saturating_add(2 * packet::packet_data::ID_RESERVATION_WINDOW);
-    match storage
-        .save_packet_ids(limit, last_message_id, &mut flash_buffer)
-        .await
-    {
-        Ok(()) => packet::packet_data::set_persisted_limit(limit),
-        Err(_) => defmt::warn!("Could not persist the packet-ID checkpoint"),
-    }
     let display_brightness =
         ui::display_settings::load_brightness(&mut storage, &mut flash_buffer).await;
     let timezone_offset_minutes =
@@ -441,7 +418,7 @@ async fn main(_spawner: Spawner) -> ! {
                 continue;
             };
             defmt::info!("Device identity: {}", device_id);
-            let packet_id = packet::packet_data::reserve_local_packet_ids(1);
+            let packet_id = flash.reserve_packet_ids(1).await;
             defmt::info!("Packet {:x}", packet_id);
 
             let packet = PacketData::new(
@@ -467,24 +444,53 @@ async fn main(_spawner: Spawner) -> ! {
         }
     };
 
-    let services_fut = async {
+    // Background services. The console leaf exists only in a debug build, so a
+    // production image has no reader task, no polling and no console strings.
+    #[cfg(feature = "debug-console")]
+    let stopped_fut = async {
         match select(
             select(radio_worker, gps_fut),
             select(
                 keypad_worker,
-                select(outbox_task(), id_checkpoint_task(&flash)),
+                select(
+                    outbox_task(),
+                    debug_console::run(
+                        esp_hal::usb::usb_serial_jtag::UsbSerialJtag::new(peripherals.USB_DEVICE),
+                        &flash,
+                    ),
+                ),
             ),
         )
         .await
         {
-            Either::First(Either::First(result)) => match result {
-                Ok(()) => restart_firmware("Radio worker stopped"),
-                Err(_) => restart_firmware("Radio worker failed"),
-            },
-            Either::First(Either::Second(_)) => restart_firmware("GPS task stopped"),
-            Either::Second(Either::First(_)) => restart_firmware("Keypad worker stopped"),
+            Either::First(Either::First(result)) => StoppedService::Radio(result),
+            Either::First(Either::Second(_)) => StoppedService::Gps,
+            Either::Second(Either::First(_)) => StoppedService::Keypad,
             Either::Second(Either::Second(Either::First(never))) => match never {},
             Either::Second(Either::Second(Either::Second(never))) => match never {},
+        }
+    };
+    #[cfg(not(feature = "debug-console"))]
+    let stopped_fut = async {
+        match select(
+            select(radio_worker, gps_fut),
+            select(keypad_worker, outbox_task()),
+        )
+        .await
+        {
+            Either::First(Either::First(result)) => StoppedService::Radio(result),
+            Either::First(Either::Second(_)) => StoppedService::Gps,
+            Either::Second(Either::First(_)) => StoppedService::Keypad,
+            Either::Second(Either::Second(never)) => match never {},
+        }
+    };
+
+    let services_fut = async {
+        match stopped_fut.await {
+            StoppedService::Radio(Ok(())) => restart_firmware("Radio worker stopped"),
+            StoppedService::Radio(Err(_)) => restart_firmware("Radio worker failed"),
+            StoppedService::Gps => restart_firmware("GPS task stopped"),
+            StoppedService::Keypad => restart_firmware("Keypad worker stopped"),
         }
     };
     GPS_SNAPSHOT.sender().send(ui::gps_snapshot(None, None));
