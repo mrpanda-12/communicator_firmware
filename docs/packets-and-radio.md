@@ -1,294 +1,120 @@
-# Packets and Radio
+# Radio and transmit path
 
-## Current Capabilities
+The LR1121 driver in `src/bin/hardware/lr1121/` and the worker in `src/bin/radio/radio.rs` together move protocol packets on and off the air. The protocol framing is separate; see [protocol reference](protocol-specification.md) for the 47-byte header and payload rules.
 
-| Band | TX | RX | Notes |
-| --- | --- | --- | --- |
-| Sub-GHz LoRa, 150-960 MHz | Yes | Yes | The default `main.rs` profile is 869.4 MHz, SF9, 125 kHz, CR 4/5, 22 dBm, explicit header, CRC on. |
-| 2.4 GHz LoRa, 2.4-2.5 GHz | Yes | Yes | Requires an explicit 2.4 GHz `RadioConfig`; it is not the current `main.rs` default. |
-| S-band LR-FHSS, 1.9-2.1 GHz | Yes | No | The LR1121 User Manual states its LR-FHSS implementation is transmit-only. S-band also has no LoRa mode, so S-band RX is rejected. |
+## Current configuration
 
-By default, `main.rs` starts RX and queues a broadcast `Text` test packet every 30 seconds. A link requires two boards with the same frequency, spreading factor, bandwidth, coding rate, preamble, header mode, CRC setting, and sync word. `RadioConfig::lora_sync_word` sets the LoRa PHY sync word and defaults to the private-network value `0x12`. The public LoRaWAN value is `0x34`, so LoRaWAN devices do not decode these packets.
-
-`cargo check` succeeds for the configured ESP32-S3 target; no linked firmware or two-board RF test is recorded. Antenna connection, RF-switch behavior, range, and peer interoperability still require bench verification.
-
-## Sync Words vs. Your Packet Decoder
-
-The sync word is handled inside the LR1121 PHY. It is **not** part of the 43-byte protocol packet, it is not written by `PacketSerializer`, and it is never passed to `PacketDeserializer`.
-
-Transmit path:
-
-```text
-PacketSerializer -> LR1121 SPI buffer -> preamble + sync word + LoRa header + payload + CRC
-```
-
-Receive path:
-
-```text
-preamble + sync word matched by LR1121 -> header/payload demodulated
--> RX_DONE or error IRQ -> firmware reads bytes over SPI -> PacketDeserializer
-```
-
-Consequences:
-
-- The sync word matters even when you implement your own packet decoder. Your decoder only runs after the LR1121 has recognized the frame and delivered bytes over SPI. If the transmitter and receiver use different sync words, the LR1121 normally never raises `RX_DONE`, so `PacketDeserializer` is never called and cannot recover the packet.
-- The sync word does not alter, encrypt, authenticate, or address the payload bytes. Your decoder sees the same custom packet bytes regardless of which sync word carried them.
-- If you decode raw IQ from an SDR, you can choose to ignore the sync word in your own software, but the sync word is still present in the waveform. A LoRa modem receiver must be configured with the same value.
-- A sync word is a network filter, not a secret. It reduces accidental cross-network reception but provides no security.
-
-The LR1121 has separate sync-word settings for each modem. This firmware does **not** use all three at once; only the setting for the currently selected packet type matters:
-
-| Modem | Sync word size | Value used by this firmware | Where it is used |
-| --- | ---: | --- | --- |
-| LoRa | 1 byte | `0x12` (private) | Sub-GHz and 2.4 GHz LoRa; set during radio configuration. `0x34` is the public LoRaWAN value and is not used. |
-| LR-FHSS | 4 bytes | `0x2C0F7995` | S-band LR-FHSS TX; set again immediately before building the frame. |
-| GFSK | 8 bytes | Not configured | GFSK is not used by this firmware. |
-
-Use `0x12` for LoRa links and `0x2C0F7995` for LR-FHSS links. The GFSK setting is unused.
-
-## Wire Format
-
-Packets use one format on every RF band. The current header is 43 bytes; payload begins at byte 43. All multi-byte integers are big-endian.
-
-| Field | Offset | Size | Meaning |
-| --- | ---: | ---: | --- |
-| `version` | 0 | 1 | Protocol version, currently `1`. |
-| `packet_id` | 1 | 2 | Packet identifier. |
-| `message_id` | 3 | 2 | Shared identifier for fragments of one message. |
-| `fragment_index` | 5 | 1 | Zero-based fragment index. |
-| `fragment_count` | 6 | 1 | Number of fragments; must be nonzero. |
-| `from` | 7 | 16 | Sender device ID. |
-| `to` | 23 | 16 | Recipient ID; all zeros mean broadcast. |
-| `is_encrypted` | 39 | 1 | `0` or `1`. This flag does not perform encryption. |
-| `packet_type` | 40 | 1 | Application type byte. |
-| `initial_hop_limit` | 41 | 1 | Original hop limit. |
-| `hop_limit` | 42 | 1 | Current hop limit. |
-| `payload` | 43 | Variable | Application bytes, or nonce/ciphertext/tag for encrypted packets. |
-
-Current packet type assignments:
-
-| Value | Variant |
-| ---: | --- |
-| `0x01` | `Text` |
-| `0x02` | `Ack` |
-| `0x03` | `Coordinates` |
-| `0x04` | `Heading` |
-| `0x05` | `DeviceAnnounce` discovery request |
-| `0x06` | `FrequencyChange` announcement type; no handler yet |
-| `0x07` | `DeviceAnnounceResponse`; parsed but not sent by this firmware |
-| `0x08` | `PairingConfirm` authenticated pairing stage |
-
-`PacketData::new` validates fragment metadata, payload capacity, and the minimum nonce/tag length when `is_encrypted` is true. This firmware supports up to 16 fragments and 512 bytes per logical text message. Each encrypted fragment gets its own AES-256-GCM nonce and tag; other packet types are not automatically encrypted. See [protocol fragmentation and coordinates](protocol-specification.md#3-fragmentation-and-reassembly) and [chat, fragmentation, and GPS navigation](chat-fragmentation-and-navigation.md).
-
-For accepted direct `Text` and `Coordinates`, the receiver queues an `Ack` after required decryption/authentication, payload validation, and persistence of the record. Text ACKs are generated only after full fragment reassembly. The ACK is unicast to the sender and carries the acknowledged logical message ID as a two-byte big-endian payload. ACKs for paired contacts are AES-GCM protected; ACKs for accepted unpaired plaintext introductions are plaintext and unauthenticated. An ACK confirms receiver-side storage acceptance—not display or reading. The chat shows a green check only for the matching encrypted direct-message row; it never marks plaintext or broadcast rows.
-
-## Sending Packets
-
-Every supported transmission goes through the radio worker's TX queue. There is no public `Radio` API that sends directly to the radio and bypasses the queue. The public `Lr1121` driver exposes low-level TX commands, but using them directly bypasses worker pacing, IRQ handling, and RX/TX state tracking and is not supported application behavior.
-
-### Normal Send Path
-
-1. Build a `PacketData` value. `PacketData::new` validates fragment metadata, payload capacity, and the encrypted-payload minimum.
-2. Enqueue the packet:
-   - While holding `Radio` and before `run_worker` consumes it, call `Radio::send_packet`. It checks the complete encoded length against the active band limit, then enqueues into that radio's queue.
-   - After `run_worker` takes `Radio`, other tasks use the matching `RadioQueue::add_packet` handle. It validates packet metadata and the generic 255-byte limit, but not the active band limit. The worker rechecks at dequeue time and exits with `PayloadTooLong` if the packet does not fit.
-3. `RadioQueue::add_packet` encodes the packet with `PacketSerializer` and sends the encoded bytes to that queue instance's Embassy channel.
-4. The worker takes one packet at a time, stops RX if active, loads the LoRa payload or builds the LR-FHSS frame, clears stale IRQs, and starts TX with a 30-second timeout.
-5. On `TX_DONE`, the worker clears `tx_in_flight`. If the queue is empty, it restarts RX. If packets remain, it continues sending, but after every two consecutive transmissions it opens an RX window of up to 500 ms before continuing. On `TIMEOUT`, it returns `TxTimeout`.
-
-`Radio::send_packet` means “accept this packet for transmission,” not “transmit it now.” It only places the encoded packet in the queue. The `run_worker` loop is the part that actually talks to the LR1121: it removes a queued packet, prepares the radio, and starts the over-the-air transmission. This keeps RX interrupts, TX completion, timeouts, and radio state changes under one owner.
-
-### Queue Ownership
-
-Create the queue separately, then pass a reference to it when constructing the radio:
+`main.rs` builds one fixed config:
 
 ```rust
-let radio_queue = RadioQueue::new();
-let radio_control = RadioControl::new();
-let radio = Radio::new(radio_config, lr1121, &radio_queue, &radio_control)?;
-```
-
-`Radio` borrows both objects. `RadioQueue` carries outgoing packets; `RadioControl` carries local commands such as frequency changes. `run_worker` takes ownership of `Radio`; once it is running, application tasks cannot call methods on that moved value. Keep both objects available and pass the queue to packet producers and the packet handler, and the control channel to code that needs to request retuning. The worker remains the sole owner of the hardware and waits on its packet queue, control channel, and radio interrupts. Create one queue and one control channel per radio to keep their traffic isolated. Neither object takes a `Radio` in its constructor or is accessed as a field through `radio` after the worker starts.
-
-For two radios, create and pair two queues:
-
-```rust
-let first_queue = RadioQueue::new();
-let first_control = RadioControl::new();
-let first_radio = Radio::new(first_config, first_lr1121, &first_queue, &first_control)?;
-
-let second_queue = RadioQueue::new();
-let second_control = RadioControl::new();
-let second_radio = Radio::new(second_config, second_lr1121, &second_queue, &second_control)?;
-```
-
-This explicit ownership makes dependencies visible and permits separate queues for separate radios. Producers must be given the correct queue reference; a packet forwarded by one radio should be enqueued on that same radio's queue.
-
-Example using the band-aware path before starting the worker:
-
-```rust
-use crate::packet::{packet_data::{DEFAULT_HOP_LIMIT, PacketData}, packet_type::PacketType};
-
-let packet = PacketData::new(
-    packet_id,
-    message_id,
-    0,
-    1,
-    sender_id,
-    recipient_id,
-    false,
-    PacketType::Text,
-    b"hello",
-    DEFAULT_HOP_LIMIT,
-    DEFAULT_HOP_LIMIT,
-)?;
-
-let radio_queue = RadioQueue::new();
-let radio_control = RadioControl::new();
-let radio = Radio::new(radio_config, lr1121, &radio_queue, &radio_control)?;
-radio.send_packet(&packet)?;
-radio.run_worker(None, async |packet| {
-    PacketHandler::handle_packet(packet, &radio_queue, &mut storage, &mut flash_buffer).await;
-}).await?;
-```
-
-### Queue Behavior
-
-| Property | Current behavior |
-| --- | --- |
-| Ordering | FIFO. Packets transmit in enqueue order. |
-| TX burst | The worker sends two queued packets, then listens for up to 500 ms before sending the next two. S-band skips the RX window because it is TX-only. |
-| Capacity | 16 encoded packets, plus at most one packet already in flight. |
-| Backpressure | `Radio::send_packet` returns `TxQueueFull`; `RadioQueue::add_packet` returns `QueueError::Full`. |
-| Retries | None. A failed TX does not re-enqueue the packet. |
-| Priority | None. There is no priority ordering. |
-| Emergency bypass | None at the `Radio` layer. Low-level `Lr1121` TX commands exist but are unsupported outside the worker. |
-| Duplicate suppression | RX handler keeps the 64 most recently seen `(sender ID, packet_id)` pairs in RAM; TX queue still accepts duplicate packets. |
-| Persistence | None. Queued packets are lost on reset. |
-| In-flight packet | Counted by `tx_in_flight`; `pending_tx_packets` includes it. |
-
-`RadioQueue::add_packet` is public because application tasks and the packet forwarder need to enqueue after `Radio` has moved into the worker. Application code should prefer `Radio::send_packet` whenever it still has a `Radio` value, since it also checks the active band's packet limit before enqueueing.
-
-The queue stores encoded packets, not logical messages. The chat sender fragments text up to 512 bytes into at most 16 band-sized packets and queues each one. An empty queue can hold all fragments, but queueing is not atomic: if `Full` occurs partway through a message, already queued fragments cannot be rolled back and the receiver will not deliver an incomplete message. The worker sends queued fragments FIFO and opens a short RX window after every two transmissions; this window is not an acknowledgement and is not synchronized with the receiver.
-
-The receiver retains at most four incomplete message assemblies and evicts the oldest when that cache is full. It does not impose a wall-clock expiry. Missing fragments do not result in delivery or an ACK. The reassembly limit is 16 fragments and 512 plaintext bytes; the packet layer rejects larger fragment counts.
-
-### Emergency and Priority Sends
-
-There is no emergency or priority send path in the current firmware. `Radio::start_transmit` is private, and every queued packet is handled by the same worker loop. The low-level `Lr1121` TX commands are public, but they are not a supported bypass: they do not manage queue ordering, RX suspension/resumption, or worker state.
-
-If priority or emergency behavior is added later, it must be an explicit policy rather than an undocumented bypass:
-
-- Normal packets remain FIFO below any priority class.
-- A priority/emergency send must still use the radio worker and the normal radio configuration, IRQ, timeout, and duty-cycle rules.
-- It must not skip duplicate handling once duplicate detection exists.
-- It must define whether it can preempt an in-flight packet. The current code cannot abort an in-flight TX.
-
-These are design requirements, not implemented capabilities.
-
-## Receiving, Forwarding, and Duplicates
-
-The worker reads RX buffer status and bytes, clears the IRQ, restarts RX, and passes the raw encoded packet to its async callback. `PacketHandler::handle_packet` decodes the packet, loads this device's ID from `StorageManager`, and checks a 64-entry RAM cache keyed by `(sender ID, packet_id)`. Duplicate and self-originated packets are dropped. Accepted packet origins are added to the bounded nearby-device list. Every accepted packet, including a broadcast `DeviceAnnounce`, adds its sender to the nearby list. The handler never answers with this device's ID: that ID travels only in traffic the user sends to a selected peer. Paired direct text and coordinates are decrypted only after their per-packet AES-GCM tags validate against the stored sender key; missing keys, tampering, and plaintext from a paired contact are rejected. Unpaired plaintext introductions remain readable and are explicitly warned in the UI.
-
-RX is single-packet mode (`set_rx(0)`), and the worker restarts RX after each packet or error. Header errors, CRC errors, and non-RX IRQs clear the pending IRQ and restart RX.
-
-Duplicate detection in the receive handler and basic hop-limited forwarding are implemented. The 64-entry cache is volatile, so a reset clears it; an old packet can be accepted again after its key is evicted. Accepted direct and broadcast text and valid coordinates are written to chat storage after any required authentication/decryption, and the UI is notified per message with a popup and a history revision. The UI lets the user select a received GPS row to open a distance and movement-direction screen.
-
-The receive-side cache deduplicates on `(from, packet_id)` before forwarding or local delivery, then forwards only if `hop_limit` is nonzero. An identical retry of a fragment from an already accepted encrypted direct message may trigger another ACK without a duplicate chat entry. The sender does not currently retry packets automatically. ACKs update the acknowledged flag of the matching encrypted direct-message row in flash; they do not prove display or reading.
-
-## LR1121 Hardware Setup
-
-`Lr1121::new` performs these steps before `Radio::new` runs:
-
-- Hard reset, BUSY wait, and NSS wakeup pulse.
-- SPI CRC disabled, matching the board reference HAL.
-- DCDC regulator selected.
-- Board RF switch configured with `SetDioAsRfSwitch` (`RFSW0 | RFSW1`; RX on RFSW0, TX on RFSW1).
-- 3.0 V TCXO with a 300-tick startup time (30.52 us steps).
-- 32.768 kHz crystal LFCLK, waiting for ready.
-- XOSC standby and full calibration (`0x3F`), then error/IRQ clearing.
-
-`Radio::new` then applies the selected band:
-
-- Enters XOSC standby and selects the LoRa or LR-FHSS packet type.
-- For sub-GHz, calibrates image rejection over the configured frequency +/-10 MHz in 4 MHz steps.
-- Sets RF frequency and the matching RSSI calibration table.
-- Configures LoRa modulation/packet parameters and the `RadioConfig::lora_sync_word` value (default `0x12`), or the LR-FHSS modulation profile.
-- Configures the PA, TX power, and 48 us ramp.
-- Selects RC-standby fallback, disables RX boost, clears IRQs, and routes TX/RX/error/timeout IRQs to DIO9.
-
-The driver follows the board reference SPI sequence: command+parameters are sent in one NSS frame; read commands use a second NSS frame for the status byte and response. `GetStatus` is a direct six-byte read with no opcode.
-
-## Radio Construction
-
-The LR1121 driver is built from the ESP-HAL SPI bus and four pins. `Lr1121::new` performs the hard reset and system startup described above. `Radio::new` validates `RadioConfig`, applies the per-band frequency/modulation/packet/PA/TX settings, clears IRQs, and routes radio IRQs to DIO9.
-
-Example profile from `main.rs`:
-
-```rust
-let radio_config = RadioConfig {
+RadioConfig {
     frequency_band: FrequencyBand::SubGhz,
-    lora_sync_word: 0x12,
     bandwidth: LoRaBandwidth::Khz125,
     pa_mode: PaMode::HighPower,
     tx_power_dbm: 22,
     ..RadioConfig::new(869_400_000)
-};
-
-let radio_queue = RadioQueue::new();
-let radio_control = RadioControl::new();
-let radio = Radio::new(radio_config, lr1121, &radio_queue, &radio_control)?;
+}
 ```
 
-`RadioConfig::new(frequency_hz)` selects a band from the frequency and supplies defaults. Set the band-specific fields explicitly when the default is not the desired profile. `validate` rejects out-of-band frequencies, unsupported bandwidth/band combinations, PA mismatches, invalid power, spreading factors outside 5-12, and a zero preamble.
+`RadioConfig::new` fills in spreading factor 9, coding rate 4/5, preamble 8 symbols, CRC enabled, explicit header, non-inverted IQ, LoRa sync word `0x12`, and automatic low-data-rate-optimization. The default frequency here is 869.4 MHz, while `RadioConfig::default()` uses 869.5 MHz with the low-power PA; check which value a code path actually uses before assuming a link will match.
 
-For a separate LoRa network, set `lora_sync_word` to the same value on every radio in that network. The field defaults to private sync word `0x12`; `0x34` is the public LoRaWAN sync word. The LR-FHSS S-band profile uses its own fixed sync word and ignores this LoRa setting.
+A working link needs matching frequency, bandwidth, spreading factor, coding rate, preamble, header mode, CRC, and sync word on both ends. Sync word is a modem filter, not a secret: `0x12` is a private-network value and `0x34` is the LoRaWAN public value, so LoRaWAN devices do not decode these packets. It is configured in the radio, never written into the 47-byte protocol packet.
 
-## Bands and Limits
+`RadioConfig::validate` rejects a spreading factor outside 5–12, a bandwidth not encodable for the band, a zero preamble, a PA mode that does not match the band, transmit power outside −9…selected PA maximum, and a frequency outside the band's range. The worker enforces a 10 % transmit duty cycle per band; transmit power and antenna limits remain the operator's responsibility.
 
-These are LR1121 silicon ranges and firmware modem choices, not a guarantee that a particular board has a suitable RF path.
+## Transmit and receive capabilities
 
-| `FrequencyBand` | Range | Modem | RX | Maximum complete encoded packet |
+| Band | Range | Modem | RX | Maximum encoded packet |
 | --- | --- | --- | --- | ---: |
-| `SubGhz` | 150-960 MHz | LoRa | Yes | 255 bytes |
-| `Sband` | 1.9-2.1 GHz | LR-FHSS | No; TX only | 133 bytes |
-| `Ism2_4Ghz` | 2.4-2.5 GHz | LoRa | Yes | 255 bytes |
+| `SubGhz` | 150–960 MHz | LoRa | Yes | 255 bytes |
+| `Sband` | 1.9–2.1 GHz | LR-FHSS | No; TX only | 133 bytes |
+| `Ism2_4Ghz` | 2.4–2.5 GHz | LoRa | Yes | 255 bytes |
 
-The common packet header remains 43 bytes. Thus the packet payload space is 212 bytes on the 255-byte profiles and 90 bytes on the current 133-byte LR-FHSS profile. AES-256-GCM adds a 12-byte nonce and 16-byte tag, reducing application data capacity to 184 and 62 bytes respectively. The chat supports up to 512 bytes of logical text in at most 16 fragments; it sizes fragments for the active band, so a 512-byte encrypted message takes three fragments on LoRa or nine on S-band.
+LoRa bandwidths supported by the driver: sub-GHz 62.5/125/250/500 kHz; 2.4 GHz also 203/406/812 kHz. PA modes cap transmit power at 14 dBm (low power), 22 dBm (high power sub-GHz path), and 13 dBm (high-frequency path used for S-band and 2.4 GHz). This board's sub-GHz output is wired through the HP PA configuration for both sub-GHz modes.
 
-LoRa bandwidth is represented by `LoRaBandwidth`. Sub-GHz supports 62.5, 125, 250, and 500 kHz in the current config. 2.4 GHz additionally maps 203, 406, and 812 kHz to the band-specific LR1121 encodings. S-band ignores the LoRa modulation fields and uses `LrFhssProfile::SbandDefault`.
+S-band uses the `SbandDefault` LR-FHSS profile: GMSK modulation, 5/6 coding rate, 136.72 kHz bandwidth, hopping enabled, two header blocks, and sync word `0x2C0F7995`. The LR1121 LR-FHSS implementation is transmit-only, and the worker does not start RX while configured for S-band. S-band requires an antenna/front end that actually supports 2 GHz.
 
-PA settings are represented by `PaMode`: LP (`LowPower`, up to +14 dBm), HP (`HighPower`, up to +22 dBm), and HF (`HighFrequency`, up to +13 dBm). On this board, both sub-GHz modes program the HP path (`pa_select=1`, `supply=1`, `duty_cycle=0x04`, `hp_setup=0x07`); the HF path uses `(2, 0, 0x07, 0)`. These are chip-path limits. Board power, thermal, antenna, and regional limits may be lower; the 22 dBm main profile must not be treated as a certification.
+These are radio capabilities, not evidence that this board's RF path, antenna, or enclosure works in any band. No RF range or interoperability test is recorded here.
 
-The current S-band LR-FHSS profile uses GMSK, 136.72 kHz bandwidth, 5/6 coding rate, 3906 Hz non-FCC grid spacing, two headers, enabled hopping, and sync word `0x2C0F7995`. The LR1121 builds the LR-FHSS frame from the encoded protocol packet. The profile accepts at most 133 input bytes and cannot receive.
+## Duty cycle
 
-## Live Retuning
+`Radio::run_worker` charges every frame against a token bucket for its band before starting TX. Each bucket accrues airtime at 10 % of real time, caps at 360 s, and starts a boot with 6 s of credit. A frame whose airtime exceeds the available credit makes the worker wait until the credit covers it, so a busy queue is paced rather than silently dropped.
 
-`Radio::set_frequency(frequency_hz)` retunes directly only when the radio is idle; it returns `RadioBusy` while TX is active or packets remain queued. If RX was active, it stops RX, reconfigures the band/modem/PA, and resumes RX where supported. Use this direct method before the worker takes ownership of the radio.
+The charge comes from `RadioConfig::time_on_air_us`: the Semtech LoRa time-on-air formula for sub-GHz and 2.4 GHz (spreading factor, bandwidth, coding rate, preamble, header mode, CRC, LDRO), and a bit-rate estimate derived from the LR-FHSS bandwidth for S-band. The S-band figure is conservative; the limit is an accounting device, not a regulatory certification of the modem profile.
 
-After `run_worker` begins, the worker owns the radio and is the only task that can operate its hardware. To request a retune from another task, use the same `RadioControl` that was passed to `Radio::new`:
+While the worker waits for budget it does not service the RX interrupt, so a long wait can miss an inbound frame. The budget is charged before the modem starts TX, and a frame refused by the band limit is dropped rather than stopping the worker.
+
+## Ownership model
 
 ```rust
-use crate::radio::control::RadioControl;
-
-// Use the same control channel that was passed to Radio::new for this radio.
-radio_control.request_frequency_change(2_450_000_000)?;
+let radio_queue = RadioQueue::new();      // encoded TX FIFO
+let radio_control = RadioControl::new();  // local retune requests
+let radio = Radio::new(config, lr1121, &radio_queue, &radio_control)?;
+radio.run_worker(None, on_packet).await    // takes ownership of `radio`
 ```
 
-The call checks that the frequency is inside a firmware-supported `FrequencyBand` and puts the request in that radio's control channel. It does not retune the hardware before it returns. Each control channel holds one pending request; if it is already full, the call returns `RadioBusy`. An out-of-range frequency returns `InvalidConfiguration`.
+`Radio` borrows the queue and control objects. Once `run_worker` takes ownership, application code cannot call `Radio` methods; producers use the same `RadioQueue` handle and retunes use `RadioControl`. In this firmware both are static objects in `main.rs`, shared with the UI, diagnostics, and packet handler.
 
-When the worker receives the request, it applies it between radio operations, with no transmission in flight. It stops RX if RX is active, switches the LR1121 frequency and band configuration, and resumes RX if it was previously active and the new band supports receiving. S-band is transmit-only, so the worker does not resume RX there. The worker also picks settings supported by the new band: it changes an incompatible LoRa bandwidth to 125 kHz and selects an appropriate PA mode and power limit. Pending packets still go through this same worker; packets sent after the retune use the new frequency.
+`Radio::send_packet` (usable only while `Radio` is still owned by the caller) checks the current band's encoded-size limit before enqueueing. After the worker starts, `RadioQueue::add_packet` validates packet metadata and the generic 255-byte limit but cannot know the active band limit; the worker rechecks the length at dequeue time and reports `PayloadTooLong`. Applications should therefore size fragments for the active band before enqueueing, which the UI send path does via `FrequencyBand::maximum_packet_size`.
 
-`Ok(())` means the request was accepted into the control channel, not that the hardware retune has already succeeded. Hardware errors occur later in the worker and are returned from `run_worker`. A local retune changes only this radio; it does not transmit a `FrequencyChange` packet, tell peers to follow, or confirm that another device is listening on the new frequency. `PacketType::FrequencyChange` is currently just a wire enum variant without an implemented handler.
+## Queue behavior
 
-The firmware now configures the LR1121 RF switch, TCXO, sub-GHz image calibration, and per-frequency RSSI calibration. Before using a non-default band, still verify the board's antenna/front end, actual supported frequency range, and local regulations. In particular, the Rust S-band range starts at 1.9 GHz, while the Waveshare board reference uses 2.0-2.1 GHz; keep both ends of a link inside a range the hardware actually supports.
+| Property | Behavior |
+| --- | --- |
+| Capacity | 32 encoded packets, plus at most one in flight. |
+| Ordering | FIFO. |
+| Encoding | `add_packet` serializes a `PacketData` into a fixed 255-byte frame before enqueueing. |
+| Backpressure | `QueueError::Full` / `RadioError::TxQueueFull`; the outbox keeps refused fragments and retries every 200 ms. |
+| TX timeout | 30 seconds, reported as `TxTimeout`. |
+| RX windows | After every two consecutive queued transmissions, RX is enabled for up to 500 ms before the next burst. S-band skips this. |
+| Pacing | Each frame waits for the band's 10 % airtime budget before TX. |
+| Retry / priority / persistence | The outbox retransmits an unacknowledged direct message after 20 s, up to three rounds. Queued frames are RAM-only. |
+| Oversized frame | A frame larger than the current band's limit is logged and dropped, and the worker keeps running. |
+| Duplicate filtering | Not performed on the TX queue; retries must reuse the original packet ID, so the queue must accept duplicates. |
 
-For a first link test, use two boards on sub-GHz with the same configuration and watch the serial console for `RX ...` lines. The current test producer broadcasts from device ID `[1; 16]`, so no addressing or encryption setup is required to observe the test payload.
+Queueing a multi-fragment message is not atomic: `add_packet` returns `Full` when the FIFO cannot take the next fragment, and already-queued fragments cannot be rolled back. The current chat send path logs this and does not persist a sent record for the logical message.
 
-## Device Announce (Discovery)
+## Worker loop
 
-`PacketType::DeviceAnnounce = 0x05` is an active discovery request: it is broadcast to `[0; 16]`, unencrypted, and has an empty payload. Receivers record the sender ID from every valid accepted packet, and the user can trigger one announcement from the Contacts screen. There is no automatic answer: `DeviceAnnounceResponse = 0x07` is defined on the wire but this firmware never sends it, so a peer learns this device's ID from a message, introduction, or pairing frame the user sends to it. Discovery exposes public IDs only and is not authentication.
+The worker is the only code that touches the LR1121 after startup. Its behavior:
 
-After selecting an unpaired peer, users can send an explicitly warned plaintext introduction or enter the same high-entropy secret on both devices. PBKDF2-HMAC-SHA256 (100,000 iterations) derives a pair key from that secret and the sorted public IDs. The lower ID initiates an authenticated request/challenge/final exchange; fresh nonces bind the exchange and the secret is never transmitted. Paired direct `Text` packets use AES-256-GCM with the packet's immutable header fields as AAD, excluding only the mutable remaining hop limit. Relays forward encrypted packets without decrypting them. A paired contact rejects plaintext, missing-key ciphertext, and invalid tags.
+1. On startup, start RX if the queue is empty and the band supports RX.
+2. If a transmission is in flight, wait for an IRQ. `TX_DONE` clears the flag; if the queue is empty, RX restarts, otherwise the worker may open a listen window and continue. `TIMEOUT` clears the flag, restores RX if possible, and returns `TxTimeout`. Unrelated IRQs are ignored after clearing.
+3. Otherwise `select` on the next queued packet, an RX IRQ, and a control-channel frequency request.
+4. A queued packet: wait for the band's duty-cycle budget, read a pending RX packet if one is waiting, then suspend RX, load the LoRa payload or build the LR-FHSS frame, clear stale IRQs, and start TX.
+5. An RX IRQ: read the payload length and bytes, clear the IRQ, restart RX, and await the packet callback. Header/CRC errors and non-RX-DONE results clear the IRQ and restart RX without a callback.
+6. A frequency request: apply the retune only when no TX and no queued packets are pending.
 
-After an accepted encrypted direct text or coordinate message, the receiver queues a unicast `Ack` (`0x02`). Broadcast and plaintext traffic is never acknowledged. The 34-byte ACK payload names the original sender ID, the original recipient ID, and the logical `message_id` as two big-endian bytes, and the ACK header repeats that `message_id`; the payload is always AES-GCM protected with the contact key, and a receiver rejects an ACK it cannot authenticate. An accepted text retry can be acknowledged again without adding another chat row. On receipt, the sender shows a green check only on the encrypted direct-message row matching both peer and logical ID; plaintext and broadcast rows never show it. ACK queueing is not an over-the-air confirmation, and an ACK does not mean the message was displayed or read. The check is not persisted.
+Because the worker processes one operation at a time, RX pauses while TX and control operations are handled. An oversized RX payload, buffer-read failure, or SPI error propagates as a `RadioError` and ends the worker. `main.rs` logs the stopped/failed service, and the firmware's top-level `select` then finishes, leaving the remaining work idle; there is no supervisor that restarts the radio worker.
+
+## Frequency changes
+
+`RadioControl::request_frequency_change(hz)` validates that the frequency maps to a supported band and pushes one request into a one-slot channel. A second pending request returns `RadioBusy`; an unsupported frequency returns `InvalidConfiguration`. The worker applies accepted requests between operations.
+
+Applying a retune selects the modem for the new band, recalibrates sub-GHz image rejection when the new frequency is below 1 GHz, sets the frequency and its RSSI calibration table, programs the modem/LoRa or LR-FHSS parameters, chooses a compatible PA mode, adjusts bandwidth and power when the new band cannot use the current values, republishes the new config, and resumes RX when the band supports it. If hardware reconfiguration fails, the worker restores the previous config before returning the error.
+
+A local retune does not notify peers, and this firmware has no handler for the `FrequencyChange` packet type. Both operators must retune manually. The UI presets in `ui/state.rs` currently offer 869.4 MHz sub-GHz and 2.4 GHz; 2.4 GHz requires hardware that supports that path and a matching peer.
+
+## LR1121 initialization
+
+`Lr1121::new` performs a reset and BUSY handshake, wakes the chip, disables SPI CRC, selects the DCDC regulator, configures the board RF switch through DIO control (`RFSW0` receive, `RFSW1` transmit), enables a 3.0 V TCXO, starts the 32.768 kHz LF clock, and runs full calibration.
+
+`Radio::new` then validates the config and applies the band: standby, packet-type selection, sub-GHz image calibration (±10 MHz around the center in 4 MHz steps), RF frequency, RSSI calibration, LoRa or LR-FHSS parameters, sync word, PA configuration, TX power with a 48 µs ramp, RC-standby fallback, RX-boost disabled, cleared IRQs, and TX/RX/error/timeout IRQs routed to DIO9. The driver sends command plus parameters in one NSS frame and uses a second frame for read responses; status reads use the direct status read.
+
+The driver implements the startup sequence this board needs, not the LR1121's complete command set. Consult [`62740776.LR1121_UM_V2.2.pdf`](../62740776.LR1121_UM_V2.2.pdf) for register-level behavior.
+
+## Debug diagnostic
+
+`main.rs` runs a development producer that queues a plaintext broadcast `Text` packet containing `Hello from the communicator` every 30 seconds with hop limit 3. It uses the shared local packet-ID allocator and logs the device ID and packet ID. This is not part of the chat feature: it will appear in peers' broadcast history on reception, and any board running this firmware transmits it by default. Remove or gate it before treating a deployment as private or quiet.
+
+## Verifying a link on hardware
+
+Bench bring-up requires actual hardware and cannot be inferred from the source:
+
+1. Confirm both boards are on the same frequency, bandwidth, spreading factor, coding rate, preamble, header mode, CRC setting, and sync word.
+2. Confirm the antenna is connected and supports the band in use before transmitting at high power.
+3. Watch the RX log line emitted for accepted frames; it reports sender, type, IDs, encryption, routing classification, hop state, and size.
+4. For encrypted direct traffic, confirm a matching contact exists on both ends; without it, the encrypted packet is rejected and no chat row appears.
+5. Use the ACK indicator to confirm end-to-end storage acceptance, and remember it does not prove display.
+
+There is no recorded two-board range test, RF-switch measurement, or regulatory certification in this repository.

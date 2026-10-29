@@ -1,107 +1,107 @@
-# Architecture
+# Runtime architecture
 
-## Runtime
+The firmware executable is `src/bin/main.rs`. It initializes one ESP32-S3 board and then runs the display/UI loop alongside long-lived radio, GPS, keypad, and diagnostic futures. It uses Embassy async execution on an Xtensa target; there is no operating-system process model or desktop application layer.
 
-Firmware for the ESP32-S3 running Embassy (`no_std`, `no_main` via `esp-hal`).
-Entry point: [`src/bin/main.rs`](../src/bin/main.rs).
+## Boot sequence
 
-Startup order:
+`main` performs setup in this order:
 
-1. Initialize the MCU at maximum CPU clock and start the Embassy runtime.
-2. Initialize the internal-flash `storage` partition, the TRNG, and the device
-   identity; load persisted settings (backlight, UTC offset) and contacts.
-3. Initialize the ILI9341 display on SPI3 and drive the backlight with LEDC PWM.
-4. Configure the LR1121 on SPI2: sub-GHz LoRa at 869.4 MHz, HP PA at 22 dBm,
-   sync word `0x12`, IRQs on DIO9.
-5. Start the radio worker, the GPS poller (UART1), the keypad worker (I2C0),
-   and the diagnostic test-packet producer.
-6. Run the UI task. It renders, polls flash through the session handle, and
-   selects on keypad, GPS, radio-config, discovery, pairing, and popup events.
+1. Initialize ESP-HAL at the maximum configured CPU clock, install the project heap, and start the Embassy runtime using TIMG0.
+2. Create the internal-flash map over `0x210000..0x400000`. Those bounds match the `storage` row in `partitions.csv`; the storage layer can erase pages inside that range.
+3. Start the TRNG entropy source. Read or create the 16-byte identity, choose a random starting value for the per-boot local packet-ID allocator, and load brightness, UTC offset, and contacts from flash.
+4. Move storage plus its reusable 640-byte scratch buffer into the shared `Flash` mutex. The receive path and UI take short exclusive turns through this handle.
+5. Initialize the ILI9341 on SPI3, its GPIO7 PWM backlight, the LR1121 on SPI2, the GPS on UART1, and the MCP23017 keypad expander on I2C0.
+6. Publish the device identity through `DEVICE_ID`, construct the radio worker and its packet handler, and enter the event-driven UI loop. A diagnostic producer queues a plaintext broadcast every 30 seconds.
 
-Everything after step 6 runs concurrently; ownership decides who may touch
-which peripheral:
+The partition geometry and board wiring are described in [storage and identity](storage-and-identity.md) and [board wiring](pinout.md).
 
-| Task | Owns | Publishes |
+## Runtime ownership
+
+| Runtime component | Owns or operates | Communication with other components |
 | --- | --- | --- |
-| Radio worker | LR1121, its TX queue | packets via the receive callback |
-| GPS task | UART1/NMEA | `GpsSnapshot` on a watch |
-| Keypad worker | MCP23017 bus | keys on the `KEYPAD_EVENTS` channel |
-| Packet handler | none (runs in the radio worker future) | flash writes, popup/revision notifications, pair contacts |
-| UI task | display, `UiState`, `ContactBook` | outgoing packets, manage commands, settings writes |
+| Radio worker | LR1121 SPI peripheral, TX/RX state, IRQ handling | Takes encoded packets from `RADIO_QUEUE`; passes RX frames to `PacketHandler`; observes `RADIO_CONTROL`. |
+| `PacketHandler` | Receive caches and fragment reassembler, within the radio worker future | Reads `DEVICE_ID`; queues ACKs/relays; uses `Flash`; publishes discovery and chat notifications; advances pairing. |
+| UI loop | Display, `UiState`, in-memory contact list | Receives keypad, GPS, radio-config, pairing, discovery, popup, and history-change events; queues outbound packets; persists user actions through `Flash`. |
+| GPS future | UART1 and NMEA parser | Publishes changed `GpsSnapshot` values through a watch. |
+| Keypad worker | MCP23017 I2C bus and GPIO16 interrupt | Sends debounced `KeypadKey` events into `KEYPAD_EVENTS`. |
+| Diagnostic producer | No peripheral | Periodically creates a broadcast packet and adds it to `RADIO_QUEUE`. |
+| Flash session | Flash map and 640-byte work buffer under one mutex | `Flash::with` serializes access from the UI and receive handler. |
 
-## Data flow
+The radio and keypad workers own their hardware instead of sharing mutable peripheral access with the UI. `RADIO_QUEUE`, `RADIO_CONTROL`, `DEVICE_ID`, and GPS snapshots are static shared channels/watches. The `Flash` mutex ensures the UI cannot reuse the flash map or work buffer while packet handling is storing a message.
 
+## Message paths
+
+### Sending
+
+```text
+5x5 keypad press
+    → keypad event channel
+    → UiState composer and send menu
+    → UI checks device identity and direct-contact key
+    → fragment count and packet IDs reserved
+    → band-sized PacketData fragments built
+    → AES-256-GCM per fragment for paired direct traffic
+    → outbox (two RAM slots, all fragments of the message)
+    → RADIO_QUEUE (encoded FIFO frames)
+    → radio worker, duty-cycle wait, LR1121 TX
+    → one logical sent-message record appended to flash
+    → UI history revision reload
 ```
-radio RX ─▶ packet_handler ─▶ StorageManager (flash records)
-                       │
-                       ├▶ notify::receive   → popup queue + revision
-                       └▶ discovery/pairing → contact adoption
 
-keypad ─▶ KeypadQueue ─▶ UiState::handle_keypad ─▶ pending_* commands
-                                                        │
-              UI run loop ◀──────────────────────────── ┘
-                │  (send, manage, delete-all, timezone save)
-                ├▶ RadioQueue (fragments)      ├▶ StorageManager
-                └▶ render (diff-based redraw)
+The local packet-ID allocator is a shared 32-bit sequence persisted in flash. It reserves a contiguous range for a fragmented message; pairing, ACK, announcement, diagnostic, and chat producers all draw from that same allocator. At boot the counter resumes at the stored value, and a checkpoint task keeps the stored value at least 1024 IDs ahead of the running counter, so a power loss can skip IDs but never reuse one. The wire fields are 32 bits wide, so the counter wraps only after 4,294,967,296 reservations. The Packet IDs settings page shows the counters and the remaining percentage.
+
+The outbox owns a message until the peer acknowledges it: an outbox task retries fragments that the TX queue refused and retransmits the whole message after 20 s, up to three transmissions. An authenticated ACK cancels the retry. There is no persistent TX queue, so a reboot loses pending retries. Details and failure behavior are in [messaging workflow](messaging.md).
+
+### Receiving
+
+```text
+LR1121 RX IRQ
+    → radio worker reads one encoded frame and restarts RX
+    → PacketHandler parses and validates the packet
+    → self/duplicate/destination checks
+    → key lookup and authenticated decryption when direct and paired
+    → fragment assembly or coordinate validation
+    → one flash record for the complete logical message
+    → popup + history revision
+    → UI reloads visible rows and list preview from flash
+    → authenticated ACK queued after successful persistence (direct paired only)
 ```
 
-The receive path never touches the display. It writes accepted messages to
-flash and signals the UI with a popup and a history revision; the UI reloads
-only what changed. There is no second copy of chat history in RAM.
+Broadcasts and packets for other devices may be forwarded after hop-limit decrement. The RX worker does not draw pixels or hold a second chat-history cache. Read [packet handler](packet-handler.md) for the ordering and packet-type matrix.
 
-## Source map
+## UI and event flow
 
-| Module | Responsibility |
+`UiState` is the screen state machine and command producer. A key mutates screen state or sets one pending command (send, pairing, announcement, identity reset, frequency request, contact action, deletion, or history-page request). The UI loop consumes those commands and performs radio/storage operations outside the renderer. `ui/render/` functions draw the state; `draw_if_changed` repaints the affected region or page rather than running storage or networking logic during rendering.
+
+Received messages use `notify::receive`: one bounded popup is queued and the history revision is incremented. A revision wake causes an open chat to reload its newest page; list previews are read from flash on boot or when a message notification arrives. Pressing Up/Down while the chat composer is empty browses records in pages of four; the selected row can open coordinate navigation. See [user interface](display-plan.md) and [chat history](chat-fragmentation-and-navigation.md).
+
+## Module responsibilities
+
+| Path | Responsibility |
 | --- | --- |
-| `hardware/pinout.rs` | Board pin constructors. |
-| `hardware/gps.rs` | Nonblocking UART polling, NMEA GGA/RMC parsing; time with optional date. |
-| `hardware/display.rs` | ILI9341 init and embedded-graphics adapter. |
-| `hardware/keypad.rs` | MCP23017 matrix scan, debounce, IRQ-driven worker, key queue. |
-| `hardware/flash.rs` | Settings, contacts, and message records over `sequential-storage`. |
-| `hardware/lr1121/` | In-tree LR1121 SPI driver: startup, calibration, modem, PA, LR-FHSS frames. |
-| `crypto/mod.rs` | PBKDF2 pair-key derivation and AES-256-GCM packet protection. |
-| `packet/` | Wire format: `PacketData`, serializer/deserializer, types, fragmenter/reassembler. |
-| `radio/queue.rs` | Per-radio FIFO TX queue (16 packets). |
-| `radio/control.rs` | Pending local retune request channel. |
-| `radio/radio.rs` | Band configuration, TX/RX IRQ loop, RX windows, retuning. |
-| `network/packet_handler.rs` | Receive pipeline: validate, dedup, decrypt, deliver to flash, ACK, relay, pairing. See [packet handler](packet-handler.md). |
-| `network/discovery.rs` | Bounded nearby-device list on a watch channel. |
-| `network/pairing.rs` | Shared-secret handshake state machine and packet builders. |
-| `notify/mod.rs` | Popup queue and history-revision watch; the receive path's only UI channel. |
-| `storage/` | `StorageManager` facade, contact/message records, namespaced flash keys, shared `Flash` session. |
-| `ui/state.rs` | Screen state machine, key handling, pending commands, chat rows. |
-| `ui/contact.rs` | In-RAM contact book with chat-list previews. |
-| `ui/render/` | Per-screen renderers plus diff-based redraw and the top bar. |
-| `ui/navigation.rs` | Distance/bearing math for the navigation screen. |
+| `hardware/pinout.rs` | GPIO-to-peripheral mapping. |
+| `hardware/display.rs` | ILI9341 initialization. |
+| `hardware/keypad.rs` | MCP23017 setup, 5×5 scan, debounce, interrupt worker, event queue. |
+| `hardware/gps.rs` | UART receive and NMEA parsing. |
+| `hardware/flash.rs` | Typed map access, contact records, message pages and deletion. |
+| `hardware/lr1121/` | LR1121 command protocol and board-specific radio initialization. |
+| `crypto/mod.rs` | Pair-key derivation, AES-256-GCM, and packet fingerprints. |
+| `packet/` | Packet model/codec, type values, fragmentation, reassembly, local packet-ID allocator. |
+| `radio/` | Configuration, TX FIFO, retune channel, LR1121 worker. |
+| `network/` | Discovery list, pairing coordinator, receive and relay path. |
+| `storage/` | Message/conversation model, contact model, key namespaces, shared flash session. |
+| `notify/` | Bounded popup channel and chat-history revision signal. |
+| `ui/state.rs` | Screens, input behavior, commands, history-page selection, display-ready rows. |
+| `ui/render/` | TFT drawing by page and widget. |
 
-Storage detail: [storage and identity](storage-and-identity.md). UI detail:
-[user interface](display-plan.md).
+## Design boundaries and current limitations
 
-## Build and check
+- `PacketData` is the application framing above the LR1121 PHY; modulation, sync word, CRC, and IRQ are radio configuration, not packet fields.
+- Radio IDs and receiver duplicate/reassembly caches are finite and volatile. The wire ID widths cannot promise permanent uniqueness.
+- Storage is serialised because the map and scratch buffer are shared. Each sent/received chat message is persisted once per logical message; ACK status updates the sent record separately.
+- The outbox retransmits a whole direct message; there is no per-fragment resend. If a fragment is lost, the receiver does not deliver the incomplete message, so the sender's retry sends the complete set again.
+- The `Heading`, `FrequencyChange`, and announce-response packet variants exist in the protocol enum, but are not full user-facing exchange features. Local frequency selection does not coordinate peers.
+- Discovery IDs and unpaired plaintext introductions are unauthenticated. Contact pair keys are stored as serialized key bytes, not encrypted at rest.
+- No documentation or source tests constitute proof of RF range, keypad soldering, storage endurance, or a physical board run.
 
-```sh
-source /home/elias/export-esp.sh
-cargo build --release                      # xtensa-esp32s3-none-elf
-cargo build --release --no-default-features
-```
-
-Both configurations compile clean; the linker emits a generic RWX-segment
-warning. Clippy's `large_stack_frames` lint (denied at 1 KiB) still fires for
-a few functions in the radio and receive paths; `cargo check`/`build` are the
-working gates.
-
-`cargo test` does not run on the host because of the Xtensa target; unit tests
-kept in the source tree (date conversions in `ui/render/top_bar.rs`) would
-need a host-testable split or an ESP test harness to execute.
-
-## Known limits
-
-- The radio worker services one packet at a time; RX pauses during TX.
-- Duplicate suppression and fragment reassembly state are RAM-only and reset
-  on reboot; a retransmitted single-fragment message can therefore be shown
-  twice after a restart.
-- Chat history grows without a retention policy; the storage partition is
-  finite and append errors surface to the send path.
-- The keypad has not been validated on hardware; a missing expander only
-  removes keypad input.
-- No RF range or interoperability test is recorded in this repository.
+Use [protocol reference](protocol-specification.md) for wire and cryptographic details, [radio guide](packets-and-radio.md) for worker operation, and [storage guide](storage-and-identity.md) for persistence.
