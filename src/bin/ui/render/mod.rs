@@ -56,9 +56,7 @@ where
         *previous_state = Some(state.clone());
     }
     // The timezone lives in the state, so an offset change repaints the bar too.
-    if *previous_gps != Some(gps)
-        || old_timezone_offset != state.timezone_offset_minutes
-    {
+    if *previous_gps != Some(gps) || old_timezone_offset != state.timezone_offset_minutes {
         top_bar::draw(display, gps, state.timezone_offset_minutes)?;
         *previous_gps = Some(gps);
     }
@@ -192,29 +190,20 @@ where
 {
     match &state.screen {
         Screen::MainMenu { selected } => menu::draw_main(display, *selected),
-        Screen::ChatsList { selected } => {
-            menu::draw_chat_list(display, &state.contacts, *selected)
-        }
+        Screen::ChatsList { selected } => menu::draw_chat_list(display, &state.contacts, *selected),
         Screen::ContactsList { selected } => {
             menu::draw_contact_manager(display, &state.contacts, *selected)
         }
         Screen::ContactManage {
             device_id,
             selected,
-            from_chats,
+            ..
         } => {
             let blocked = state
                 .contacts
                 .entry_by_kind(ConversationId::Direct(*device_id))
                 .is_some_and(|entry| entry.blocked);
-            settings::draw_contact_manage(
-                display,
-                device_id,
-                *selected,
-                *from_chats,
-                blocked,
-                state.device_id,
-            )
+            settings::draw_contact_manage(display, device_id, *selected, blocked)
         }
         Screen::DeviceSearch { selected } => {
             settings::draw_device_search(display, &state.discovered_devices, *selected)
@@ -262,6 +251,11 @@ where
             state.radio_config,
             state.timezone_offset_minutes,
         ),
+        Screen::IdentityReset { status } => {
+            settings::draw_identity_reset(display, state.device_id, *status)
+        }
+        Screen::FrequencyChange { selected } => settings::draw_frequency_change(display, *selected),
+        Screen::FrequencyStatus { status } => settings::draw_frequency_status(display, *status),
         Screen::ChatView {
             conversation,
             unencrypted_dm,

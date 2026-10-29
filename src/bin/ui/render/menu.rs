@@ -1,4 +1,3 @@
-
 use embedded_graphics::{
     Drawable,
     pixelcolor::Rgb565,
@@ -82,18 +81,18 @@ where
         }
     }
     if indices.is_empty() {
-        text(display, "PAIR OR SCAN TO ADD A CONTACT", 12, 110, MUTED, false)?;
+        text(
+            display,
+            "PAIR OR SCAN TO ADD A CONTACT",
+            12,
+            110,
+            MUTED,
+            false,
+        )?;
     }
     draw_row(display, "VIEW NEARBY PEERS", indices.len(), selected)?;
     draw_row(display, "SCAN FOR DEVICES", indices.len() + 1, selected)?;
-    text(
-        display,
-        "ENTER OPEN    RIGHT MANAGE",
-        8,
-        218,
-        MUTED,
-        false,
-    )
+    text(display, "ENTER OPEN    RIGHT MANAGE", 8, 218, MUTED, false)
 }
 
 /// 6/ Repaint just the old and new rows in the contact manager.
@@ -141,7 +140,14 @@ where
     for index in 0..section.item_count() {
         draw_row(display, section.item_label(index), index, selected)?;
     }
-    text(display, "UP/DOWN SELECT   ENTER VIEW", 12, 218, MUTED, false)
+    text(
+        display,
+        "UP/DOWN SELECT   ENTER VIEW",
+        12,
+        218,
+        MUTED,
+        false,
+    )
 }
 
 /// 4/ Repaint only the old and new selected entries inside a Settings category.
@@ -249,7 +255,14 @@ where
     // Verified contacts and broadcast render white; peers that were only
     // heard on the air render amber until they are paired.
     let name_color = if entry.is_unknown() { UNKNOWN } else { WHITE };
-    text(display, entry.display_name().as_str(), 32, y, name_color, false)?;
+    text(
+        display,
+        entry.display_name().as_str(),
+        32,
+        y,
+        name_color,
+        false,
+    )?;
 
     // One badge slot: SENDING.. on an unacknowledged message of ours, OK on
     // the acknowledged one, and nothing on received messages.
@@ -266,7 +279,11 @@ where
             },
             276,
             y,
-            if entry.preview_acknowledged { ACK_GREEN } else { WARNING },
+            if entry.preview_acknowledged {
+                ACK_GREEN
+            } else {
+                WARNING
+            },
             false,
         );
     }
@@ -317,7 +334,12 @@ where
     )
 }
 
-pub fn draw_row<D>(display: &mut D, label: &str, index: usize, selected: usize) -> Result<(), D::Error>
+pub fn draw_row<D>(
+    display: &mut D,
+    label: &str,
+    index: usize,
+    selected: usize,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {

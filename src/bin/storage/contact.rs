@@ -55,8 +55,7 @@ impl<'a> Value<'a> for Contact {
         let key = buffer[16..16 + KEY_SIZE]
             .try_into()
             .map_err(|_| SerializationError::InvalidFormat)?;
-        let custom_name =
-            decode_fixed_string(&buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES - 1])?;
+        let custom_name = decode_fixed_string(&buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES - 1])?;
         let blocked = buffer[CONTACT_RECORD_BYTES - 1] == 1;
         Ok((
             Self {

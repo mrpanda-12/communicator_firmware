@@ -111,11 +111,6 @@ impl<'d> Gps<'d> {
         self.last_sentence_error
     }
 
-    // Drains buffered UART bytes and updates coordinates/time.
-    pub fn update(&mut self) -> Result<usize, RxError> {
-        self.poll()
-    }
-
     fn feed_byte(&mut self, byte: u8) {
         if byte == b'$' {
             self.sentence_len = 0;

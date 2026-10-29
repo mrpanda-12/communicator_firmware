@@ -8,6 +8,7 @@ use esp_hal::spi::Error as SpiError;
 use crate::hardware::lr1121::lr1121::Lr1121;
 use crate::packet::packet_data::{MAX_PACKET_SIZE, PacketData};
 use crate::radio::control::RadioControl;
+use crate::radio::duty_cycle::DutyCycle;
 use crate::radio::queue::{Packet, QueueError, RadioQueue};
 use crate::radio::radio_error::RadioError;
 use crate::radio::types::{FrequencyBand, LoRaBandwidth, PaMode, PacketStatus, RadioConfig};
@@ -57,6 +58,7 @@ pub struct Radio<'a, 'q, SPI> {
     tx_burst_count: usize,
     rx_active: bool,
     rx_payload_len: Option<u8>,
+    duty_cycle: DutyCycle,
 }
 
 impl<'a, 'q, SPI> Radio<'a, 'q, SPI>
@@ -82,6 +84,7 @@ where
             tx_burst_count: 0,
             rx_active: false,
             rx_payload_len: None,
+            duty_cycle: DutyCycle::new(),
         };
 
         radio.apply_hardware_config()?;
@@ -257,7 +260,22 @@ where
                         self.process_rx(&mut on_packet_received).await?;
                     }
 
-                    self.start_transmit(&packet)?;
+                    // Wait for transmit airtime before the frame reaches the modem.
+                    let airtime_us = self.config.time_on_air_us(packet.len());
+                    self.duty_cycle
+                        .reserve(self.config.frequency_band, airtime_us)
+                        .await;
+                    // A frame sized for another band is dropped instead of
+                    // stopping the worker.
+                    match self.start_transmit(&packet) {
+                        Ok(()) => {}
+                        Err(RadioError::PayloadTooLong { length, maximum }) => defmt::warn!(
+                            "Dropped queued frame: {} bytes exceeds {} on this band",
+                            length,
+                            maximum
+                        ),
+                        Err(error) => return Err(error),
+                    }
                 }
 
                 Either::First(Either::Second(())) => {
@@ -499,7 +517,7 @@ where
     }
 
     pub fn get_last_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
-        Ok(self.lr1121.get_packet_status()?)
+        self.lr1121.get_packet_status()
     }
 
     // Changes RF band and modem after the radio worker has reached an idle boundary.

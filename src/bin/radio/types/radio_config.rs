@@ -1,4 +1,4 @@
-use crate::radio::types::{CodingRate, FrequencyBand, LoRaBandwidth, PaMode};
+use crate::radio::types::{CodingRate, FrequencyBand, LoRaBandwidth, LrFhssProfile, PaMode};
 
 // Configures the LR1121 RF band, transmit path, and modem settings.
 // LoRa-specific fields apply to sub-GHz and 2.4 GHz; S-band uses its LR-FHSS profile.
@@ -153,6 +153,39 @@ impl RadioConfig {
     pub fn low_data_rate_optimization_enabled(&self) -> bool {
         self.low_data_rate_optimization
             .unwrap_or_else(|| self.recommended_ldro())
+    }
+
+    // Estimates how long one encoded frame keeps the transmitter busy.
+    // Uses the Semtech LoRa time-on-air formula and an LR-FHSS bit-rate estimate;
+    // the duty-cycle limiter consumes this value, so an overestimate is safe.
+    pub fn time_on_air_us(&self, packet_len: usize) -> u64 {
+        if self.frequency_band == FrequencyBand::Sband {
+            let bandwidth = u64::from(LrFhssProfile::SbandDefault.bandwidth().hz());
+            // LR-FHSS carries roughly three bits per seven hertz of channel bandwidth.
+            let bit_rate = (bandwidth * 3 / 7).max(1);
+            let bits = 8 * (packet_len as u64 + 24);
+            return bits * 1_000_000 / bit_rate;
+        }
+
+        let spreading_factor = u64::from(self.spreading_factor);
+        let bandwidth = u64::from(self.bandwidth.hz());
+        let symbol_us = ((1u64 << spreading_factor) * 1_000_000).div_ceil(bandwidth);
+        let coding_rate = u64::from(self.coding_rate.register_value());
+        let ldro = u64::from(self.low_data_rate_optimization_enabled());
+        let crc = u64::from(self.crc_enabled);
+        let implicit_header = u64::from(self.implicit_header);
+
+        let payload_bits = 8 * packet_len as u64;
+        let adjusted = (payload_bits + 28 + 16 * crc)
+            .saturating_sub(4 * spreading_factor)
+            .saturating_sub(20 * implicit_header);
+        let blocks = adjusted.div_ceil(4 * (spreading_factor - 2 * ldro));
+        let payload_symbols = 8 + blocks * (coding_rate + 4);
+
+        // The preamble ends with a 4.25-symbol sync, counted in quarter symbols.
+        let preamble_quarters = 4 * u64::from(self.preamble_symbols) + 17;
+        let total_quarters = preamble_quarters + 4 * payload_symbols;
+        total_quarters * symbol_us / 4
     }
 }
 

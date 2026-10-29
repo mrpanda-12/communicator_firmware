@@ -1,8 +1,5 @@
 #![no_std]
 #![no_main]
-#![deny(clippy::mem_forget)]
-#![deny(clippy::large_stack_frames)]
-
 pub mod crypto;
 pub mod hardware;
 pub mod network;
@@ -14,7 +11,15 @@ pub mod ui;
 
 static GPS_SNAPSHOT: Watch<CriticalSectionRawMutex, ui::GpsSnapshot, 2> = Watch::new();
 
-const FIRMWARE_VERSION: &str = "0.0.6";
+/// The device identity for every subsystem. The UI updates it when the user
+/// resets the identity, so the radio worker never sends from a stale id.
+static DEVICE_ID: Watch<CriticalSectionRawMutex, Option<[u8; 16]>, 1> = Watch::new();
+
+/// The radio TX queue lives in static storage, keeping the main task stack small.
+static RADIO_QUEUE: RadioQueue = RadioQueue::new();
+static RADIO_CONTROL: RadioControl = RadioControl::new();
+
+const FIRMWARE_VERSION: &str = "0.0.8";
 const RADIO_CONFIG: RadioConfig = RadioConfig {
     frequency_band: FrequencyBand::SubGhz,
     bandwidth: LoRaBandwidth::Khz125,
@@ -27,7 +32,7 @@ use crate::{
     hardware::{
         flash::FlashStore,
         gps::Gps,
-        keypad::{Keypad, KEYPAD_EVENTS},
+        keypad::{KEYPAD_EVENTS, Keypad},
         lr1121::lr1121::Lr1121,
         pinout,
     },
@@ -82,14 +87,14 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// 1/ Match these bounds to the `storage` row in the root partition table.
-// 2/ Keep the end exclusive and both addresses aligned to 4 KiB erase pages.
+// Match these bounds to the `storage` row in the root partition table. Keep
+// the end exclusive and both addresses aligned to 4 KiB erase pages.
 const FLASH_DATA_START: u32 = 0x210000;
 const FLASH_DATA_END: u32 = 0x400000;
 
 // TFT uses SPI3 on GPIO12=SCK and GPIO11=MOSI.
 
-/// 1/ Build the display's dedicated hardware SPI3 bus.
+/// Build the display's dedicated hardware SPI3 bus.
 fn init_display_spi(
     spi3: peripherals::SPI3<'static>,
     sck: peripherals::GPIO12<'static>,
@@ -101,18 +106,18 @@ fn init_display_spi(
             .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
     )
-        .expect("Failed to initialize display SPI3")
-        .with_sck(sck)
-        .with_mosi(mosi)
+    .expect("Failed to initialize display SPI3")
+    .with_sck(sck)
+    .with_mosi(mosi)
 }
 
-/// 2/ Open the flash map over the reserved range from the real partition layout.
+/// Open the flash map over the reserved range from the real partition layout.
 fn init_flash_storage(flash: peripherals::FLASH<'static>) -> FlashStore<'static> {
     FlashStore::new(flash, FLASH_DATA_START..FLASH_DATA_END)
         .expect("Invalid flash data partition range")
 }
 
-/// 3/ Keep the ADC entropy source alive for every use of the ESP-HAL TRNG.
+/// Keep the ADC entropy source alive for every use of the ESP-HAL TRNG.
 fn init_trng(
     rng: peripherals::RNG<'static>,
     adc1: peripherals::ADC1<'static>,
@@ -122,7 +127,7 @@ fn init_trng(
     (source, trng)
 }
 
-/// 4/ Load the device ID and create it only when the flash store has no ID.
+/// Load the device ID and create it only when the flash store has no ID.
 async fn initialize_storage(
     flash: FlashStore<'static>,
     trng: &Trng,
@@ -159,7 +164,7 @@ async fn initialize_storage(
 
     (storage, device_id)
 }
-/// 2/ Open SPI2 for the LR1121 and apply the fixed configuration.
+/// Open SPI2 for the LR1121 and apply the fixed configuration.
 fn init_radio<'q>(
     spi2: peripherals::SPI2<'static>,
     gpio40: peripherals::GPIO40<'static>,
@@ -180,10 +185,10 @@ fn init_radio<'q>(
             .with_frequency(Rate::from_mhz(1))
             .with_mode(Mode::_0),
     )
-        .expect("Failed to initialize SPI2")
-        .with_sck(radio_pins.spi_sck)
-        .with_mosi(radio_pins.spi_mosi)
-        .with_miso(radio_pins.spi_miso);
+    .expect("Failed to initialize SPI2")
+    .with_sck(radio_pins.spi_sck)
+    .with_mosi(radio_pins.spi_mosi)
+    .with_miso(radio_pins.spi_miso);
 
     let lr1121 = Lr1121::new(
         spi,
@@ -192,13 +197,13 @@ fn init_radio<'q>(
         radio_pins.reset,
         radio_pins.irq,
     )
-        .expect("Failed to initialize LR1121");
+    .expect("Failed to initialize LR1121");
 
     Radio::new(RADIO_CONFIG, lr1121, radio_queue, radio_control)
         .expect("Failed to configure LR1121")
 }
 
-/// 5/ Open the MCP23017 button expander on I2C0 with its interrupt on GPIO16.
+/// Open the MCP23017 button expander on I2C0 with its interrupt on GPIO16.
 fn init_keypad(
     i2c0: peripherals::I2C0<'static>,
     sda: peripherals::GPIO17<'static>,
@@ -217,42 +222,6 @@ fn init_keypad(
     Keypad::new(bus, irq)
 }
 
-/// Fill each chat-list row preview from the newest stored record in flash.
-///
-/// The full chat rows load when the user opens the conversation in the UI;
-/// boot only reads one record per conversation, not its whole history.
-async fn seed_chat_previews(
-    storage: &mut StorageManager<'static>,
-    buffer: &mut [u8],
-    contacts: &mut ui::contact::ContactBook,
-) {
-    for entry in contacts.visible_indices(false).iter() {
-        let Some(entry) = contacts.entry(*entry) else { continue };
-        let storage_id = entry.kind.storage_id();
-        let newest = storage
-            .load_recent_messages(&storage_id, 1, buffer)
-            .await
-            .ok()
-            .and_then(|records| records.first().cloned());
-        let Some(record) = newest else { continue };
-        let coordinates = match &record.kind {
-            crate::storage::message::MessageKind::Text => None,
-            crate::storage::message::MessageKind::Coords {
-                latitude_microdegrees,
-                longitude_microdegrees,
-            } => Some((*latitude_microdegrees, *longitude_microdegrees)),
-        };
-        let preview =
-            ui::contact::preview_text(record.text.as_str(), coordinates);
-        contacts.seed_preview(
-            entry.kind,
-            preview.as_str(),
-            record.from_me,
-            record.acknowledged,
-        );
-    }
-}
-
 fn init_gps(
     uart1: peripherals::UART1<'static>,
     gpio4: peripherals::GPIO4<'static>,
@@ -267,13 +236,56 @@ async fn gps_task(mut gps: Gps<'static>) -> ! {
     GPS_SNAPSHOT.sender().send(published);
 
     loop {
-        let _ = gps.update();
+        let _ = gps.poll();
         let snapshot = ui::gps_snapshot(gps.get_coordinate(), gps.get_time());
         if snapshot != published {
             GPS_SNAPSHOT.sender().send(snapshot);
             published = snapshot;
         }
         Timer::after(Duration::from_millis(20)).await;
+    }
+}
+
+/// Restart the firmware when a service task stops serving the application.
+fn restart_firmware(reason: &str) -> ! {
+    defmt::error!("{}; restarting the firmware", reason);
+    esp_hal::system::software_reset()
+}
+
+/// Persist the packet-ID counter once it reaches the saved window limit.
+async fn id_checkpoint_task(flash: &Flash) -> ! {
+    loop {
+        Timer::after(Duration::from_secs(1)).await;
+        let Some((limit, message_id)) = packet::packet_data::checkpoint_target() else {
+            continue;
+        };
+        let saved = flash
+            .with(async |session| {
+                session
+                    .storage
+                    .save_packet_ids(limit, message_id, &mut session.buffer)
+                    .await
+                    .is_ok()
+            })
+            .await;
+        if saved {
+            packet::packet_data::set_persisted_limit(limit);
+        } else {
+            defmt::warn!("Could not persist the packet-ID checkpoint");
+        }
+    }
+}
+
+/// Keep the outbox draining: retry fragments the TX queue refused and
+/// retransmit messages the peer has not acknowledged yet.
+async fn outbox_task() -> ! {
+    loop {
+        let drained = RADIO_QUEUE.queued_packet_count() == 0;
+        let now_us = embassy_time::Instant::now().as_micros();
+        network::outbox::pump(now_us, drained, |packet| {
+            RADIO_QUEUE.add_packet(packet).is_ok()
+        });
+        Timer::after(Duration::from_millis(200)).await;
     }
 }
 
@@ -296,11 +308,30 @@ async fn main(_spawner: Spawner) -> ! {
         }
     }
 
-    // 5/ Initialize custom storage backends and persistent application values.
+    // Initialize the storage backends and load persistent application values.
     let flash_store = init_flash_storage(peripherals.FLASH);
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
     let mut flash_buffer = [0u8; FLASH_BUFFER_SIZE];
     let (mut storage, device_id) = initialize_storage(flash_store, &trng, &mut flash_buffer).await;
+
+    // Resume the stored packet-ID counter and reserve the next window in flash
+    // before any producer can send.
+    let saved_ids = storage
+        .load_packet_ids(&mut flash_buffer)
+        .await
+        .ok()
+        .flatten();
+    let next_id = saved_ids.map(|ids| ids.packet_id).unwrap_or(0);
+    let last_message_id = saved_ids.map(|ids| ids.message_id).unwrap_or(0);
+    packet::packet_data::set_local_packet_ids(next_id, last_message_id);
+    let limit = next_id.saturating_add(2 * packet::packet_data::ID_RESERVATION_WINDOW);
+    match storage
+        .save_packet_ids(limit, last_message_id, &mut flash_buffer)
+        .await
+    {
+        Ok(()) => packet::packet_data::set_persisted_limit(limit),
+        Err(_) => defmt::warn!("Could not persist the packet-ID checkpoint"),
+    }
     let display_brightness =
         ui::display_settings::load_brightness(&mut storage, &mut flash_buffer).await;
     let timezone_offset_minutes =
@@ -318,11 +349,15 @@ async fn main(_spawner: Spawner) -> ! {
         }
         Err(_) => defmt::warn!("Could not load saved contacts from flash"),
     }
-    seed_chat_previews(&mut storage, &mut flash_buffer, &mut contacts).await;
+    // The UI seeds every chat-list preview from flash before its first draw.
+    // Hands the startup scratch buffer to the session, so only one copy of the
+    // buffer is alive.
     let flash = Flash::new(FlashSession {
         storage,
-        buffer: [0u8; FLASH_BUFFER_SIZE],
+        buffer: flash_buffer,
     });
+    // Publish the boot identity so the radio worker and UI share one source.
+    DEVICE_ID.sender().send(device_id);
 
     let mut display_buffer = [0u8; 512];
     let display_cs = Output::new(peripherals.GPIO10, Level::High, OutputConfig::default());
@@ -338,7 +373,7 @@ async fn main(_spawner: Spawner) -> ! {
         embassy_time::Delay,
         &mut display_buffer,
     );
-    // 6/ Drive the module's active-high backlight input with hardware PWM.
+    // Drive the module's active-high backlight input with hardware PWM.
     let mut ledc = Ledc::new(peripherals.LEDC);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
     let mut backlight_timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
@@ -359,8 +394,6 @@ async fn main(_spawner: Spawner) -> ! {
         })
         .expect("Failed to configure display backlight PWM channel");
 
-    let radio_queue = RadioQueue::new();
-    let radio_control = RadioControl::new();
     let discovery = DeviceDiscovery::new();
     let pairing = PairingCoordinator::new();
     let radio = init_radio(
@@ -372,8 +405,8 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO41,
         peripherals.GPIO39,
         peripherals.GPIO38,
-        &radio_queue,
-        &radio_control,
+        &RADIO_QUEUE,
+        &RADIO_CONTROL,
     );
     let gps = init_gps(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5);
     let keypad = init_keypad(
@@ -383,16 +416,12 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO16,
     );
 
+    // The worker reads the device identity from the shared watch, so an
+    // identity reset takes effect without restarting the RX dispatcher.
     let mut packet_handler = PacketHandler::new();
     let radio_worker = radio.run_worker(None, async |packet| {
         packet_handler
-            .handle_packet(
-                packet,
-                &radio_queue,
-                &discovery,
-                &pairing,
-                &flash,
-            )
+            .handle_packet(packet, &RADIO_QUEUE, &discovery, &pairing, &flash)
             .await;
     });
     let gps_fut = gps_task(gps);
@@ -404,15 +433,15 @@ async fn main(_spawner: Spawner) -> ! {
         }
     });
     let test_packet_producer = async {
-        let mut packet_id = 1u16;
-
         loop {
-            let Some(device_id) = device_id else {
+            // Read the live identity so the diagnostic follows an identity reset.
+            let Some(device_id) = DEVICE_ID.try_get().flatten().or(device_id) else {
                 defmt::warn!("Skipping test packet: device identity is unavailable");
                 Timer::after(Duration::from_secs(30)).await;
                 continue;
             };
             defmt::info!("Device identity: {}", device_id);
+            let packet_id = packet::packet_data::reserve_local_packet_ids(1);
             defmt::info!("Packet {:x}", packet_id);
 
             let packet = PacketData::new(
@@ -428,25 +457,34 @@ async fn main(_spawner: Spawner) -> ! {
                 DEFAULT_HOP_LIMIT,
                 DEFAULT_HOP_LIMIT,
             )
-                .expect("valid test packet");
+            .expect("valid test packet");
 
-            if radio_queue.add_packet(&packet).is_err() {
+            if RADIO_QUEUE.add_packet(&packet).is_err() {
                 defmt::warn!("Test packet queue is full; dropping packet");
             }
 
-            packet_id = packet_id.wrapping_add(1);
             Timer::after(Duration::from_secs(30)).await;
         }
     };
 
     let services_fut = async {
-        match select(select(radio_worker, gps_fut), keypad_worker).await {
+        match select(
+            select(radio_worker, gps_fut),
+            select(
+                keypad_worker,
+                select(outbox_task(), id_checkpoint_task(&flash)),
+            ),
+        )
+        .await
+        {
             Either::First(Either::First(result)) => match result {
-                Ok(()) => defmt::error!("Radio worker stopped"),
-                Err(_) => defmt::error!("Radio worker failed"),
+                Ok(()) => restart_firmware("Radio worker stopped"),
+                Err(_) => restart_firmware("Radio worker failed"),
             },
-            Either::First(Either::Second(_)) => defmt::error!("GPS task stopped"),
-            Either::Second(_) => defmt::error!("Keypad worker stopped"),
+            Either::First(Either::Second(_)) => restart_firmware("GPS task stopped"),
+            Either::Second(Either::First(_)) => restart_firmware("Keypad worker stopped"),
+            Either::Second(Either::Second(Either::First(never))) => match never {},
+            Either::Second(Either::Second(Either::Second(never))) => match never {},
         }
     };
     GPS_SNAPSHOT.sender().send(ui::gps_snapshot(None, None));
@@ -458,14 +496,16 @@ async fn main(_spawner: Spawner) -> ! {
         timezone_offset_minutes,
         &pairing,
         &flash,
+        &RADIO_CONTROL,
+        &trng,
         pairing
             .event_receiver()
             .expect("Pairing event watch should be initialized"),
         discovery
             .receiver()
             .expect("Discovery watch should be initialized"),
-        &radio_queue,
-        radio_control
+        &RADIO_QUEUE,
+        RADIO_CONTROL
             .config_receiver()
             .expect("Radio config watch should be initialized"),
         GPS_SNAPSHOT
@@ -475,7 +515,7 @@ async fn main(_spawner: Spawner) -> ! {
     );
     let services_and_ui_fut = async {
         match select(services_fut, ui_fut).await {
-            Either::First(()) => defmt::error!("Firmware service stopped"),
+            Either::First(never) => match never {},
             Either::Second(never) => match never {},
         }
     };

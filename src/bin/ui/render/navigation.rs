@@ -13,7 +13,7 @@ use crate::ui::{
     navigation::{compass_direction, distance_and_bearing, relative_turn_degrees},
 };
 
-use super::style::{ACK_GREEN, MUTED, WHITE, text};
+use super::style::{ACK_GREEN, MUTED, WHITE, text, write_coordinate};
 
 /// Draw distance and movement-relative guidance to the selected remote coordinate.
 pub fn draw<D>(
@@ -98,16 +98,4 @@ where
     }
 
     text(display, "BACK: RETURN TO CHAT", 12, 188, WHITE, false)
-}
-
-/// Format signed microdegrees without allocating or depending on float formatting.
-fn write_coordinate(output: &mut String<48>, coordinate: i32) {
-    let sign = if coordinate < 0 { "-" } else { "" };
-    let absolute = coordinate.unsigned_abs();
-    let _ = write!(
-        output,
-        "{sign}{}.{:06}",
-        absolute / 1_000_000,
-        absolute % 1_000_000
-    );
 }

@@ -45,7 +45,10 @@ pub async fn load_brightness(storage: &mut StorageManager<'static>, flash_buffer
 }
 
 /// 2/ Load the saved UTC offset in minutes, clamped to the supported range.
-pub async fn load_timezone_offset(storage: &mut StorageManager<'static>, flash_buffer: &mut [u8]) -> i32 {
+pub async fn load_timezone_offset(
+    storage: &mut StorageManager<'static>,
+    flash_buffer: &mut [u8],
+) -> i32 {
     match storage
         .get_setting::<i32>(TIMEZONE_SETTING, flash_buffer)
         .await

@@ -1,3 +1,5 @@
+use core::fmt::Write;
+
 use embedded_graphics::{
     Drawable,
     mono_font::{
@@ -8,6 +10,7 @@ use embedded_graphics::{
     prelude::{DrawTarget, Point, RgbColor},
     text::{Baseline, Text},
 };
+use heapless::String;
 
 pub const BLACK: Rgb565 = Rgb565::BLACK;
 pub const WHITE: Rgb565 = Rgb565::WHITE;
@@ -41,4 +44,17 @@ where
     )
     .draw(display)
     .map(|_| ())
+}
+
+/// Format signed microdegrees as `degrees.microseconds` for one chat or
+/// navigation line, without allocating or depending on float formatting.
+pub fn write_coordinate<const N: usize>(output: &mut String<N>, coordinate: i32) {
+    let sign = if coordinate < 0 { "-" } else { "" };
+    let absolute = coordinate.unsigned_abs();
+    let _ = write!(
+        output,
+        "{sign}{}.{:06}",
+        absolute / 1_000_000,
+        absolute % 1_000_000
+    );
 }

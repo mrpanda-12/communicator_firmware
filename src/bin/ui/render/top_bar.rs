@@ -126,7 +126,10 @@ mod tests {
     fn offset_crosses_midnight() {
         // 23:30 UTC minus 60 minutes lands on the previous day.
         let base = days_from_civil(2026, 1, 1) * 1440 + 23 * 60 + 30;
-        assert_eq!((base + -60).div_euclid(1440), days_from_civil(2026, 1, 1) - 1);
+        assert_eq!(
+            (base + -60).div_euclid(1440),
+            days_from_civil(2026, 1, 1) - 1
+        );
         // 00:30 UTC plus 60 minutes stays on the same day.
         let base = days_from_civil(2026, 1, 1) * 1440 + 30;
         assert_eq!((base + 60).div_euclid(1440), days_from_civil(2026, 1, 1));

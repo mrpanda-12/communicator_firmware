@@ -1,11 +1,13 @@
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use heapless::Vec;
 
 use crate::packet::packet_error::PacketError;
 use crate::packet::packet_type::PacketType;
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
-pub const HEADER_SIZE: usize = 43;
+pub const HEADER_SIZE: usize = 47;
 
 /// Header bytes covered by AES-GCM; the trailing hop limit is excluded.
 pub const AUTHENTICATED_HEADER_SIZE: usize = HEADER_SIZE - 1;
@@ -20,16 +22,75 @@ pub const GCM_OVERHEAD: usize = GCM_NONCE_SIZE + GCM_TAG_SIZE;
 
 pub const DEFAULT_HOP_LIMIT: u8 = 3;
 
+/// IDs one checkpoint reserves ahead of the stored counter.
+pub const ID_RESERVATION_WINDOW: u32 = 1024;
+
+/// Allocate packet IDs from one counter shared by all local producers.
+/// A batch reservation keeps fragments of one message consecutive and prevents
+/// the UI, protocol responses, and diagnostic producer from colliding.
+static LOCAL_PACKET_ID: AtomicU32 = AtomicU32::new(0);
+/// Highest counter value already written to flash.
+static PERSISTED_LIMIT: AtomicU32 = AtomicU32::new(0);
+/// First ID of the most recent reservation, reported as the last message ID.
+static LAST_MESSAGE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Load the persisted counters before any producer runs.
+pub fn set_local_packet_ids(next: u32, last_message_id: u32) {
+    LOCAL_PACKET_ID.store(next, Ordering::Relaxed);
+    LAST_MESSAGE_ID.store(last_message_id, Ordering::Relaxed);
+}
+
+/// Reserve `count` consecutive local packet IDs and return the first ID.
+///
+/// Returns 32-bit wire values that wrap after 4,294,967,296 reservations.
+pub fn reserve_local_packet_ids(count: u16) -> u32 {
+    let first = LOCAL_PACKET_ID.fetch_add(u32::from(count), Ordering::Relaxed);
+    LAST_MESSAGE_ID.store(first, Ordering::Relaxed);
+    first
+}
+
+/// Report the ID the next reservation starts from.
+pub fn current_packet_id() -> u32 {
+    LOCAL_PACKET_ID.load(Ordering::Relaxed)
+}
+
+/// Report the first ID of the most recent reservation.
+pub fn last_message_id() -> u32 {
+    LAST_MESSAGE_ID.load(Ordering::Relaxed)
+}
+
+/// Record the counter value a checkpoint has persisted.
+pub fn set_persisted_limit(limit: u32) {
+    PERSISTED_LIMIT.store(limit, Ordering::Relaxed);
+}
+
+/// Report the counters to persist once the running value comes within one
+/// window of the stored limit.
+///
+/// The checkpoint stays two windows ahead of the running counter, so a delayed
+/// write or a power loss can skip IDs but never replay one.
+pub fn checkpoint_target() -> Option<(u32, u32)> {
+    let current = LOCAL_PACKET_ID.load(Ordering::Relaxed);
+    let persisted = PERSISTED_LIMIT.load(Ordering::Relaxed);
+    if current == u32::MAX || current.saturating_add(ID_RESERVATION_WINDOW) < persisted {
+        return None;
+    }
+    Some((
+        current.saturating_add(2 * ID_RESERVATION_WINDOW),
+        last_message_id(),
+    ))
+}
+
 #[derive(Clone)]
 pub struct PacketData {
     // Stores the protocol version for this packet.
     pub version: u8,
 
     // Assigns a unique ID to this packet.
-    pub packet_id: u16,
+    pub packet_id: u32,
 
     // Groups all fragments that belong to one message.
-    pub message_id: u16,
+    pub message_id: u32,
 
     // Stores this fragment's zero-based index.
     pub fragment_index: u8,
@@ -61,8 +122,8 @@ pub struct PacketData {
 
 impl PacketData {
     pub fn new(
-        packet_id: u16,
-        message_id: u16,
+        packet_id: u32,
+        message_id: u32,
         fragment_index: u8,
         fragment_count: u8,
         from: [u8; 16],
@@ -165,25 +226,25 @@ impl PacketData {
     pub(crate) fn write_header(&self, header: &mut [u8; HEADER_SIZE]) {
         // Stores the protocol version at byte 0.
         header[0] = self.version;
-        // Stores the big-endian packet ID across bytes 1-2.
-        header[1..3].copy_from_slice(&self.packet_id.to_be_bytes());
-        // Stores the big-endian message ID across bytes 3-4.
-        header[3..5].copy_from_slice(&self.message_id.to_be_bytes());
-        // Stores the fragment index and count in bytes 5-6.
-        header[5] = self.fragment_index;
-        header[6] = self.fragment_count;
-        // Stores the sender device ID across bytes 7-22.
-        header[7..23].copy_from_slice(&self.from);
-        // Stores the recipient device ID across bytes 23-38.
-        header[23..39].copy_from_slice(&self.to);
-        // Stores the encryption flag at byte 39.
-        header[39] = u8::from(self.is_encrypted);
-        // Stores the packet type at byte 40.
-        header[40] = self.packet_type as u8;
-        // Stores the original hop limit at byte 41.
-        header[41] = self.initial_hop_limit;
-        // Stores the remaining hop limit at byte 42; relays may lower it.
-        header[42] = self.hop_limit;
+        // Stores the big-endian packet ID across bytes 1-4.
+        header[1..5].copy_from_slice(&self.packet_id.to_be_bytes());
+        // Stores the big-endian message ID across bytes 5-8.
+        header[5..9].copy_from_slice(&self.message_id.to_be_bytes());
+        // Stores the fragment index and count in bytes 9-10.
+        header[9] = self.fragment_index;
+        header[10] = self.fragment_count;
+        // Stores the sender device ID across bytes 11-26.
+        header[11..27].copy_from_slice(&self.from);
+        // Stores the recipient device ID across bytes 27-42.
+        header[27..43].copy_from_slice(&self.to);
+        // Stores the encryption flag at byte 43.
+        header[43] = u8::from(self.is_encrypted);
+        // Stores the packet type at byte 44.
+        header[44] = self.packet_type as u8;
+        // Stores the original hop limit at byte 45.
+        header[45] = self.initial_hop_limit;
+        // Stores the remaining hop limit at byte 46; relays may lower it.
+        header[46] = self.hop_limit;
     }
 
     /// Return the immutable header bytes used as AES-GCM associated data.

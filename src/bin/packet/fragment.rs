@@ -15,42 +15,50 @@ const REASSEMBLY_CAPACITY: usize = 4;
 pub struct FragmentKey {
     pub from: [u8; 16],
     pub to: [u8; 16],
-    pub message_id: u16,
+    pub message_id: u32,
 }
 
 pub struct Fragmenter;
 
 impl Fragmenter {
-    /// Split plaintext into packets. Encrypted callers must encrypt every returned packet before queuing it.
-    pub fn fragment(
-        packet_id: u16,
-        message_id: u16,
-        from: [u8; 16],
-        to: [u8; 16],
+    /// Count fragments using the encoded-packet limit of the active radio band.
+    pub fn fragment_count_with_limit(
         is_encrypted: bool,
-        packet_type: PacketType,
-        payload: &[u8],
-        initial_hop_limit: u8,
-        hop_limit: u8,
-    ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
-        Self::fragment_with_limit(
-            packet_id,
-            message_id,
-            from,
-            to,
-            is_encrypted,
-            packet_type,
-            payload,
-            initial_hop_limit,
-            hop_limit,
-            MAX_PACKET_SIZE,
-        )
+        payload_len: usize,
+        maximum_packet_size: usize,
+    ) -> Result<u16, PacketError> {
+        if payload_len > MAX_LOGICAL_MESSAGE_SIZE {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        if !(HEADER_SIZE..=MAX_PACKET_SIZE).contains(&maximum_packet_size) {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        let overhead = if is_encrypted { GCM_OVERHEAD } else { 0 };
+        let available_payload = maximum_packet_size - HEADER_SIZE;
+        if available_payload < overhead {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        let max_fragment_payload = available_payload - overhead;
+        if max_fragment_payload == 0 && payload_len > 0 {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        let count = if payload_len == 0 {
+            1
+        } else {
+            payload_len.div_ceil(max_fragment_payload)
+        };
+        if count == 0 || count > MAX_FRAGMENT_COUNT {
+            return Err(PacketError::PayloadTooLarge);
+        }
+        Ok(count as u16)
     }
 
     /// Split plaintext using the encoded-packet limit of the active radio band.
+    ///
+    /// Encrypted callers must encrypt every returned packet before queueing it.
     pub fn fragment_with_limit(
-        packet_id: u16,
-        message_id: u16,
+        packet_id: u32,
+        message_id: u32,
         from: [u8; 16],
         to: [u8; 16],
         is_encrypted: bool,
@@ -60,32 +68,11 @@ impl Fragmenter {
         hop_limit: u8,
         maximum_packet_size: usize,
     ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
-        // Reserve the current band's header and GCM overhead before splitting application text.
-        if payload.len() > MAX_LOGICAL_MESSAGE_SIZE {
-            return Err(PacketError::PayloadTooLarge);
-        }
-        if maximum_packet_size > MAX_PACKET_SIZE || maximum_packet_size < HEADER_SIZE {
-            return Err(PacketError::PayloadTooLarge);
-        }
+        let fragment_count =
+            Self::fragment_count_with_limit(is_encrypted, payload.len(), maximum_packet_size)?
+                as usize;
         let overhead = if is_encrypted { GCM_OVERHEAD } else { 0 };
-        let available_payload = maximum_packet_size - HEADER_SIZE;
-        if available_payload < overhead {
-            return Err(PacketError::PayloadTooLarge);
-        }
-        let max_fragment_payload = available_payload - overhead;
-        if max_fragment_payload == 0 && !payload.is_empty() {
-            return Err(PacketError::PayloadTooLarge);
-        }
-
-        let fragment_count = if payload.is_empty() {
-            1
-        } else {
-            payload.len().div_ceil(max_fragment_payload)
-        };
-
-        if fragment_count == 0 || fragment_count > MAX_FRAGMENT_COUNT {
-            return Err(PacketError::PayloadTooLarge);
-        }
+        let max_fragment_payload = maximum_packet_size - HEADER_SIZE - overhead;
 
         let mut packets: Vec<PacketData, MAX_FRAGMENT_COUNT> = Vec::new();
         for index in 0..fragment_count {
@@ -94,7 +81,7 @@ impl Fragmenter {
             let chunk = &payload[start..end];
 
             let mut packet = PacketData::new(
-                packet_id.wrapping_add(index as u16),
+                packet_id.wrapping_add(index as u32),
                 message_id,
                 index as u8,
                 fragment_count as u8,
@@ -116,31 +103,9 @@ impl Fragmenter {
         Ok(packets)
     }
 
-    pub fn fragment_with_defaults(
-        packet_id: u16,
-        message_id: u16,
-        from: [u8; 16],
-        to: [u8; 16],
-        is_encrypted: bool,
-        packet_type: PacketType,
-        payload: &[u8],
-    ) -> Result<Vec<PacketData, MAX_FRAGMENT_COUNT>, PacketError> {
-        Self::fragment(
-            packet_id,
-            message_id,
-            from,
-            to,
-            is_encrypted,
-            packet_type,
-            payload,
-            DEFAULT_HOP_LIMIT,
-            DEFAULT_HOP_LIMIT,
-        )
-    }
-
     pub fn fragment_with_defaults_and_limit(
-        packet_id: u16,
-        message_id: u16,
+        packet_id: u32,
+        message_id: u32,
         from: [u8; 16],
         to: [u8; 16],
         is_encrypted: bool,
@@ -165,7 +130,7 @@ impl Fragmenter {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcceptedFragment {
-    pub packet_id: u16,
+    pub packet_id: u32,
     pub fingerprint: [u8; 32],
 }
 
@@ -178,7 +143,7 @@ pub struct ReassembledMessage {
 
 #[derive(Clone, Copy)]
 struct FragmentMeta {
-    packet_id: u16,
+    packet_id: u32,
     fingerprint: [u8; 32],
     offset: usize,
     length: usize,

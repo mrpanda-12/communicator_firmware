@@ -5,15 +5,15 @@
 
 pub mod contact;
 pub mod display_settings;
-#[cfg(feature = "fake-navigator")]
-pub mod fake_navigator;
 pub mod navigation;
 pub mod render;
 pub mod state;
 
+use crate::DEVICE_ID;
 use crate::crypto;
 use crate::hardware::keypad::KeypadQueue;
 use crate::network::{
+    outbox,
     pairing::{PairingCoordinator, build_request_packet},
     types::{DiscoveryList, PairingEvent},
 };
@@ -24,19 +24,43 @@ use crate::packet::{
     packet_type::PacketType,
 };
 use crate::radio::{
+    control::RadioControl,
     queue::{QueueError, RadioQueue},
+    radio_error::RadioError,
     types::RadioConfig,
 };
-use crate::storage::message::{ConversationId, Direction, MessageKind, StoredMessage};
+use crate::storage::message::{ConversationId, Direction, StoredMessage};
 use crate::storage::session::Flash;
 use crate::ui::{
     contact::ContactBook,
-    state::{ManageCommand, ManageAction, OutgoingBody, OutgoingMessage},
+    state::{HistoryPageRequest, ManageAction, ManageCommand, OutgoingBody, OutgoingMessage},
 };
 use embassy_futures::select::{Either, select};
+use esp_hal::rng::Trng;
 use heapless::Vec as HeaplessVec;
-use state::{AnnouncementStatus, ChatRow, PairingUiStatus, UiState};
 use state::MAX_CHAT_MESSAGES;
+use state::{
+    AnnouncementStatus, ChatRow, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, UiState,
+};
+
+/// A broadcast row names the sender; unknown peers render a short ID instead.
+fn broadcast_sender_label(contacts: &ContactBook, sender: &[u8; 16]) -> heapless::String<32> {
+    match contacts.entry_by_kind(ConversationId::Direct(*sender)) {
+        Some(entry) => entry.display_name(),
+        None => {
+            let mut label = heapless::String::<32>::new();
+            let _ = core::fmt::Write::write_fmt(
+                &mut label,
+                format_args!("UNHEARD {:02X}{:02X}", sender[0], sender[1]),
+            );
+            label
+        }
+    }
+}
+
+/// List rows that can have a conversation: every contact slot, including the
+/// broadcast entry that always occupies the first one.
+const MAX_VISIBLE_CONVERSATIONS: usize = contact::MAX_CONTACTS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpsSnapshot {
@@ -78,15 +102,8 @@ pub fn gps_snapshot(
     }
 }
 
-/// 2/ Render the current UI model with a consistent, always-visible GPS bar.
-pub fn draw<D>(display: &mut D, state: &UiState, gps: GpsSnapshot) -> Result<(), D::Error>
-where
-    D: embedded_graphics::prelude::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-{
-    render::draw(display, state, gps)
-}
-
 /// 3/ React to screen events, chat storage, and received-message notifications.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<'a, D>(
     mut display: D,
     device_id: Option<[u8; 16]>,
@@ -95,6 +112,8 @@ pub async fn run<'a, D>(
     timezone_offset_minutes: i32,
     pairing: &PairingCoordinator,
     flash: &'a Flash,
+    radio_control: &RadioControl,
+    trng: &Trng,
     mut pairing_events: embassy_sync::watch::Receiver<
         'a,
         embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
@@ -135,8 +154,6 @@ where
         timezone_offset_minutes,
     );
 
-    #[cfg(feature = "fake-navigator")]
-    let mut fake_navigator = fake_navigator::FakeNavigator::new();
     let mut current_gps = gps.get().await;
     state.update_gps_snapshot(current_gps);
 
@@ -147,56 +164,18 @@ where
     let mut changes = notify::revision_receiver();
     let mut previous_state = None;
     let mut previous_gps = None;
-    let mut next_packet_id = 0x8000u16;
     let mut synced = None;
 
     loop {
-        #[cfg(feature = "fake-navigator")]
-        match select(
-            select(
-                select(
-                    select(gps.changed(), radio_config.changed()),
-                    select(discovery.changed(), pairing_events.changed()),
-                ),
-                select(select(popups.receive(), changes.changed()), keypad_events.receive()),
-            ),
-            fake_navigator.next_key(),
-        )
-        .await
-        {
-            Either::First(Either::First(Either::First(Either::First(snapshot)))) => {
-                current_gps = snapshot;
-                state.update_gps_snapshot(snapshot);
-            }
-            Either::First(Either::First(Either::First(Either::Second(config)))) => {
-                state.radio_config = config
-            }
-            Either::First(Either::First(Either::Second(Either::First(devices)))) => {
-                state.discovered_devices = filter_unsaved_peers(&state.contacts, devices)
-            }
-            Either::First(Either::First(Either::Second(Either::Second(event)))) => {
-                if let Some(event) = event {
-                    state.handle_pairing_event(event);
-                }
-            }
-            Either::First(Either::Second(Either::First(Either::First(popup)))) => {
-                handle_popup(&mut state, flash, popup).await;
-            }
-            Either::First(Either::Second(Either::First(Either::Second(_)))) => {}
-            Either::First(Either::Second(Either::Second(key))) => {
-                state.handle_keypad(key);
-            }
-            Either::Second(key) => {
-                state.handle_key(key);
-            }
-        }
-        #[cfg(not(feature = "fake-navigator"))]
         match select(
             select(
                 select(gps.changed(), radio_config.changed()),
                 select(discovery.changed(), pairing_events.changed()),
             ),
-            select(select(popups.receive(), changes.changed()), keypad_events.receive()),
+            select(
+                select(popups.receive(), changes.changed()),
+                keypad_events.receive(),
+            ),
         )
         .await
         {
@@ -204,9 +183,11 @@ where
                 current_gps = snapshot;
                 state.update_gps_snapshot(snapshot);
             }
-            Either::First(Either::First(Either::Second(config))) => state.radio_config = config,
+            Either::First(Either::First(Either::Second(config))) => {
+                state.radio_config = config;
+            }
             Either::First(Either::Second(Either::First(devices))) => {
-                state.discovered_devices = filter_unsaved_peers(&state.contacts, devices)
+                state.discovered_devices = filter_unsaved_peers(&state.contacts, devices);
             }
             Either::First(Either::Second(Either::Second(event))) => {
                 if let Some(event) = event {
@@ -216,6 +197,8 @@ where
             Either::Second(Either::First(Either::First(popup))) => {
                 handle_popup(&mut state, flash, popup).await;
             }
+            // A storage-revision bump needs no immediate action; the loop
+            // reads notify::revision() below on the next pass.
             Either::Second(Either::First(Either::Second(_))) => {}
             Either::Second(Either::Second(key)) => state.handle_keypad(key),
         }
@@ -223,8 +206,7 @@ where
         if state.take_pending_announcement() {
             let status = match state.device_id {
                 Some(device_id) => {
-                    let packet_id = next_packet_id;
-                    next_packet_id = next_packet_id.wrapping_add(1);
+                    let packet_id = crate::packet::packet_data::reserve_local_packet_ids(1);
                     match PacketData::new(
                         packet_id,
                         packet_id,
@@ -273,10 +255,13 @@ where
                 .is_some_and(|device_id| device_id < pending.peer_id)
             {
                 let device_id = state.device_id;
-                let packet_id = next_packet_id;
-                next_packet_id = next_packet_id.wrapping_add(1);
-                let request =
-                    build_request_packet(&pending.key, packet_id, device_id.unwrap(), pending.peer_id);
+                let packet_id = crate::packet::packet_data::reserve_local_packet_ids(1);
+                let request = build_request_packet(
+                    &pending.key,
+                    packet_id,
+                    device_id.unwrap(),
+                    pending.peer_id,
+                );
                 let queued = request.is_some_and(|(packet, nonce)| {
                     pairing.set_request_nonce(pending.peer_id, nonce);
                     radio_queue.add_packet(&packet).is_ok()
@@ -291,11 +276,56 @@ where
         }
 
         if let Some(outgoing) = state.take_pending_message() {
-            send_message(&mut state, flash, radio_queue, &mut next_packet_id, outgoing).await;
+            send_message(&mut state, flash, outgoing).await;
         }
 
         if let Some(manage) = state.take_pending_manage() {
             apply_manage(&mut state, flash, manage).await;
+        }
+
+        if state.take_pending_reset_identity() {
+            let new_id = flash
+                .with(async |session| {
+                    session
+                        .storage
+                        .regenerate_device_id(&mut session.buffer, |id| {
+                            trng.read(id);
+                            Ok(())
+                        })
+                        .await
+                })
+                .await;
+            match new_id {
+                Ok(new_id) => {
+                    defmt::info!("Regenerated and saved this device identity");
+                    state.device_id = Some(new_id);
+                    // The radio worker reads the same watch, so the next frame
+                    // is addressed from the new identity.
+                    DEVICE_ID.sender().send(Some(new_id));
+                    state.set_identity_reset_status(ResetUiStatus::Done);
+                    // Contacts and chat history belong to the person, not the
+                    // device identity, so they are kept as they are.
+                }
+                Err(_) => {
+                    defmt::warn!("Could not regenerate the device identity");
+                    state.set_identity_reset_status(ResetUiStatus::Failed);
+                }
+            }
+        }
+
+        if let Some(frequency_hz) = state.take_pending_frequency() {
+            let status = match radio_control.request_frequency_change(frequency_hz) {
+                Ok(()) => {
+                    defmt::info!("Requested frequency change to {} Hz", frequency_hz);
+                    FrequencyUiStatus::Queued
+                }
+                Err(RadioError::RadioBusy | RadioError::InvalidConfiguration) => {
+                    defmt::warn!("Frequency change not accepted for {} Hz", frequency_hz);
+                    FrequencyUiStatus::Busy
+                }
+                Err(_) => FrequencyUiStatus::Busy,
+            };
+            state.set_frequency_status(status);
         }
 
         if let Some(offset) = state.take_pending_timezone() {
@@ -340,15 +370,19 @@ where
             defmt::info!("Deleted all chat history");
         }
 
-        // Load the four visible rows whenever the conversation changes or the
-        // network task reports that history moved.
+        // Service an explicit arrow-key history page request first.
+        if let Some(request) = state.take_pending_history_page() {
+            load_conversation_page(&mut state, flash, request).await;
+            synced = Some((notify::revision(), state.active_conversation()));
+        }
+
+        // Reload the latest page when the conversation changes or history moves.
         let active = state.active_conversation();
         let revision = notify::revision();
         if synced != Some((revision, active)) {
             synced = Some((revision, active));
             if let Some(conversation) = active {
-                seed_preview_conversation(&mut state, flash, conversation).await;
-                set_chat_rows(&mut state, flash, conversation).await;
+                open_conversation(&mut state, flash, conversation).await;
             }
         }
 
@@ -367,13 +401,7 @@ where
 }
 
 /// Build and queue the fragments of one outgoing message, then persist it.
-async fn send_message(
-    state: &mut UiState,
-    flash: &Flash,
-    radio_queue: &RadioQueue,
-    next_packet_id: &mut u16,
-    outgoing: OutgoingMessage,
-) {
+async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMessage) {
     let Some(device_id) = state.device_id else {
         defmt::warn!("Could not send message: device identity unavailable");
         return;
@@ -390,24 +418,35 @@ async fn send_message(
         defmt::warn!("Refusing encrypted message to a peer without a pair key");
         return;
     }
-    // Coordinates are always sent as an unencrypted single packet; text is
-    // encrypted whenever a pair key exists and the chat asked for encryption.
-    let encrypted = !matches!(outgoing.body, OutgoingBody::Coords { .. })
-        && contact_key.is_some()
-        && !outgoing.unencrypted;
+    // Text and coordinates are encrypted whenever this chat has a pair key and
+    // the chat asked for encryption; broadcast and unpaired traffic stays
+    // plaintext, and coordinates stay a single fragment.
+    let encrypted = contact_key.is_some() && !outgoing.unencrypted;
 
-    let packet_id = *next_packet_id;
     let packet_type = match outgoing.body {
         OutgoingBody::Coords { .. } => PacketType::Coordinates,
         OutgoingBody::Text(_) => PacketType::Text,
     };
+    let payload = outgoing.payload();
+    let fragment_count = match Fragmenter::fragment_count_with_limit(
+        encrypted,
+        payload.len(),
+        state.radio_config.frequency_band.maximum_packet_size(),
+    ) {
+        Ok(count) => count,
+        Err(_) => {
+            defmt::warn!("Could not size outgoing message packets");
+            return;
+        }
+    };
+    let packet_id = crate::packet::packet_data::reserve_local_packet_ids(fragment_count);
     let built = build_message_packets(
         packet_id,
         device_id,
         peer_id,
         encrypted,
         packet_type,
-        outgoing.payload().as_slice(),
+        payload.as_slice(),
         contact_key,
         state.radio_config.frequency_band.maximum_packet_size(),
     );
@@ -415,37 +454,27 @@ async fn send_message(
         defmt::warn!("Could not build outgoing message packet");
         return;
     };
-    *next_packet_id = next_packet_id.wrapping_add(packets.len() as u16);
+    let Some(first) = packets.first() else { return };
+    let message_id = first.message_id;
+    let packet_id = first.packet_id;
 
-    let mut queue_error = None;
-    for packet in packets.iter() {
-        if let Err(error) = radio_queue.add_packet(packet) {
-            queue_error = Some(error);
-            break;
-        }
-    }
-    if let Some(error) = queue_error {
-        match error {
-            QueueError::Full => defmt::warn!("Could not queue message: TX queue is full"),
-            QueueError::Packet(_) => defmt::warn!("Could not queue message fragment"),
-            QueueError::PacketTooLong { length, maximum } => {
-                defmt::warn!("Message fragment {} bytes exceeds {}", length, maximum)
-            }
-        }
-        defmt::warn!("The peer may not receive any fragment of this message");
+    // Hand the whole message to the outbox, so a full TX queue delays it
+    // instead of dropping it.
+    if outbox::submit(message_id, packets, encrypted).is_err() {
+        defmt::warn!("Could not queue message: two sends are already waiting");
+        notify::send_queue_full(conversation);
         return;
     }
 
     // Persist the sent message so a later ACK can turn it green after reboot.
-    let first = packets.first().expect("at least one fragment");
     let stored = StoredMessage::new(
-        u32::from(first.message_id),
+        message_id,
         Direction::Sent,
         0,
-        outgoing.message_kind(),
+        outgoing.message_type(),
         outgoing.text(),
-        first.packet_id,
-        first.message_id,
+        packet_id,
+        message_id,
         device_id,
         encrypted,
     );
@@ -464,14 +493,17 @@ async fn send_message(
         state
             .contacts
             .seed_preview(conversation, preview.as_str(), true, false);
+        // The draft is sent and stored; do not leave it in the composer to resend.
+        state.clear_chat_input();
     } else {
         defmt::warn!("Could not save the sent message to flash");
+        notify::storage_full(conversation);
     }
 }
 
 /// Fragment one outgoing payload and encrypt every fragment when a key exists.
 fn build_message_packets(
-    packet_id: u16,
+    packet_id: u32,
     from: [u8; 16],
     to: [u8; 16],
     encrypted: bool,
@@ -506,6 +538,10 @@ fn build_message_packets(
 /// refresh the row preview, and show the toast unless the peer is blocked.
 async fn handle_popup(state: &mut UiState, flash: &Flash, popup: notify::Popup) {
     let conversation = popup.conversation;
+    if popup.kind == notify::PopupKind::Alert {
+        state.show_popup(popup);
+        return;
+    }
     state.note_unknown_sender(conversation);
     // Refresh that row's preview straight from the record just written.
     seed_preview_conversation(state, flash, conversation).await;
@@ -572,23 +608,65 @@ async fn apply_manage(state: &mut UiState, flash: &Flash, manage: ManageCommand)
     state.after_manage(manage.from_chats);
 }
 
-/// Replace the visible chat rows with the newest records of one conversation.
-async fn set_chat_rows(state: &mut UiState, flash: &Flash, conversation: ConversationId) {
-    let storage_id = conversation.storage_id();
-    let records = flash
+/// Load the newest page when a conversation is opened.
+async fn open_conversation(state: &mut UiState, flash: &Flash, conversation: ConversationId) {
+    load_conversation_page(
+        state,
+        flash,
+        HistoryPageRequest {
+            conversation,
+            start: None,
+            select: None,
+        },
+    )
+    .await;
+}
+
+/// Load one indexed page and preserve its position in the complete history.
+async fn load_conversation_page(state: &mut UiState, flash: &Flash, request: HistoryPageRequest) {
+    let storage_id = request.conversation.storage_id();
+    let page = flash
         .with(async |session| {
             session
                 .storage
-                .load_recent_messages(&storage_id, MAX_CHAT_MESSAGES, &mut session.buffer)
+                .load_message_page(
+                    &storage_id,
+                    request.start,
+                    MAX_CHAT_MESSAGES,
+                    &mut session.buffer,
+                )
                 .await
-                .unwrap_or_default()
+                .unwrap_or((0, 0, 0, alloc::vec::Vec::new()))
         })
         .await;
+    let (total, base, start, records) = page;
     let mut rows: HeaplessVec<ChatRow, MAX_CHAT_MESSAGES> = HeaplessVec::new();
     for record in records.iter() {
-        let _ = rows.push(ChatRow::from_stored(record));
+        let sender_label = match &request.conversation {
+            ConversationId::Broadcast if !record.from_me => {
+                Some(broadcast_sender_label(&state.contacts, &record.sender_id))
+            }
+            _ => None,
+        };
+        let _ = rows.push(ChatRow::from_stored(record, sender_label));
     }
-    state.set_chat_rows(rows);
+    if request.start.is_none()
+        && let Some(newest) = records.last()
+    {
+        let preview =
+            crate::ui::contact::preview_text(newest.text.as_str(), newest.kind.coordinates());
+        state.contacts.seed_preview(
+            request.conversation,
+            preview.as_str(),
+            newest.from_me,
+            newest.acknowledged,
+        );
+    }
+    let selected = request
+        .select
+        .and_then(|ordinal| ordinal.checked_sub(start))
+        .and_then(|index| usize::try_from(index).ok());
+    state.set_chat_page(rows, base, start, total, selected);
 }
 
 /// Refresh one conversation's chat-list preview from its newest flash record.
@@ -609,21 +687,18 @@ async fn seed_preview_conversation(
         })
         .await;
     let Some(record) = newest else { return };
-    let kind = match &record.kind {
-        MessageKind::Text => None,
-        MessageKind::Coords { latitude_microdegrees, longitude_microdegrees } => {
-            Some((*latitude_microdegrees, *longitude_microdegrees))
-        }
-    };
-    let preview = crate::ui::contact::preview_text(record.text.as_str(), kind);
-    state
-        .contacts
-        .seed_preview(conversation, preview.as_str(), record.from_me, record.acknowledged);
+    let preview = crate::ui::contact::preview_text(record.text.as_str(), record.kind.coordinates());
+    state.contacts.seed_preview(
+        conversation,
+        preview.as_str(),
+        record.from_me,
+        record.acknowledged,
+    );
 }
 
 /// Fill every visible chat-list preview from flash at boot.
 async fn seed_previews(state: &mut UiState, flash: &Flash) {
-    let mut kinds: heapless::Vec<ConversationId, 33> = heapless::Vec::new();
+    let mut kinds: heapless::Vec<ConversationId, MAX_VISIBLE_CONVERSATIONS> = heapless::Vec::new();
     for index in state.contacts.visible_indices(false).iter() {
         if let Some(entry) = state.contacts.entry(*index)
             && kinds.push(entry.kind).is_err()
@@ -636,10 +711,7 @@ async fn seed_previews(state: &mut UiState, flash: &Flash) {
     }
 }
 
-fn filter_unsaved_peers(
-    contacts: &ContactBook,
-    devices: DiscoveryList,
-) -> DiscoveryList {
+fn filter_unsaved_peers(contacts: &ContactBook, devices: DiscoveryList) -> DiscoveryList {
     let mut unsaved = DiscoveryList::new();
     for device_id in devices {
         if contacts.direct_key(&device_id).is_none() {

@@ -25,10 +25,10 @@ impl FrequencyBand {
     }
 
     pub const fn contains(self, frequency_hz: u32) -> bool {
-        match self {
-            Self::SubGhz => frequency_hz >= 150_000_000 && frequency_hz <= 960_000_000,
-            Self::Sband => frequency_hz >= 1_900_000_000 && frequency_hz <= 2_100_000_000,
-            Self::Ism2_4Ghz => frequency_hz >= 2_400_000_000 && frequency_hz <= 2_500_000_000,
+        // Keep one range table: band selection and validation cannot drift.
+        match Self::for_frequency(frequency_hz) {
+            Some(band) => band as u8 == self as u8,
+            None => false,
         }
     }
 }

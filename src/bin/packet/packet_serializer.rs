@@ -23,7 +23,7 @@ impl PacketSerializer {
         packet_data.write_header(&mut header);
         buffer[..HEADER_SIZE].copy_from_slice(&header);
 
-        // Stores the packet payload starting at byte 43.
+        // Stores the packet payload starting at byte 47.
         buffer[HEADER_SIZE..packet_len].copy_from_slice(packet_data.payload.as_slice());
 
         Ok(packet_len)

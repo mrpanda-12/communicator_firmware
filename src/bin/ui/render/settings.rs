@@ -6,7 +6,9 @@ use heapless::String;
 use crate::{
     network::types::DiscoveryList,
     radio::types::RadioConfig,
-    ui::state::{PairingUiStatus, SettingsSection},
+    ui::state::{
+        FREQUENCY_PRESETS, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, SettingsSection,
+    },
 };
 
 use super::{
@@ -52,6 +54,8 @@ where
     text(display, section.item_label(item), 12, 78, WHITE, false)?;
     if section == SettingsSection::Device && item == 0 {
         draw_device_info(display, device_id, firmware_version)?;
+    } else if section == SettingsSection::Device && item == 1 {
+        draw_packet_ids(display)?;
     } else if section == SettingsSection::Frequency && item == 0 {
         draw_radio_info(display, radio_config)?;
     } else if section.is_timezone_item(item) {
@@ -69,15 +73,46 @@ where
     text(display, "BACK: OPTIONS", 8, 218, WHITE, false)
 }
 
-/// Show the current UTC offset and how to change it.
-fn draw_timezone_offset<D>(
-    display: &mut D,
-    timezone_offset_minutes: i32,
-) -> Result<(), D::Error>
+/// Show the last assigned IDs and how much of the 32-bit space is left.
+fn draw_packet_ids<D>(display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let sign = if timezone_offset_minutes < 0 { "-" } else { "+" };
+    let next = crate::packet::packet_data::current_packet_id();
+    let last_packet = next.saturating_sub(1);
+    let last_message = crate::packet::packet_data::last_message_id();
+    let used = u64::from(next) * 100 / u64::from(u32::MAX);
+    let left = 100u64.saturating_sub(used);
+
+    for (label, value, y) in [
+        ("LAST PACKET", last_packet, 104),
+        ("LAST MESSAGE", last_message, 126),
+        ("NEXT PACKET", next, 148),
+    ] {
+        let mut line = String::<32>::new();
+        let _ = write!(line, "{label} {:08X}", value);
+        text(display, line.as_str(), 12, y, WHITE, false)?;
+    }
+
+    let mut remaining = String::<32>::new();
+    let _ = write!(
+        remaining,
+        "IDS LEFT {left}% {}",
+        u32::MAX.saturating_sub(next)
+    );
+    text(display, remaining.as_str(), 12, 170, CYAN, false)
+}
+
+/// Show the current UTC offset and how to change it.
+fn draw_timezone_offset<D>(display: &mut D, timezone_offset_minutes: i32) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let sign = if timezone_offset_minutes < 0 {
+        "-"
+    } else {
+        "+"
+    };
     let absolute = timezone_offset_minutes.unsigned_abs();
     let mut offset = String::<16>::new();
     let _ = write!(offset, "{sign}{:02}:{:02}", absolute / 60, absolute % 60);
@@ -98,14 +133,11 @@ pub fn draw_contact_manage<D>(
     display: &mut D,
     device_id: &[u8; 16],
     selected: usize,
-    _from_chats: bool,
     blocked: bool,
-    device_id_of: Option<[u8; 16]>,
 ) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let _ = device_id_of;
     text(display, "MANAGE CONTACT", 12, 38, CYAN, true)?;
     let mut identity = String::<40>::new();
     let nothing = format_device_id(device_id);
@@ -121,14 +153,7 @@ where
         142,
         selected == 1,
     )?;
-    text(
-        display,
-        "BACK: BACK TO LIST",
-        8,
-        218,
-        MUTED,
-        false,
-    )
+    text(display, "BACK: BACK TO LIST", 8, 218, MUTED, false)
 }
 
 /// 4/ Display recent sender IDs heard passively in any valid packet.
@@ -317,6 +342,100 @@ where
     )?;
     text(display, "ENTER: CONTINUE", 12, 172, WHITE, false)?;
     text(display, "BACK: CANCEL", 12, 218, WHITE, false)
+}
+
+/// Show the outcome of the requested identity regeneration.
+pub fn draw_identity_reset<D>(
+    display: &mut D,
+    device_id: Option<[u8; 16]>,
+    status: ResetUiStatus,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    text(display, "RESET IDENTITY", 12, 38, CYAN, true)?;
+    match device_id {
+        Some(device_id) => {
+            let identity = format_device_id(&device_id);
+            text(display, identity.as_str(), 12, 72, MUTED, false)?;
+        }
+        None => text(display, "NO IDENTITY YET", 12, 72, MUTED, false)?,
+    }
+    let (label, color) = match status {
+        ResetUiStatus::Working => ("REGENERATING ...", MUTED),
+        ResetUiStatus::Done => ("NEW IDENTITY SAVED", CYAN),
+        ResetUiStatus::Failed => ("FAILED; ID UNCHANGED", WARNING),
+    };
+    text(display, label, 12, 108, color, false)?;
+    text(
+        display,
+        "PEERS MUST RE-PAIR THE NEW ID",
+        12,
+        132,
+        WARNING,
+        false,
+    )?;
+    text(
+        display,
+        "CONTACTS AND HISTORY ARE KEPT",
+        12,
+        152,
+        MUTED,
+        false,
+    )?;
+    text(display, "ENTER / BACK: SETTINGS", 8, 218, WHITE, false)
+}
+
+/// Show the offered frequency presets for one radio.
+pub fn draw_frequency_change<D>(display: &mut D, selected: usize) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    text(display, "CHANGE FREQUENCY", 12, 38, CYAN, true)?;
+    for (index, (_, label)) in FREQUENCY_PRESETS.iter().enumerate() {
+        draw_option(display, label, 96 + index as i32 * 30, selected == index)?;
+    }
+    text(
+        display,
+        "EVERY PEER MUST RETUNE TOO",
+        12,
+        170,
+        WARNING,
+        false,
+    )?;
+    text(
+        display,
+        "UP/DOWN SELECT  ENTER: RETUNE",
+        8,
+        218,
+        WHITE,
+        false,
+    )
+}
+
+/// Show the outcome of one retune request.
+pub fn draw_frequency_status<D>(display: &mut D, status: FrequencyUiStatus) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    text(display, "CHANGE FREQUENCY", 12, 38, CYAN, true)?;
+    match status {
+        FrequencyUiStatus::Queued => {
+            text(display, "RETUNE QUEUED", 12, 92, CYAN, false)?;
+            text(
+                display,
+                "APPLIED AT THE NEXT IDLE BOUNDARY",
+                12,
+                114,
+                MUTED,
+                false,
+            )?;
+        }
+        FrequencyUiStatus::Busy => {
+            text(display, "RADIO BUSY; TRY AGAIN", 12, 92, WARNING, false)?;
+        }
+    }
+    text(display, "ENTER / BACK: SETTINGS", 8, 218, WHITE, false)
 }
 
 fn format_device_id(device_id: &[u8; 16]) -> String<40> {

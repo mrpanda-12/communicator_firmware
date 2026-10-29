@@ -8,8 +8,8 @@ pub const BROADCAST_ID: [u8; 16] = [0xff; 16];
 
 /// One conversation: the public broadcast or a direct peer.
 ///
-/// This is the only conversation vocabulary; the UI, the receive path, and the
-/// share it, and storage derives its keys from the peer ID.
+/// The UI, the receive path, and storage all use this one vocabulary, and the
+/// storage key is derived from the peer ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversationId {
     Broadcast,
@@ -57,12 +57,28 @@ pub enum Direction {
 pub const MAX_MESSAGE_PAYLOAD: usize = MAX_LOGICAL_MESSAGE_SIZE;
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum MessageKind {
+pub enum MessageType {
     Text,
     Coords {
         latitude_microdegrees: i32,
         longitude_microdegrees: i32,
     },
+}
+
+impl MessageType {
+    /// Returns the position this record carries, or `None` for plain text.
+    ///
+    /// Callers that build previews or rows use this instead of matching the
+    /// enum themselves.
+    pub fn coordinates(&self) -> Option<(i32, i32)> {
+        match self {
+            Self::Text => None,
+            Self::Coords {
+                latitude_microdegrees,
+                longitude_microdegrees,
+            } => Some((*latitude_microdegrees, *longitude_microdegrees)),
+        }
+    }
 }
 
 /// One chat message in its flash record form.
@@ -72,13 +88,13 @@ pub struct StoredMessage {
     pub id: u32,
     pub from_me: bool,
     pub timestamp: u32,
-    pub kind: MessageKind,
+    pub kind: MessageType,
     pub text: String<MAX_MESSAGE_PAYLOAD>,
-    pub packet_id: u16,
-    pub message_id: u16,
+    pub packet_id: u32,
+    pub message_id: u32,
     pub sender_id: [u8; 16],
     pub encrypted: bool,
-    /// Set when our peer acknowledged the message; not meaningful for received rows.
+    /// Marks a sent message whose delivery the peer confirmed.
     pub acknowledged: bool,
 }
 
@@ -88,10 +104,10 @@ impl StoredMessage {
         conversation_ordinal: u32,
         direction: Direction,
         timestamp: u32,
-        kind: MessageKind,
+        kind: MessageType,
         text: &str,
-        packet_id: u16,
-        message_id: u16,
+        packet_id: u32,
+        message_id: u32,
         sender_id: [u8; 16],
         encrypted: bool,
     ) -> Self {
@@ -113,7 +129,7 @@ impl StoredMessage {
 }
 
 // id, from_me, timestamp, packet_id, message_id, sender_id, encrypted, kind, text_len.
-const MESSAGE_FIXED_BYTES: usize = 4 + 1 + 4 + 2 + 2 + 16 + 1 + 1 + 2;
+const MESSAGE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 4 + 16 + 1 + 1 + 2;
 /// One trailing byte records the acknowledged flag.
 const ACK_FLAG_BYTES: usize = 1;
 
@@ -121,8 +137,8 @@ impl<'a> Value<'a> for StoredMessage {
     fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, SerializationError> {
         // Coordinates add eight bytes; text messages add only their text.
         let coordinate_bytes = match &self.kind {
-            MessageKind::Text => 0,
-            MessageKind::Coords { .. } => 8,
+            MessageType::Text => 0,
+            MessageType::Coords { .. } => 8,
         };
         let required = MESSAGE_FIXED_BYTES
             .checked_add(coordinate_bytes)
@@ -140,21 +156,21 @@ impl<'a> Value<'a> for StoredMessage {
         offset += 1;
         buffer[offset..offset + 4].copy_from_slice(&self.timestamp.to_le_bytes());
         offset += 4;
-        buffer[offset..offset + 2].copy_from_slice(&self.packet_id.to_le_bytes());
-        offset += 2;
-        buffer[offset..offset + 2].copy_from_slice(&self.message_id.to_le_bytes());
-        offset += 2;
+        buffer[offset..offset + 4].copy_from_slice(&self.packet_id.to_le_bytes());
+        offset += 4;
+        buffer[offset..offset + 4].copy_from_slice(&self.message_id.to_le_bytes());
+        offset += 4;
         buffer[offset..offset + 16].copy_from_slice(&self.sender_id);
         offset += 16;
         buffer[offset] = u8::from(self.encrypted);
         offset += 1;
 
         match &self.kind {
-            MessageKind::Text => {
+            MessageType::Text => {
                 buffer[offset] = 0x01;
                 offset += 1;
             }
-            MessageKind::Coords {
+            MessageType::Coords {
                 latitude_microdegrees,
                 longitude_microdegrees,
             } => {
@@ -191,8 +207,8 @@ impl<'a> Value<'a> for StoredMessage {
         offset += 1;
 
         let timestamp = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
-        let packet_id = u16::from_le_bytes(read_array::<2>(buffer, &mut offset)?);
-        let message_id = u16::from_le_bytes(read_array::<2>(buffer, &mut offset)?);
+        let packet_id = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
+        let message_id = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
         let sender_id = read_array::<16>(buffer, &mut offset)?;
 
         let encrypted = match buffer[offset] {
@@ -207,13 +223,13 @@ impl<'a> Value<'a> for StoredMessage {
             .ok_or(SerializationError::BufferTooSmall)?;
         offset += 1;
         let kind = match kind_tag {
-            0x01 => MessageKind::Text,
+            0x01 => MessageType::Text,
             0x02 => {
                 let latitude_microdegrees =
                     i32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
                 let longitude_microdegrees =
                     i32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
-                MessageKind::Coords {
+                MessageType::Coords {
                     latitude_microdegrees,
                     longitude_microdegrees,
                 }
@@ -238,8 +254,6 @@ impl<'a> Value<'a> for StoredMessage {
             .map_err(|_| SerializationError::InvalidData)?;
         offset = text_end;
 
-        // The trailing flag defaults to unacknowledged for records saved before
-        // the field existed.
         let acknowledged = match buffer.get(offset) {
             Some(0) | None => false,
             Some(1) => true,

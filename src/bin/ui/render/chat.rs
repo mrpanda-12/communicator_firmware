@@ -11,7 +11,7 @@ use heapless::String;
 use crate::storage::message::ConversationId;
 use crate::ui::state::ChatRow;
 
-use super::style::{ACK_GREEN, BLUE, CYAN, MUTED, WARNING, WHITE, text};
+use super::style::{ACK_GREEN, BLUE, CYAN, MUTED, WARNING, WHITE, text, write_coordinate};
 
 /// 1/ Draw the selected conversation, composer, and context menu.
 pub fn draw<D>(
@@ -89,15 +89,27 @@ where
                 .into_styled(PrimitiveStyle::with_fill(super::style::SELECTED))
                 .draw(display)?;
         }
-        let mut line = String::<48>::new();
+        let mut line = String::<80>::new();
+        // Broadcast rows lead with the sender's name; every other received row
+        // keeps the generic FROM label.
         let label = if row.coordinates.is_some() {
             if row.from_me { "GPS->" } else { "GPS<-" }
         } else if row.from_me {
             "ME>"
+        } else if matches!(conversation, ConversationId::Broadcast) {
+            ""
         } else {
             "FROM"
         };
-        let _ = write!(line, "{label} ");
+        if !label.is_empty() {
+            let _ = write!(line, "{label}");
+            let _ = line.push(' ');
+        }
+        if !row.from_me
+            && let (ConversationId::Broadcast, Some(name)) = (conversation, &row.sender_label)
+        {
+            let _ = write!(line, "{name}> ");
+        }
         if let Some((latitude, longitude)) = row.coordinates {
             write_coordinate(&mut line, latitude);
             let _ = line.push(',');
@@ -108,14 +120,14 @@ where
 
         // Colour: a sent row of an encrypted chat is green when acknowledged and
         // grey while sending; everything else is cyan when encrypted, muted when public.
-        let color = if row.from_me && row.encrypted && matches!(conversation, ConversationId::Direct(_))
-        {
-            if row.acknowledged { ACK_GREEN } else { MUTED }
-        } else if row.encrypted {
-            CYAN
-        } else {
-            MUTED
-        };
+        let color =
+            if row.from_me && row.encrypted && matches!(conversation, ConversationId::Direct(_)) {
+                if row.acknowledged { ACK_GREEN } else { MUTED }
+            } else if row.encrypted {
+                CYAN
+            } else {
+                MUTED
+            };
         text(display, line.as_str(), 12, row_y + 2, color, false)?;
 
         // SENDING.. sits on the right edge until the ACK turns the row green.
@@ -185,16 +197,4 @@ where
         "SENDING DISABLED   BACK: CHATS"
     };
     text(display, controls, 8, 218, WHITE, false)
-}
-
-/// Format signed microdegrees without allocating or depending on float formatting.
-fn write_coordinate(line: &mut String<48>, coordinate: i32) {
-    let sign = if coordinate < 0 { "-" } else { "" };
-    let absolute = coordinate.unsigned_abs();
-    let _ = write!(
-        line,
-        "{sign}{}.{:06}",
-        absolute / 1_000_000,
-        absolute % 1_000_000
-    );
 }

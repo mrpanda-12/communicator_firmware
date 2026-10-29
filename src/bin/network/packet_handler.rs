@@ -5,10 +5,12 @@ use core::str::from_utf8;
 
 use heapless::Vec;
 
+use crate::storage::message::ConversationId;
 use crate::{
-    crypto,
+    DEVICE_ID, crypto,
     network::{
         discovery::DeviceDiscovery,
+        outbox,
         pairing::{
             PairingCoordinator, build_challenge_packet, build_finish_packet, pairing_stage,
             verify_pairing_packet,
@@ -19,8 +21,7 @@ use crate::{
     packet::{
         fragment::{Defragmenter, ReassembledMessage},
         packet_data::{
-            AUTHENTICATED_HEADER_SIZE, DEFAULT_HOP_LIMIT, GCM_OVERHEAD, MAX_PAYLOAD_SIZE,
-            PacketData,
+            DEFAULT_HOP_LIMIT, GCM_OVERHEAD, MAX_PAYLOAD_SIZE, PacketData, reserve_local_packet_ids,
         },
         packet_deserializer::PacketDeserializer,
         packet_type::PacketType,
@@ -28,20 +29,17 @@ use crate::{
     radio::queue::{Packet, QueueError, RadioQueue},
     storage::{
         contact::Contact,
-        message::{Direction, MessageKind, StoredMessage},
+        message::{Direction, MessageType, StoredMessage},
         session::Flash,
     },
 };
-use crate::storage::message::ConversationId;
 
 /// Fragment keys remembered for duplicate suppression.
-const SEEN_CAPACITY: usize = 64;
+const SEEN_CAPACITY: usize = 128;
 /// Accepted fragments remembered for a repeated acknowledgement.
-const ACCEPTED_CAPACITY: usize = 64;
+const ACCEPTED_CAPACITY: usize = 128;
 /// Acknowledgement payload: original sender, recipient, and message ID.
-const ACK_PAYLOAD_SIZE: usize = 16 + 16 + 2;
-/// Keeps a locally chosen packet ID inside the lower 15 bits after wrapping.
-const RESPONSE_ID_MASK: u16 = 0x7fff;
+const ACK_PAYLOAD_SIZE: usize = 16 + 16 + 4;
 
 /// Plaintext of one received fragment.
 type Payload = Vec<u8, MAX_PAYLOAD_SIZE>;
@@ -51,8 +49,8 @@ type PairKey = [u8; crypto::KEY_SIZE];
 /// One authenticated fragment, kept so a retransmit still gets its ACK.
 struct Accepted {
     sender: [u8; 16],
-    packet_id: u16,
-    message_id: u16,
+    packet_id: u32,
+    message_id: u32,
     fingerprint: [u8; 32],
     key: PairKey,
 }
@@ -60,13 +58,11 @@ struct Accepted {
 /// Verifies frames, rebuilds logical messages, and answers their senders.
 pub struct PacketHandler {
     /// `(sender, packet_id)` of every fragment already processed.
-    seen: Vec<([u8; 16], u16), SEEN_CAPACITY>,
+    seen: Vec<([u8; 16], u32), SEEN_CAPACITY>,
     /// Fragments of messages that were authenticated and delivered.
     accepted: Vec<Accepted, ACCEPTED_CAPACITY>,
     /// Rebuilds one logical message from its fragments.
     fragments: Defragmenter,
-    /// Next packet ID for a locally generated response.
-    next_id: u16,
 }
 
 impl PacketHandler {
@@ -75,11 +71,10 @@ impl PacketHandler {
             seen: Vec::new(),
             accepted: Vec::new(),
             fragments: Defragmenter::new(),
-            next_id: 0,
         }
     }
 
-    /// Process one frame until it is delivered, relayed, acknowledged, or dropped.
+    /// Answer one RX frame; `None` stops all further dispatch.
     pub async fn handle_packet(
         &mut self,
         frame: Packet,
@@ -93,7 +88,8 @@ impl PacketHandler {
             return;
         };
         // Refuse traffic while this device has no identity.
-        let Some(device_id) = load_device_id(flash).await else {
+        let Some(device_id) = DEVICE_ID.try_get().flatten() else {
+            defmt::warn!("RX ignored: this device has no stored identity");
             return;
         };
         // Drop packets this device sent and a relay echoed back.
@@ -153,7 +149,7 @@ impl PacketHandler {
     }
 
     /// Record one fragment key; true when it was already seen.
-    fn is_duplicate(&mut self, sender: [u8; 16], packet_id: u16) -> bool {
+    fn is_duplicate(&mut self, sender: [u8; 16], packet_id: u32) -> bool {
         // Report a repeated key so the caller can drop the duplicate.
         let key = (sender, packet_id);
         if self.seen.contains(&key) {
@@ -237,7 +233,7 @@ impl PacketHandler {
 
         // Deliver once; skip the ACK when storage refuses the text.
         let conversation = ConversationId::Direct(packet.from);
-        if !deliver_text(conversation, &message, flash).await {
+        if deliver_text(conversation, &message, flash).await == SaveResult::Failed {
             return;
         }
         // Acknowledge only authenticated traffic.
@@ -302,10 +298,10 @@ impl PacketHandler {
         // Save the row to its conversation and tell the UI it arrived.
         let conversation = ConversationId::from_peer(packet.from);
         let stored = StoredMessage::new(
-            u32::from(packet.message_id),
+            packet.message_id,
             Direction::Received,
             0,
-            MessageKind::Coords {
+            MessageType::Coords {
                 latitude_microdegrees: latitude,
                 longitude_microdegrees: longitude,
             },
@@ -315,7 +311,9 @@ impl PacketHandler {
             packet.from,
             pair_key.is_some(),
         );
-        save_message(conversation, &stored, flash).await;
+        if save_message(conversation, &stored, flash).await == SaveResult::Failed {
+            return;
+        }
 
         // Answer only an authenticated row.
         let Some(key) = pair_key else {
@@ -342,11 +340,15 @@ impl PacketHandler {
             return;
         }
 
-        // Require the payload to name this exchange.
-        let Some(message_id) = decode_ack(payload.as_slice(), &packet.from, &packet.to) else {
+        // Require the payload to name this exchange: the stored sent message's
+        // sender is this device, and the ACK sender is the peer.
+        let Some(message_id) = decode_ack(payload.as_slice(), &packet.to, &packet.from) else {
             defmt::warn!("Rejected ACK: payload names another exchange");
             return;
         };
+
+        // Stop retransmitting: the peer has the whole message.
+        outbox::acknowledge(message_id);
 
         // Flip our records to the delivered state and tell the UI.
         let marked = flash
@@ -394,7 +396,7 @@ impl PacketHandler {
                     fail();
                     return;
                 };
-                let request_id = self.take_id();
+                let request_id = reserve_local_packet_ids(1);
                 let Some((response, response_nonce)) =
                     build_challenge_packet(&key, request_id, device_id, packet.from, request_nonce)
                 else {
@@ -429,7 +431,7 @@ impl PacketHandler {
                 };
                 let Some(response) = build_finish_packet(
                     &key,
-                    self.take_id(),
+                    reserve_local_packet_ids(1),
                     device_id,
                     packet.from,
                     request_nonce,
@@ -539,7 +541,7 @@ impl PacketHandler {
 
         // Reserve the GCM overhead; encryption below replaces the payload.
         let mut ack = match PacketData::new(
-            self.take_id(),
+            reserve_local_packet_ids(1),
             received.message_id,
             0,
             1,
@@ -570,13 +572,6 @@ impl PacketHandler {
             Err(_) => defmt::warn!("Could not queue invalid message ACK"),
         }
     }
-
-    /// Hand out the next locally chosen packet ID for a response.
-    fn take_id(&mut self) -> u16 {
-        let packet_id = self.next_id;
-        self.next_id = packet_id.wrapping_add(1) & RESPONSE_ID_MASK;
-        packet_id
-    }
 }
 
 impl Default for PacketHandler {
@@ -601,24 +596,6 @@ fn parse_frame(frame: &Packet) -> Option<PacketData> {
         return None;
     }
     Some(packet)
-}
-
-/// Read this device's stored identity, refusing traffic while it is missing.
-async fn load_device_id(flash: &Flash) -> Option<[u8; 16]> {
-    let loaded = flash
-        .with(async |session| session.storage.load_device_id(&mut session.buffer).await)
-        .await;
-    match loaded {
-        Ok(Some(device_id)) => Some(device_id),
-        Ok(None) => {
-            defmt::warn!("RX ignored: this device has no stored identity");
-            None
-        }
-        Err(_) => {
-            defmt::warn!("RX ignored: could not load this device's identity");
-            None
-        }
-    }
 }
 
 /// Apply the pair-key rules to a direct packet and return its plaintext.
@@ -672,42 +649,75 @@ async fn decrypt_direct(packet: &PacketData, flash: &Flash) -> Option<(Payload, 
     }
 }
 
-/// Save one reassembled text message and toast the UI; false means it was refused.
+/// Outcome of one inbound record append.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveResult {
+    Stored,
+    Duplicate,
+    Failed,
+}
+
+/// Save one reassembled text message and toast the UI.
 async fn deliver_text(
     conversation: ConversationId,
     message: &ReassembledMessage,
     flash: &Flash,
-) -> bool {
+) -> SaveResult {
     // Reject a payload that is not valid UTF-8.
     let Ok(text) = from_utf8(message.payload.as_slice()) else {
         defmt::warn!("Rejected text message: payload is not UTF-8");
-        return false;
+        return SaveResult::Failed;
     };
     let first = &message.first_packet;
 
     // Reject text longer than the record limit before it reaches flash.
     if text.len() > crate::storage::message::MAX_MESSAGE_PAYLOAD {
         defmt::warn!("Rejected text message: it exceeds the storage capacity");
-        return false;
+        return SaveResult::Failed;
     }
 
     let stored = StoredMessage::new(
-        u32::from(first.message_id),
+        first.message_id,
         Direction::Received,
         0,
-        MessageKind::Text,
+        MessageType::Text,
         text,
         first.packet_id,
         first.message_id,
         first.from,
         message.encrypted,
     );
-    save_message(conversation, &stored, flash).await;
-    true
+    save_message(conversation, &stored, flash).await
 }
 
-/// Append one record to flash and toast the UI once it persisted.
-async fn save_message(conversation: ConversationId, stored: &StoredMessage, flash: &Flash) {
+/// Append one record to flash and toast the UI only after it persisted.
+async fn save_message(
+    conversation: ConversationId,
+    stored: &StoredMessage,
+    flash: &Flash,
+) -> SaveResult {
+    // A retransmit can arrive after a reboot; the stored record proves the
+    // message was already delivered even when the RAM duplicate cache is gone.
+    let duplicate = flash
+        .with(async |session| {
+            session
+                .storage
+                .recent_message_exists(
+                    &conversation.storage_id(),
+                    &stored.sender_id,
+                    stored.packet_id,
+                    stored.message_id,
+                    &mut session.buffer,
+                )
+                .await
+        })
+        .await;
+    match duplicate {
+        Ok(true) => return SaveResult::Duplicate,
+        Ok(false) => {}
+        Err(_) => defmt::warn!("Could not check recent history for a duplicate"),
+    }
+
     let saved = flash
         .with(async |session| {
             session
@@ -722,18 +732,16 @@ async fn save_message(conversation: ConversationId, stored: &StoredMessage, flas
         })
         .await;
     if saved {
-        let (text, coordinates) = match &stored.kind {
-            MessageKind::Text => (stored.text.as_str(), None),
-            MessageKind::Coords { latitude_microdegrees, longitude_microdegrees } => {
-                ("", Some((*latitude_microdegrees, *longitude_microdegrees)))
-            }
-        };
         notify::receive(
             conversation,
-            crate::ui::contact::preview_text(text, coordinates).as_str(),
+            crate::ui::contact::preview_text(stored.text.as_str(), stored.kind.coordinates())
+                .as_str(),
         );
+        SaveResult::Stored
     } else {
         defmt::warn!("Could not save the received message to flash");
+        notify::storage_full(conversation);
+        SaveResult::Failed
     }
 }
 
@@ -756,16 +764,26 @@ fn decode_coordinates(payload: &[u8]) -> Option<(i32, i32)> {
 }
 
 /// Read the acknowledged message's sender, recipient, and message ID.
-fn decode_ack(payload: &[u8], sender: &[u8; 16], recipient: &[u8; 16]) -> Option<u16> {
+///
+/// `named_sender` is the message sender named first in the payload, and
+/// `named_recipient` the ACK sender named second. On this device the payload
+/// names ourselves first and the peer second, so a forged or misrouted ACK
+/// naming another exchange is rejected here.
+fn decode_ack(payload: &[u8], named_sender: &[u8; 16], named_recipient: &[u8; 16]) -> Option<u32> {
     // Require exactly the three fields that identify one message.
     if payload.len() != ACK_PAYLOAD_SIZE {
         return None;
     }
     // Reject an ACK that names another conversation or another sender.
-    if payload[..16] != *sender || payload[16..32] != *recipient {
+    if payload[..16] != *named_sender || payload[16..32] != *named_recipient {
         return None;
     }
-    Some(u16::from_be_bytes([payload[32], payload[33]]))
+    Some(u32::from_be_bytes([
+        payload[32],
+        payload[33],
+        payload[34],
+        payload[35],
+    ]))
 }
 
 /// Read one nonce-sized slice of a pairing payload.
@@ -779,14 +797,10 @@ fn read_nonce(packet: &PacketData, offset: usize) -> Option<[u8; crypto::NONCE_S
 
 /// Hash the immutable header and payload of one fragment.
 fn fingerprint(packet: &PacketData) -> [u8; 32] {
-    // Exclude the hop limit so a relayed copy still matches.
+    // Exclude the hop limit so a relayed copy still matches. Hashes the two
+    // runs directly to avoid a 254-byte stack copy.
     let header = packet.authenticated_header();
-    let payload = packet.payload.as_slice();
-    let mut bytes = [0; AUTHENTICATED_HEADER_SIZE + MAX_PAYLOAD_SIZE];
-    let header_len = header.len();
-    bytes[..header_len].copy_from_slice(&header);
-    bytes[header_len..header_len + payload.len()].copy_from_slice(payload);
-    crypto::hash(&bytes[..header_len + payload.len()])
+    crypto::hash_parts(&[&header, packet.payload.as_slice()])
 }
 
 /// Decrement the hop limit and queue the packet for relaying.

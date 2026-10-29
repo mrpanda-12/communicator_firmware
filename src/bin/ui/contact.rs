@@ -5,7 +5,8 @@ use heapless::{String, Vec};
 pub use crate::storage::contact::Contact;
 pub use crate::storage::message::ConversationId;
 
-const MAX_CONTACTS: usize = 32;
+/// List capacity; the broadcast conversation occupies one slot.
+pub const MAX_CONTACTS: usize = 32;
 const CONTACT_NAME_CAPACITY: usize = 32;
 /// Characters of the last message shown under a contact row.
 pub const PREVIEW_CHARS: usize = 22;

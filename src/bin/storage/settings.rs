@@ -2,8 +2,8 @@ use sequential_storage::map::{Key, SerializationError};
 
 const MAX_KEY_BYTES: usize = 32;
 
-/// Keys use a one-byte namespace so settings, contacts, and legacy metadata
-/// cannot accidentally alias one another.
+/// Keys carry a one-byte namespace so settings, contacts, and message records
+/// cannot alias one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageKey {
     bytes: [u8; MAX_KEY_BYTES],
@@ -39,22 +39,26 @@ impl StorageKey {
         Self::from_parts(b'n', device_id)
     }
 
-    /// True for the message-record and message-count namespaces, whatever the
-    /// device ID is, so "delete all chats" can enumerate every conversation.
+    pub(crate) fn message_base(device_id: &[u8; 16]) -> Self {
+        Self::from_parts(b'b', device_id)
+    }
+
+    /// True for the record, count, and base namespaces of a conversation,
+    /// whatever the device ID is, so "delete all chats" can enumerate them.
     pub(crate) fn is_conversation_message(&self) -> bool {
-        matches!(self.bytes.first(), Some(b'm' | b'n'))
+        matches!(self.bytes.first(), Some(b'm' | b'n' | b'b'))
     }
 
     fn from_parts(namespace: u8, value: &[u8]) -> Self {
-        // All current callers use values <= 31 bytes. Keep a runtime assertion
-        // here to make a future accidental oversized internal key fail loudly.
-        assert!(value.len() + 1 <= MAX_KEY_BYTES, "storage key is too long");
+        // Clamps the value to the 31-byte key budget; callers that accept
+        // external text validate the length first.
+        let length = value.len().min(MAX_KEY_BYTES - 1);
         let mut bytes = [0; MAX_KEY_BYTES];
         bytes[0] = namespace;
-        bytes[1..value.len() + 1].copy_from_slice(value);
+        bytes[1..length + 1].copy_from_slice(&value[..length]);
         Self {
             bytes,
-            len: (value.len() + 1) as u8,
+            len: (length + 1) as u8,
         }
     }
 }

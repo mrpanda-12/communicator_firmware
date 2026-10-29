@@ -7,7 +7,9 @@ use crate::packet::{
     packet_serializer::PacketSerializer,
 };
 
-pub const QUEUE_CAPACITY: usize = 16;
+/// Deep enough to absorb a burst of fragmented messages next to ACKs and
+/// announcements; entries are 255-byte encoded frames, 32 slots stay a few KiB.
+pub const QUEUE_CAPACITY: usize = 32;
 
 pub type Packet = Vec<u8, MAX_PACKET_SIZE>;
 
@@ -57,7 +59,6 @@ impl RadioQueue {
     pub(crate) fn queued_packet_count(&self) -> usize {
         self.packets.len()
     }
-
 }
 
 impl Default for RadioQueue {

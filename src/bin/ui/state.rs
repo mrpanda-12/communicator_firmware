@@ -6,7 +6,7 @@ use crate::{
     network::types::{DiscoveryList, PairingEvent},
     radio::types::RadioConfig,
     storage::contact::Contact,
-    storage::message::{ConversationId, MessageKind},
+    storage::message::{ConversationId, MessageType},
 };
 
 use super::contact::{ContactBook, PREVIEW_CHARS};
@@ -52,7 +52,7 @@ impl SettingsSection {
 
     pub const fn item_count(self) -> usize {
         match self {
-            Self::Device => 2,
+            Self::Device => 3,
             Self::Frequency => 2,
             Self::Gps => 4,
         }
@@ -61,6 +61,7 @@ impl SettingsSection {
     pub const fn item_label(self, index: usize) -> &'static str {
         match (self, index) {
             (Self::Device, 0) => "DEVICE INFO",
+            (Self::Device, 1) => "PACKET IDS",
             (Self::Device, _) => "RESET IDENTITY",
             (Self::Frequency, 0) => "CURRENT FREQUENCY",
             (Self::Frequency, _) => "CHANGE FREQUENCY",
@@ -74,9 +75,10 @@ impl SettingsSection {
     pub const fn item_description(self, index: usize) -> &'static str {
         match (self, index) {
             (Self::Device, 0) => "Device identity and firmware version.",
-            (Self::Device, _) => "Identity reset is not implemented in this preview.",
+            (Self::Device, 1) => "Last packet and message ID, and space left.",
+            (Self::Device, _) => "ENTER regenerates the identity in flash.",
             (Self::Frequency, 0) => "Shows configured frequency and transmit power.",
-            (Self::Frequency, _) => "Retune this radio; peers must change too.",
+            (Self::Frequency, _) => "Pick a preset; every peer must retune too.",
             (Self::Gps, 0) => "Current fix status is also shown in the top bar.",
             (Self::Gps, 1) => "Coordinates appear here when the receiver has a fix.",
             (Self::Gps, 2) => "The top bar shows GPS time in UTC.",
@@ -152,6 +154,12 @@ pub enum Screen {
         menu_index: usize,
         /// Chat row picked for coordinate navigation; `None` while typing or browsing normally.
         selected_message: Option<usize>,
+        /// Oldest record still retained for this conversation.
+        history_base: u32,
+        /// Absolute record index of the first row in `messages`.
+        history_start: u32,
+        /// Next record ordinal; the exclusive upper bound of the history.
+        history_total: u32,
     },
     Navigation {
         conversation: ConversationId,
@@ -171,6 +179,37 @@ pub enum Screen {
         section: SettingsSection,
         item: usize,
     },
+    /// Identity regeneration requested; shows progress and the result.
+    IdentityReset {
+        status: ResetUiStatus,
+    },
+    /// Pick a preset frequency for the radio worker to retune.
+    FrequencyChange {
+        selected: usize,
+    },
+    /// Outcome of one retune request.
+    FrequencyStatus {
+        status: FrequencyUiStatus,
+    },
+}
+
+/// Frequencies the Change frequency screen offers, in RF order.
+pub const FREQUENCY_PRESETS: [(u32, &str); 2] = [
+    (869_400_000, "869.400 MHZ  SUB-GHZ"),
+    (2_400_000_000, "2400.000 MHZ  2.4 GHZ"),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetUiStatus {
+    Working,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrequencyUiStatus {
+    Queued,
+    Busy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,13 +255,13 @@ pub struct OutgoingMessage {
 }
 
 impl OutgoingMessage {
-    pub fn message_kind(&self) -> MessageKind {
+    pub fn message_type(&self) -> MessageType {
         match &self.body {
-            OutgoingBody::Text(_) => MessageKind::Text,
+            OutgoingBody::Text(_) => MessageType::Text,
             OutgoingBody::Coords {
                 latitude_microdegrees,
                 longitude_microdegrees,
-            } => MessageKind::Coords {
+            } => MessageType::Coords {
                 latitude_microdegrees: *latitude_microdegrees,
                 longitude_microdegrees: *longitude_microdegrees,
             },
@@ -311,28 +350,28 @@ pub struct UiState {
     pending_timezone: Option<i32>,
     pending_announcement: bool,
     pending_pairing: Option<PairingCommand>,
+    /// Regenerate the flash identity when the run loop reaches a storage slot.
+    pending_reset_identity: bool,
+    /// Frequency the user picked for the radio worker to retune.
+    pending_frequency: Option<u32>,
+    pending_history_page: Option<HistoryPageRequest>,
 }
 
-/// The single typed-entry construction site for a fresh chat composer.
-/// The screen a chat entry sets: the warning when a direct chat has no key,
+/// The screen a chat entry opens: the warning when a direct chat has no key,
 /// the chat view itself otherwise.
 fn open_chat_target(device_has_key: bool, kind: ConversationId, from_discovery: bool) -> Screen {
-    if let ConversationId::Direct(device_id) = kind {
-        if !device_has_key {
-            return Screen::UnencryptedDmWarning {
-                device_id,
-                from_discovery,
-            };
-        }
+    if let ConversationId::Direct(device_id) = kind
+        && !device_has_key
+    {
+        return Screen::UnencryptedDmWarning {
+            device_id,
+            from_discovery,
+        };
     }
     chat_screen(kind, false, from_discovery)
 }
 
-fn chat_screen(
-    conversation: ConversationId,
-    unencrypted_dm: bool,
-    from_discovery: bool,
-) -> Screen {
+fn chat_screen(conversation: ConversationId, unencrypted_dm: bool, from_discovery: bool) -> Screen {
     Screen::ChatView {
         conversation,
         unencrypted_dm,
@@ -343,7 +382,19 @@ fn chat_screen(
         menu_open: false,
         menu_index: 0,
         selected_message: None,
+        history_base: 0,
+        history_start: 0,
+        history_total: 0,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryPageRequest {
+    pub conversation: ConversationId,
+    /// `None` loads the latest window; `Some` loads from this record ordinal.
+    pub start: Option<u32>,
+    /// Absolute record ordinal to select once the page is loaded.
+    pub select: Option<u32>,
 }
 
 impl UiState {
@@ -377,6 +428,9 @@ impl UiState {
             pending_timezone: None,
             pending_announcement: false,
             pending_pairing: None,
+            pending_reset_identity: false,
+            pending_frequency: None,
+            pending_history_page: None,
         }
     }
 
@@ -403,9 +457,7 @@ impl UiState {
                 conversation: ConversationId::Broadcast,
                 ..
             } => true,
-            Screen::ChatView {
-                unencrypted_dm, ..
-            } => *unencrypted_dm || encrypted_direct,
+            Screen::ChatView { unencrypted_dm, .. } => *unencrypted_dm || encrypted_direct,
             _ => false,
         };
         // These lookups run before the mutable screen match, because helper
@@ -448,10 +500,9 @@ impl UiState {
                             self.pending_delete_all = true;
                         } else if let Some(kind) = row_kind {
                             let has_key = match kind {
-                                ConversationId::Direct(device_id) => self
-                                    .contacts
-                                    .direct_key(&device_id)
-                                    .is_some(),
+                                ConversationId::Direct(device_id) => {
+                                    self.contacts.direct_key(&device_id).is_some()
+                                }
                                 ConversationId::Broadcast => true,
                             };
                             self.screen = open_chat_target(has_key, kind, false);
@@ -505,10 +556,9 @@ impl UiState {
                     Key::Enter => {
                         if let Some(kind) = contacts_open_kind {
                             let has_key = match kind {
-                                ConversationId::Direct(device_id) => self
-                                    .contacts
-                                    .direct_key(&device_id)
-                                    .is_some(),
+                                ConversationId::Direct(device_id) => {
+                                    self.contacts.direct_key(&device_id).is_some()
+                                }
                                 ConversationId::Broadcast => true,
                             };
                             self.screen = open_chat_target(has_key, kind, false);
@@ -606,11 +656,8 @@ impl UiState {
                 }
                 Key::Back => self.screen = Screen::ChatsList { selected: 0 },
                 Key::Enter => {
-                    self.screen = chat_screen(
-                        ConversationId::Direct(*device_id),
-                        true,
-                        *from_discovery,
-                    );
+                    self.screen =
+                        chat_screen(ConversationId::Direct(*device_id), true, *from_discovery);
                 }
                 _ => {}
             },
@@ -640,7 +687,8 @@ impl UiState {
                 Key::Enter if secret.len() >= 16 => {
                     let status = match self.device_id {
                         Some(my_id) => {
-                            let derived = crypto::derive_pair_key(secret.as_bytes(), &my_id, device_id);
+                            let derived =
+                                crypto::derive_pair_key(secret.as_bytes(), &my_id, device_id);
                             self.pending_pairing = Some(PairingCommand {
                                 peer_id: *device_id,
                                 key: derived,
@@ -686,6 +734,9 @@ impl UiState {
                 menu_open,
                 menu_index,
                 selected_message,
+                history_base,
+                history_start,
+                history_total,
                 ..
             } => {
                 let rows = self.messages.len();
@@ -704,19 +755,41 @@ impl UiState {
                     Key::Right => *cursor = (*cursor + 1).min(input.len()),
                     Key::Up if *menu_open => *menu_index = menu_index.saturating_sub(1),
                     Key::Down if *menu_open => *menu_index = (*menu_index + 1) % 2,
-                    // Browse history rows only while nothing is being typed.
+                    // Browse and page through flash history only while not typing.
                     Key::Up if input.is_empty() && !*menu_open && rows > 0 => {
-                        *selected_message = Some(match *selected_message {
-                            None => rows - 1,
-                            Some(picked) => (picked + rows - 1) % rows,
-                        });
+                        match *selected_message {
+                            None => *selected_message = Some(rows - 1),
+                            Some(picked) if picked > 0 => *selected_message = Some(picked - 1),
+                            Some(_) if *history_start > *history_base => {
+                                self.pending_history_page = Some(HistoryPageRequest {
+                                    conversation: *conversation,
+                                    start: Some(
+                                        history_start.saturating_sub(MAX_CHAT_MESSAGES as u32),
+                                    ),
+                                    select: Some(history_start.saturating_sub(1)),
+                                });
+                            }
+                            _ => {}
+                        }
                     }
                     Key::Down if input.is_empty() && !*menu_open && rows > 0 => {
-                        *selected_message = match *selected_message {
-                            None => Some(0),
-                            Some(picked) if picked + 1 < rows => Some(picked + 1),
-                            Some(_) => None,
-                        };
+                        match *selected_message {
+                            None => *selected_message = Some(0),
+                            Some(picked) if picked + 1 < rows => {
+                                *selected_message = Some(picked + 1);
+                            }
+                            Some(_)
+                                if history_start.saturating_add(rows as u32) < *history_total =>
+                            {
+                                let next = history_start.saturating_add(rows as u32);
+                                self.pending_history_page = Some(HistoryPageRequest {
+                                    conversation: *conversation,
+                                    start: Some(next),
+                                    select: Some(next),
+                                });
+                            }
+                            Some(_) => *selected_message = None,
+                        }
                     }
                     Key::Enter if *menu_open && can_send => {
                         let body = match *menu_index {
@@ -805,26 +878,67 @@ impl UiState {
                         selected: *item,
                     }
                 }
-                Key::Right | Key::Up
-                    if section.is_timezone_item(*item) =>
-                {
+                Key::Enter if *section == SettingsSection::Device && *item == 2 => {
+                    self.pending_reset_identity = true;
+                    self.screen = Screen::IdentityReset {
+                        status: ResetUiStatus::Working,
+                    };
+                }
+                Key::Enter if *section == SettingsSection::Frequency && *item == 1 => {
+                    self.screen = Screen::FrequencyChange { selected: 0 };
+                }
+                Key::Right | Key::Up if section.is_timezone_item(*item) => {
                     self.adjust_timezone_offset(crate::ui::display_settings::TIMEZONE_STEP)
                 }
                 Key::Left | Key::Down if section.is_timezone_item(*item) => {
-                    self.adjust_timezone_offset(crate::ui::display_settings::TIMEZONE_STEP * -1)
+                    self.adjust_timezone_offset(-crate::ui::display_settings::TIMEZONE_STEP)
                 }
                 _ => {}
             },
+            Screen::IdentityReset { .. } => {
+                if key == Key::Back || key == Key::Enter {
+                    self.screen = Screen::SettingsSection {
+                        section: SettingsSection::Device,
+                        selected: 2,
+                    };
+                }
+            }
+            Screen::FrequencyChange { selected } => match key {
+                Key::Back => {
+                    self.screen = Screen::SettingsItem {
+                        section: SettingsSection::Frequency,
+                        item: 1,
+                    }
+                }
+                Key::Up => {
+                    *selected = (*selected + FREQUENCY_PRESETS.len() - 1) % FREQUENCY_PRESETS.len()
+                }
+                Key::Down => *selected = (*selected + 1) % FREQUENCY_PRESETS.len(),
+                Key::Enter => {
+                    self.pending_frequency = Some(FREQUENCY_PRESETS[*selected].0);
+                    self.screen = Screen::FrequencyStatus {
+                        status: FrequencyUiStatus::Queued,
+                    };
+                }
+                _ => {}
+            },
+            Screen::FrequencyStatus { .. } => {
+                if key == Key::Back || key == Key::Enter {
+                    self.screen = Screen::SettingsItem {
+                        section: SettingsSection::Frequency,
+                        item: 1,
+                    };
+                }
+            }
         }
     }
 
     /// Nudge the UTC offset by one step and queue the new value for flash.
     fn adjust_timezone_offset(&mut self, delta_minutes: i32) {
-        let next = (self.timezone_offset_minutes + delta_minutes)
-            .clamp(
-                crate::ui::display_settings::MIN_TIMEZONE_OFFSET,
-                crate::ui::display_settings::MAX_TIMEZONE_OFFSET,
-            );
+        let next = (self.timezone_offset_minutes + delta_minutes).clamp(
+            crate::ui::display_settings::MIN_TIMEZONE_OFFSET,
+            crate::ui::display_settings::MAX_TIMEZONE_OFFSET,
+        );
         if next != self.timezone_offset_minutes {
             self.timezone_offset_minutes = next;
             self.pending_timezone = Some(next);
@@ -868,7 +982,6 @@ impl UiState {
             .and_then(|index| self.contacts.entry(*index))
             .map(|entry| entry.kind)
     }
-
 
     /// Apply one 5x5 keypad key. Two hex digits type one ASCII character, so
     /// a lone digit stays pending until its pair arrives or BACK clears it.
@@ -1006,18 +1119,18 @@ impl UiState {
                 menu_open,
                 selected_message,
                 ..
-            } if input.is_empty() && !*menu_open => {
-                (
-                    *conversation,
-                    *unencrypted_dm,
-                    *from_discovery,
-                    *selected_message,
-                )
-            }
+            } if input.is_empty() && !*menu_open => (
+                *conversation,
+                *unencrypted_dm,
+                *from_discovery,
+                *selected_message,
+            ),
             _ => return false,
         };
         let Some(picked) = picked else { return false };
-        let Some(row) = self.messages.get(picked) else { return false };
+        let Some(row) = self.messages.get(picked) else {
+            return false;
+        };
         let Some((target_latitude_microdegrees, target_longitude_microdegrees)) = row.coordinates
         else {
             return false;
@@ -1055,9 +1168,34 @@ impl UiState {
         }
     }
 
-    /// Replace chat rows wholesale after a flash read.
-    pub fn set_chat_rows(&mut self, rows: Vec<ChatRow, MAX_CHAT_MESSAGES>) {
+    /// Replace the visible history window and its absolute flash position.
+    pub fn set_chat_page(
+        &mut self,
+        rows: Vec<ChatRow, MAX_CHAT_MESSAGES>,
+        base: u32,
+        start: u32,
+        total: u32,
+        selected_message: Option<usize>,
+    ) {
         self.messages = rows;
+        if let Screen::ChatView {
+            history_base,
+            history_start,
+            history_total,
+            selected_message: selected,
+            ..
+        } = &mut self.screen
+        {
+            *history_base = base;
+            *history_start = start;
+            *history_total = total;
+            *selected = selected_message.filter(|index| *index < self.messages.len());
+        }
+    }
+
+    /// Take a request to load an adjacent page of the open conversation.
+    pub fn take_pending_history_page(&mut self) -> Option<HistoryPageRequest> {
+        self.pending_history_page.take()
     }
 
     /// Show one received-message toast over whatever screen is active.
@@ -1095,6 +1233,36 @@ impl UiState {
 
     pub fn take_pending_pairing(&mut self) -> Option<PairingCommand> {
         self.pending_pairing.take()
+    }
+
+    /// The identity reset the run loop still has to execute.
+    pub fn take_pending_reset_identity(&mut self) -> bool {
+        core::mem::replace(&mut self.pending_reset_identity, false)
+    }
+
+    /// The preset the run loop still has to send to the radio worker.
+    pub fn take_pending_frequency(&mut self) -> Option<u32> {
+        self.pending_frequency.take()
+    }
+
+    /// Report the outcome of the requested identity regeneration.
+    pub fn set_identity_reset_status(&mut self, status: ResetUiStatus) {
+        if let Screen::IdentityReset {
+            status: current_status,
+        } = &mut self.screen
+        {
+            *current_status = status;
+        }
+    }
+
+    /// Report the outcome of the requested retune.
+    pub fn set_frequency_status(&mut self, status: FrequencyUiStatus) {
+        if let Screen::FrequencyStatus {
+            status: current_status,
+        } = &mut self.screen
+        {
+            *current_status = status;
+        }
     }
 
     pub fn set_pairing_status(&mut self, device_id: [u8; 16], status: PairingUiStatus) {
@@ -1159,27 +1327,28 @@ pub struct ChatRow {
     pub coordinates: Option<(i32, i32)>,
     /// Already truncated to `ROW_TEXT_CHARS`; empty for a coordinate row.
     pub text: String<ROW_TEXT_CHARS>,
+    /// Broadcast rows name the sending peer; direct rows keep the FROM label.
+    pub sender_label: Option<String<32>>,
 }
 
 impl ChatRow {
     /// Trim one flash record down to the fields the panel draws.
-    pub fn from_stored(message: &crate::storage::message::StoredMessage) -> Self {
+    /// `sender_label` comes from the contact book for broadcast conversations.
+    pub fn from_stored(
+        message: &crate::storage::message::StoredMessage,
+        sender_label: Option<String<32>>,
+    ) -> Self {
         let mut row = Self {
             from_me: message.from_me,
             encrypted: message.encrypted,
             acknowledged: message.acknowledged,
-            coordinates: match &message.kind {
-                MessageKind::Text => None,
-                MessageKind::Coords {
-                    latitude_microdegrees,
-                    longitude_microdegrees,
-                } => Some((*latitude_microdegrees, *longitude_microdegrees)),
-            },
+            coordinates: message.kind.coordinates(),
             text: String::new(),
+            sender_label,
         };
         let source = match &message.kind {
-            MessageKind::Text => message.text.as_str(),
-            MessageKind::Coords { .. } => "[GPS]",
+            MessageType::Text => message.text.as_str(),
+            MessageType::Coords { .. } => "[GPS]",
         };
         let mut preview = String::<PREVIEW_CHARS>::new();
         let _ = preview.push_str(source);

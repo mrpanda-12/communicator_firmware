@@ -42,6 +42,23 @@ pub enum LrFhssBandwidth {
     Khz1574_2 = 0x09,
 }
 
+impl LrFhssBandwidth {
+    pub const fn hz(self) -> u32 {
+        match self {
+            Self::Khz39_06 => 39_060,
+            Self::Khz85_94 => 85_940,
+            Self::Khz136_72 => 136_720,
+            Self::Khz183_59 => 183_590,
+            Self::Khz335_94 => 335_940,
+            Self::Khz386_72 => 386_720,
+            Self::Khz722_66 => 722_660,
+            Self::Khz773_44 => 773_440,
+            Self::Khz1523_4 => 1_523_400,
+            Self::Khz1574_2 => 1_574_200,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LrFhssHeaderCount {

@@ -1,9 +1,10 @@
 use super::FrequencyBand;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
 pub enum LoRaBandwidth {
     Khz62_5 = 62_500,
+    #[default]
     Khz125 = 125_000,
     Khz203 = 203_000,
     Khz250 = 250_000,
@@ -33,11 +34,5 @@ impl LoRaBandwidth {
             (FrequencyBand::Sband, _) => None,
             (_, Self::Khz203 | Self::Khz406 | Self::Khz812) => None,
         }
-    }
-}
-
-impl Default for LoRaBandwidth {
-    fn default() -> Self {
-        Self::Khz125
     }
 }
