@@ -100,13 +100,38 @@ Parts for one keypad: one MCP23017, 24 keys (one cell is unused), 24 × 1N4148-c
 
 ### Per-key diode
 
-Every cell is the switch in series with a diode pointing at the column:
+Every cell is the switch in series with a diode pointing at the column. Here is
+the whole matrix; `>` is the diode with its band (cathode) on the right, so
+current can only flow from the row to the column:
 
 ```text
 row line ────[ switch ]────|>|──── column line
                              ^
                              cathode (band) faces the column
 ```
+
+Every cell of the matrix, with the diode sitting at its column end.
+
+```text
+            C0      C1      C2      C3      C4
+          PA4     PA5     PA6     PA7     PB0
+           |       |       |       |       |
+R0 PA0 - [ 0 ]> - [ 1 ]> - [ 2 ]> - [ 3 ]> - [SEND]>
+           |       |       |       |       |
+R1 PA1 - [ 4 ]> - [ 5 ]> - [ 6 ]> - [ 7 ]> - [BACK]>
+           |       |       |       |       |
+R2 PA2 - [ 8 ]> - [ 9 ]> - [ A ]> - [ B ]> - [ENTER]>
+           |       |       |       |       |
+R3 PA3 - [ C ]> - [ D ]> - [ E ]> - [ F ]> - [HELP]>
+           |       |       |       |       |
+R4 PB1 - [ UP ]>- [DOWN ]>- [LEFT ]>- [RIGHT]>
+                                             (C4/R4 empty)
+```
+
+The five row lines run horizontally and the five column lines vertically, so
+each key bridges one crossing. Solder the keys on the top side and the diodes
+underneath next to their key; a diode fitted backwards blocks its own key and
+leaves the rest working, which is the easy fault to find.
 
 Either series order works along the cell; only the diode direction matters. One diode per key is required: without them, three keys forming a rectangle connect a driven-high column through two switches to the low column, so two column outputs fight each other far beyond the expander's per-pin current rating, and a floating-column design also reports a phantom fourth key. With diodes, current can only flow row → switch → column. The 100 kΩ row pull-up limits current to roughly 33 µA, so a silicon diode drops only about 0.3 V, well below the expander's input-low threshold, and reverse leakage is negligible.
 

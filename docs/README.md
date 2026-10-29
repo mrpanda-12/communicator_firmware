@@ -9,7 +9,7 @@ The executable is `src/bin/main.rs`. It is `no_std`/`no_main`, uses ESP-HAL and 
 - Runs one LR1121 radio worker. The default profile is sub-GHz LoRa at 869.4 MHz, SF9, 125 kHz, coding rate 4/5, private LoRa sync word `0x12`, and configured transmit power 22 dBm.
 - Sends and receives public broadcast text and direct text. Direct traffic is encrypted only when a contact has a saved pairing key and the user has not chosen the unencrypted introduction path.
 - Fragments text according to the active radio's packet-size limit, reassembles bounded incoming messages, and stores complete accepted messages in flash.
-- Pairs contacts from a locally entered shared secret. Paired direct packets use AES-256-GCM; the secret is not transmitted. Contact keys and chat records rely on the chip's flash encryption for protection at rest; see [encryption at rest](at-rest-encryption.md).
+- Pairs contacts from a locally entered shared secret. Paired direct packets use AES-256-GCM; the secret is not transmitted.
 - Sends coordinates from the latest GPS fix, stores received coordinates as chat rows, and can show a simple distance/bearing screen for a selected row.
 - Drives a 320×240 ILI9341 display and an MCP23017 5×5 keypad. The matrix scanner waits on the expander interrupt and debounces presses.
 - Shows UTC from the GPS receiver and can display a fixed, persistent UTC offset next to it.
@@ -34,7 +34,6 @@ The default firmware also queues the diagnostic broadcast text `Hello from the c
 | [Storage and identity](storage-and-identity.md) | Partition bounds, map keys, record lifecycle, identity reset, and flash-write behavior. |
 | [Chat history and navigation](chat-fragmentation-and-navigation.md) | History paging, message indicators, fragmentation limits, and coordinate navigation. |
 | [Board wiring](pinout.md) | Pin assignments, keypad matrix, bring-up, and electrical cautions. |
-| [Encryption at rest](at-rest-encryption.md) | ESP32-S3 flash encryption for identity, contacts, and chat records. |
 
 ## Build and run
 

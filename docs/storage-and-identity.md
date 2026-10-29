@@ -97,7 +97,7 @@ A `Contact` stores the peer's 16-byte device ID, the 32-byte derived pair key, a
 - `display_name()` returns the custom name if set, otherwise the 32-character uppercase hex ID. There is currently no UI to set a custom name, so saved contacts display their hex ID.
 - A blocked contact is dropped on the receive path before any message is processed and is hidden from the lists.
 - Blocking or deleting a contact is written through the contact record and the removal path; an unpaired/unknown peer's block state exists only for the running session.
-- Contact records, including the pair key, are stored as plain map values. Protection at rest comes from the chip's flash encryption, which makes the whole `storage` partition ciphertext outside a running device; see [encryption at rest](at-rest-encryption.md).
+- Contact records, including the pair key, are stored as plain map values. The firmware does not encrypt its flash.
 
 ## Message records
 
@@ -156,7 +156,7 @@ When a valid ACK arrives for an encrypted direct message, `mark_acknowledged` sc
 - Device IDs and conversation keys are not secret; the pairing key is.
 - Contact keys are stored as plain bytes.
 - The entered pairing secret is not stored anywhere, including logs.
-- Chat text and coordinates are written as plaintext record fields even when they arrived encrypted over the air. The packet layer's encryption does not extend to records; flash encryption protects them on a powered-off device.
+- Chat text and coordinates are written as plaintext record fields even when they arrived encrypted over the air. The packet layer's encryption does not extend to records, so anyone with physical access to the flash can read them.
 - Erasing a conversation removes its records through the storage map; it does not guarantee physical erasure of every cell copy on the flash device.
 
 See [messaging](messaging.md) for the end-to-end write/read flow and failure behavior, and [protocol reference](protocol-specification.md) for over-the-air key derivation and framing.
