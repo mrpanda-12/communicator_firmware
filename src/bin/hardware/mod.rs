@@ -1,4 +1,5 @@
 pub mod display;
+pub mod errorscreen;
 pub mod flash;
 pub mod gps;
 pub mod keypad;

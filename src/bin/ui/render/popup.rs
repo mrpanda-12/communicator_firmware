@@ -1,13 +1,10 @@
+use crate::notify::{Popup, PopupType};
 use embedded_graphics::{
     Drawable,
     pixelcolor::Rgb565,
     prelude::{DrawTarget, Point, Primitive, Size},
     primitives::{PrimitiveStyle, Rectangle},
 };
-use heapless::String;
-
-use crate::notify::{Popup, PopupKind};
-use crate::storage::message::ConversationId;
 
 use super::style::{CYAN, WHITE, text};
 
@@ -16,19 +13,23 @@ pub fn draw<D>(display: &mut D, popup: &Popup) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    Rectangle::new(Point::new(90, 36), Size::new(140, 44))
+    Rectangle::new(Point::new(10, 36), Size::new(300, 44))
         .into_styled(PrimitiveStyle::with_fill(super::style::BLUE))
         .draw(display)?;
-    Rectangle::new(Point::new(90, 36), Size::new(140, 44))
+    Rectangle::new(Point::new(10, 36), Size::new(300, 44))
         .into_styled(PrimitiveStyle::with_stroke(super::style::CYAN, 1))
         .draw(display)?;
 
-    let mut title = String::<32>::new();
-    let _ = match (popup.kind, popup.conversation) {
-        (PopupKind::Alert, _) => title.push_str("ALERT"),
-        (PopupKind::NewMessage, ConversationId::Broadcast) => title.push_str("BROADCAST"),
-        (PopupKind::NewMessage, ConversationId::Direct(_)) => title.push_str("NEW MESSAGE"),
-    };
-    text(display, title.as_str(), 100, 44, WHITE, false)?;
-    text(display, popup.text.as_str(), 100, 62, CYAN, false)
+    // Top row: who it came from on the left, the public marker on the right.
+    match popup.popup_type {
+        PopupType::Alert => text(display, "ALERT", 20, 44, WHITE, false)?,
+        PopupType::ContactRequest => text(display, popup.name.as_str(), 20, 44, WHITE, false)?,
+        PopupType::NewMessage => {
+            text(display, popup.name.as_str(), 20, 44, WHITE, false)?;
+            if popup.conversation.is_broadcast() {
+                text(display, "BROADCAST", 246, 44, CYAN, false)?;
+            }
+        }
+    }
+    text(display, popup.text.as_str(), 20, 62, CYAN, false)
 }

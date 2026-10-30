@@ -108,8 +108,13 @@ impl PacketHandler {
             return;
         }
 
-        // Record the sender so the UI can offer it.
-        discovery.remember(packet.from);
+        // Record the sender so the UI can offer it; an announcement also
+        // feeds the active search list.
+        if packet.packet_type == PacketType::DeviceAnnounce {
+            discovery.remember_announce(packet.from);
+        } else {
+            discovery.remember(packet.from);
+        }
         // Log one line per accepted frame.
         log_frame(&packet, broadcast, here);
 
@@ -136,6 +141,11 @@ impl PacketHandler {
                 if !broadcast {
                     return;
                 }
+            }
+            // A direct add-contact request only prompts the user.
+            PacketType::DeviceAnnounceResponse if !broadcast && here => {
+                Self::accept_contact_request(&packet, flash).await;
+                return;
             }
             // Relay everything else further down.
             _ => {}
@@ -301,7 +311,7 @@ impl PacketHandler {
         let stored = StoredMessage::new(
             packet.message_id,
             Direction::Received,
-            0,
+            crate::now_utc_seconds(),
             MessageType::Coords {
                 latitude_microdegrees: latitude,
                 longitude_microdegrees: longitude,
@@ -365,6 +375,25 @@ impl PacketHandler {
             Ok(_) => notify::changed(),
             Err(_) => defmt::warn!("Could not mark the acknowledged message in flash"),
         }
+    }
+
+    /// Show an add-contact request from a peer; nothing is stored or keyed.
+    async fn accept_contact_request(packet: &PacketData, flash: &Flash) {
+        let looked_up = flash
+            .with(async |session| {
+                session
+                    .storage
+                    .load_contact(&packet.from, &mut session.buffer)
+                    .await
+            })
+            .await;
+        // A blocked peer's request is dropped like any other traffic of theirs.
+        if matches!(looked_up, Ok(Some(contact)) if contact.blocked) {
+            defmt::debug!("Dropped contact request from a blocked peer");
+            return;
+        }
+        defmt::info!("Heard an add-contact request");
+        notify::contact_request(packet.from);
     }
 
     /// Advance the pending handshake by one stage, then save the pair key.
@@ -682,7 +711,7 @@ async fn deliver_text(
     let stored = StoredMessage::new(
         first.message_id,
         Direction::Received,
-        0,
+        crate::now_utc_seconds(),
         MessageType::Text,
         text,
         first.packet_id,
@@ -735,11 +764,12 @@ async fn save_message(
         })
         .await;
     if saved {
-        notify::receive(
-            conversation,
-            crate::ui::contact::preview_text(stored.text.as_str(), stored.kind.coordinates())
-                .as_str(),
-        );
+        // A position row shows its marker; message text is cut to one line.
+        let body = match stored.kind.coordinates() {
+            Some(_) => "[GPS]",
+            None => stored.text.as_str(),
+        };
+        notify::receive(conversation, stored.sender_id, body);
         SaveResult::Stored
     } else {
         defmt::warn!("Could not save the received message to flash");

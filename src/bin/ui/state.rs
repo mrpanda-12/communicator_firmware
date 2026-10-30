@@ -116,30 +116,51 @@ pub enum Screen {
         selected: usize,
         from_chats: bool,
     },
-    DeviceSearch {
+    /// Active scan: announces every two seconds and lists the replies.
+    AnnounceDevices {
+        selected: usize,
+    },
+    /// One list of peers heard on the air: active, then passively heard.
+    Devices {
         selected: usize,
     },
     DiscoveredDevice {
         device_id: [u8; 16],
         selected: usize,
+        origin: DeviceOrigin,
     },
     UnencryptedDmWarning {
         device_id: [u8; 16],
         from_discovery: bool,
     },
-    PairingEntry {
+    /// One-line contact name, typed as hex pairs on the keypad.
+    NameEntry {
         device_id: [u8; 16],
+        name: String<32>,
+        cursor: usize,
+        /// High nibble of a keystroke waiting for its second hex digit.
+        pending_hex: Option<u8>,
+        /// The add flow continues to the password step; otherwise it saves.
+        add_flow: bool,
+        from_chats: bool,
+        origin: DeviceOrigin,
+    },
+    /// Shared-secret password for the pairing handshake.
+    SecretEntry {
+        device_id: [u8; 16],
+        name: String<32>,
         secret: String<64>,
         cursor: usize,
         /// High nibble of a keystroke waiting for its second hex digit.
         pending_hex: Option<u8>,
+        /// Return to the contact actions instead of the discovery list.
+        from_manage: bool,
+        /// Device list this password step belongs to.
+        origin: DeviceOrigin,
     },
     PairingStatus {
         device_id: [u8; 16],
         status: PairingUiStatus,
-    },
-    AnnouncementStatus {
-        status: AnnouncementStatus,
     },
     ChatView {
         conversation: ConversationId,
@@ -193,6 +214,22 @@ pub enum Screen {
     },
 }
 
+/// Which device list opened a peer's actions; BACK returns there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceOrigin {
+    Announce,
+    Search,
+    Recent,
+}
+
+/// The list screen one origin returns to, so BACK always has a target.
+pub fn device_list(origin: DeviceOrigin) -> Screen {
+    match origin {
+        DeviceOrigin::Announce => Screen::AnnounceDevices { selected: 0 },
+        DeviceOrigin::Search | DeviceOrigin::Recent => Screen::Devices { selected: 0 },
+    }
+}
+
 /// Frequencies the Change frequency screen offers, in RF order.
 pub const FREQUENCY_PRESETS: [(u32, &str); 2] = [
     (869_400_000, "869.400 MHZ  SUB-GHZ"),
@@ -214,7 +251,6 @@ pub enum FrequencyUiStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnouncementStatus {
-    Sending,
     Queued,
     Failed,
     NoIdentity,
@@ -233,6 +269,13 @@ pub enum PairingUiStatus {
 pub struct PairingCommand {
     pub peer_id: [u8; 16],
     pub key: [u8; KEY_SIZE],
+}
+
+/// A contact name the run loop still has to write to flash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameCommand {
+    pub device_id: [u8; 16],
+    pub name: String<32>,
 }
 
 /// One message the user wants to send from the composer.
@@ -334,6 +377,10 @@ pub struct UiState {
     pub firmware_version: &'static str,
     pub radio_config: RadioConfig,
     pub discovered_devices: DiscoveryList,
+    /// Peers whose own announcement was heard, for the search screen.
+    pub announced_devices: DiscoveryList,
+    /// Peers heard in any other packet, for the passive list.
+    pub passive_devices: DiscoveryList,
     /// Chat rows of the open conversation: flash-backed, refreshed on change.
     pub messages: Vec<ChatRow, MAX_CHAT_MESSAGES>,
     /// Latest received-message toast, drawn over any screen.
@@ -349,7 +396,15 @@ pub struct UiState {
     pending_delete_all: bool,
     pending_timezone: Option<i32>,
     pending_announcement: bool,
+    /// Stop the repeating announce scan when the user leaves the list.
+    cancel_scan: bool,
+    /// Peer to send a plaintext add-contact request to.
+    pending_contact_request: Option<[u8; 16]>,
     pending_pairing: Option<PairingCommand>,
+    /// Contact name submitted but not yet written to flash.
+    pending_rename: Option<RenameCommand>,
+    /// Name to give the contact a running pairing will save.
+    pending_contact_name: String<32>,
     /// Regenerate the flash identity when the run loop reaches a storage slot.
     pending_reset_identity: bool,
     /// Frequency the user picked for the radio worker to retune.
@@ -415,6 +470,8 @@ impl UiState {
             firmware_version,
             radio_config,
             discovered_devices,
+            announced_devices: DiscoveryList::new(),
+            passive_devices: DiscoveryList::new(),
             timezone_offset_minutes,
             messages: Vec::new(),
             popup: None,
@@ -427,7 +484,11 @@ impl UiState {
             pending_delete_all: false,
             pending_timezone: None,
             pending_announcement: false,
+            cancel_scan: false,
+            pending_contact_request: None,
             pending_pairing: None,
+            pending_rename: None,
+            pending_contact_name: String::new(),
             pending_reset_identity: false,
             pending_frequency: None,
             pending_history_page: None,
@@ -523,8 +584,8 @@ impl UiState {
             }
             Screen::ContactsList { selected } => {
                 let indices = self.contacts.visible_indices(true);
-                let nearby_index = indices.len();
-                let scan_index = nearby_index + 1;
+                let add_index = indices.len();
+                let devices_index = add_index + 1;
                 let item_count = indices.len() + 2;
                 match key {
                     Key::Back => self.screen = Screen::MainMenu { selected: 1 },
@@ -546,12 +607,14 @@ impl UiState {
                             };
                         }
                     }
-                    Key::Enter if *selected == nearby_index => {
-                        self.screen = Screen::DeviceSearch { selected: 0 }
-                    }
-                    Key::Enter if *selected == scan_index => {
+                    // ADD DEVICE announces every two seconds and lists replies.
+                    Key::Enter if *selected == add_index => {
                         self.pending_announcement = true;
-                        self.screen = Screen::DeviceSearch { selected: 0 };
+                        self.screen = Screen::AnnounceDevices { selected: 0 };
+                    }
+                    // DEVICES shows active announcements, then passive peers.
+                    Key::Enter if *selected == devices_index => {
+                        self.screen = Screen::Devices { selected: 0 };
                     }
                     Key::Enter => {
                         if let Some(kind) = contacts_open_kind {
@@ -576,11 +639,14 @@ impl UiState {
                     .contacts
                     .entry_by_kind(ConversationId::Direct(*device_id))
                     .is_some();
-                let currently_blocked = self
+                let entry = self
                     .contacts
-                    .entry_by_kind(ConversationId::Direct(*device_id))
-                    .is_some_and(|entry| entry.blocked);
-                let action_count = 2;
+                    .entry_by_kind(ConversationId::Direct(*device_id));
+                let currently_blocked = entry.is_some_and(|entry| entry.blocked);
+                let name = entry
+                    .map(|entry| entry.custom_name.clone())
+                    .unwrap_or_default();
+                let action_count = 5;
                 match key {
                     Key::Back => {
                         self.screen = if *from_chats {
@@ -591,10 +657,43 @@ impl UiState {
                     }
                     Key::Up => *selected = selected.saturating_sub(1),
                     Key::Down => *selected = (*selected + 1) % action_count,
+                    Key::Enter if have_entry && *selected == 0 => {
+                        self.screen = Screen::NameEntry {
+                            device_id: *device_id,
+                            cursor: name.len(),
+                            name,
+                            pending_hex: None,
+                            add_flow: false,
+                            from_chats: *from_chats,
+                            origin: DeviceOrigin::Recent,
+                        };
+                    }
+                    Key::Enter if have_entry && *selected == 1 => {
+                        self.pending_rename = Some(RenameCommand {
+                            device_id: *device_id,
+                            name: String::new(),
+                        });
+                        self.screen = if *from_chats {
+                            Screen::ChatsList { selected: 0 }
+                        } else {
+                            Screen::ContactsList { selected: 0 }
+                        };
+                    }
+                    Key::Enter if have_entry && *selected == 2 => {
+                        self.screen = Screen::SecretEntry {
+                            device_id: *device_id,
+                            name,
+                            secret: String::new(),
+                            cursor: 0,
+                            pending_hex: None,
+                            from_manage: true,
+                            origin: DeviceOrigin::Recent,
+                        };
+                    }
                     Key::Enter if have_entry => {
                         let action = match *selected {
-                            0 => ManageAction::Delete,
-                            _ => ManageAction::Block(!currently_blocked),
+                            3 => ManageAction::Block(!currently_blocked),
+                            _ => ManageAction::Delete,
                         };
                         self.pending_manage = Some(ManageCommand {
                             device_id: *device_id,
@@ -605,10 +704,14 @@ impl UiState {
                     _ => {}
                 }
             }
-            Screen::DeviceSearch { selected } => {
+            Screen::AnnounceDevices { selected } => {
                 let item_count = self.discovered_devices.len().max(1);
                 match key {
-                    Key::Back => self.screen = Screen::ContactsList { selected: 0 },
+                    // BACK is the universal exit: it also stops the repeats.
+                    Key::Back => {
+                        self.cancel_scan = true;
+                        self.screen = Screen::ContactsList { selected: 0 }
+                    }
                     Key::Up => *selected = (*selected + item_count - 1) % item_count,
                     Key::Down => *selected = (*selected + 1) % item_count,
                     Key::Enter => {
@@ -616,6 +719,36 @@ impl UiState {
                             self.screen = Screen::DiscoveredDevice {
                                 device_id: *device_id,
                                 selected: 0,
+                                origin: DeviceOrigin::Announce,
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // One list: active announcements first, then passive traffic.
+            Screen::Devices { selected } => {
+                let active_len = self.announced_devices.len();
+                let item_count = (active_len + self.passive_devices.len()).max(1);
+                match key {
+                    Key::Back => self.screen = Screen::ContactsList { selected: 0 },
+                    Key::Up => *selected = (*selected + item_count - 1) % item_count,
+                    Key::Down => *selected = (*selected + 1) % item_count,
+                    Key::Enter => {
+                        let pick = if *selected < active_len {
+                            self.announced_devices
+                                .get(*selected)
+                                .map(|device_id| (*device_id, DeviceOrigin::Search))
+                        } else {
+                            self.passive_devices
+                                .get(*selected - active_len)
+                                .map(|device_id| (*device_id, DeviceOrigin::Recent))
+                        };
+                        if let Some((device_id, origin)) = pick {
+                            self.screen = Screen::DiscoveredDevice {
+                                device_id,
+                                selected: 0,
+                                origin,
                             };
                         }
                     }
@@ -625,25 +758,31 @@ impl UiState {
             Screen::DiscoveredDevice {
                 device_id,
                 selected,
-            } => match key {
-                Key::Back => self.screen = Screen::DeviceSearch { selected: 0 },
-                Key::Up | Key::Down => *selected = (*selected + 1) % 2,
-                Key::Enter if *selected == 0 => {
-                    self.screen = Screen::UnencryptedDmWarning {
-                        device_id: *device_id,
-                        from_discovery: true,
+                origin,
+            } => {
+                // Both sections can add the peer or ask it to add us back.
+                let item_count = 2;
+                match key {
+                    Key::Back => self.screen = device_list(*origin),
+                    Key::Up | Key::Down => *selected = (*selected + 1) % item_count,
+                    Key::Enter if *selected == 0 => {
+                        self.screen = Screen::NameEntry {
+                            device_id: *device_id,
+                            name: String::new(),
+                            cursor: 0,
+                            pending_hex: None,
+                            add_flow: true,
+                            from_chats: false,
+                            origin: *origin,
+                        }
                     }
-                }
-                Key::Enter => {
-                    self.screen = Screen::PairingEntry {
-                        device_id: *device_id,
-                        secret: String::new(),
-                        cursor: 0,
-                        pending_hex: None,
+                    Key::Enter => {
+                        self.pending_contact_request = Some(*device_id);
+                        self.screen = device_list(*origin);
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Screen::UnencryptedDmWarning {
                 device_id,
                 from_discovery,
@@ -652,6 +791,7 @@ impl UiState {
                     self.screen = Screen::DiscoveredDevice {
                         device_id: *device_id,
                         selected: 0,
+                        origin: DeviceOrigin::Recent,
                     }
                 }
                 Key::Back => self.screen = Screen::ChatsList { selected: 0 },
@@ -661,16 +801,92 @@ impl UiState {
                 }
                 _ => {}
             },
-            Screen::PairingEntry {
+            Screen::NameEntry {
                 device_id,
-                secret,
+                name,
                 cursor,
+                add_flow,
+                from_chats,
+                origin,
                 ..
             } => match key {
                 Key::Back => {
-                    self.screen = Screen::DiscoveredDevice {
+                    self.screen = if *add_flow {
+                        Screen::DiscoveredDevice {
+                            device_id: *device_id,
+                            selected: 0,
+                            origin: *origin,
+                        }
+                    } else {
+                        Screen::ContactManage {
+                            device_id: *device_id,
+                            selected: 0,
+                            from_chats: *from_chats,
+                        }
+                    }
+                }
+                Key::Left => *cursor = cursor.saturating_sub(1),
+                Key::Right => *cursor = (*cursor + 1).min(name.len()),
+                Key::Backspace if *cursor > 0 => {
+                    name.remove(*cursor - 1);
+                    *cursor -= 1;
+                }
+                Key::Character(ch) if ch.is_ascii() && !ch.is_control() => {
+                    if name.push(ch).is_ok() {
+                        *cursor = name.len();
+                    }
+                }
+                Key::Enter if *add_flow => {
+                    self.screen = Screen::SecretEntry {
                         device_id: *device_id,
-                        selected: 1,
+                        name: name.clone(),
+                        secret: String::new(),
+                        cursor: 0,
+                        pending_hex: None,
+                        from_manage: false,
+                        origin: *origin,
+                    };
+                }
+                Key::Enter => {
+                    let from_chats = *from_chats;
+                    self.pending_rename = Some(RenameCommand {
+                        device_id: *device_id,
+                        name: name.clone(),
+                    });
+                    self.screen = if from_chats {
+                        Screen::ChatsList { selected: 0 }
+                    } else {
+                        Screen::ContactsList { selected: 0 }
+                    };
+                }
+                _ => {}
+            },
+            Screen::SecretEntry {
+                device_id,
+                name,
+                secret,
+                cursor,
+                from_manage,
+                origin,
+                ..
+            } => match key {
+                Key::Back => {
+                    self.screen = if *from_manage {
+                        Screen::ContactManage {
+                            device_id: *device_id,
+                            selected: 2,
+                            from_chats: false,
+                        }
+                    } else {
+                        Screen::NameEntry {
+                            device_id: *device_id,
+                            name: name.clone(),
+                            cursor: name.len(),
+                            pending_hex: None,
+                            add_flow: true,
+                            from_chats: false,
+                            origin: *origin,
+                        }
                     }
                 }
                 Key::Left => *cursor = cursor.saturating_sub(1),
@@ -684,7 +900,7 @@ impl UiState {
                         *cursor = secret.len();
                     }
                 }
-                Key::Enter if secret.len() >= 16 => {
+                Key::Enter if !secret.is_empty() => {
                     let status = match self.device_id {
                         Some(my_id) => {
                             let derived =
@@ -693,6 +909,7 @@ impl UiState {
                                 peer_id: *device_id,
                                 key: derived,
                             });
+                            self.pending_contact_name = name.clone();
                             if my_id < *device_id {
                                 PairingUiStatus::Starting
                             } else {
@@ -706,25 +923,25 @@ impl UiState {
                         status,
                     };
                 }
+                // ENTER on an empty password adds the peer without a pair key.
+                Key::Enter if secret.is_empty() => {
+                    self.pending_rename = Some(RenameCommand {
+                        device_id: *device_id,
+                        name: name.clone(),
+                    });
+                    self.contacts.note_unknown(*device_id);
+                    self.contacts.set_name(*device_id, name.as_str());
+                    self.screen = Screen::ContactsList { selected: 0 };
+                }
                 _ => {}
             },
-            Screen::PairingStatus { device_id, status } => match key {
+            Screen::PairingStatus { status, .. } => match key {
                 Key::Back | Key::Enter if *status == PairingUiStatus::Paired => {
                     self.screen = Screen::ChatsList { selected: 0 }
                 }
-                Key::Back | Key::Enter => {
-                    self.screen = Screen::DiscoveredDevice {
-                        device_id: *device_id,
-                        selected: 1,
-                    }
-                }
+                Key::Back | Key::Enter => self.screen = Screen::ContactsList { selected: 0 },
                 _ => {}
             },
-            Screen::AnnouncementStatus { .. } => {
-                if key == Key::Back || key == Key::Enter {
-                    self.screen = Screen::ContactsList { selected: 0 };
-                }
-            }
             Screen::ChatView {
                 conversation,
                 unencrypted_dm,
@@ -747,6 +964,7 @@ impl UiState {
                             self.screen = Screen::DiscoveredDevice {
                                 device_id: *device_id,
                                 selected: 0,
+                                origin: DeviceOrigin::Recent,
                             };
                         }
                     }
@@ -971,13 +1189,13 @@ impl UiState {
 
     /// Number of CHATS rows: every visible contact plus the clear-all row.
     fn chat_rows(&self) -> usize {
-        self.contacts.visible_indices(false).len() + 1
+        self.contacts.chat_indices().len() + 1
     }
 
     /// Conversation of one CHATS row, or `None` for the clear-all row.
     fn chat_row_kind(&self, row: usize) -> Option<ConversationId> {
         self.contacts
-            .visible_indices(false)
+            .chat_indices()
             .get(row)
             .and_then(|index| self.contacts.entry(*index))
             .map(|entry| entry.kind)
@@ -1009,7 +1227,13 @@ impl UiState {
                     cursor,
                     ..
                 } => Self::type_hex_digit(pending_hex, input, cursor, digit),
-                Screen::PairingEntry {
+                Screen::NameEntry {
+                    pending_hex,
+                    name,
+                    cursor,
+                    ..
+                } => Self::type_hex_digit(pending_hex, name, cursor, digit),
+                Screen::SecretEntry {
                     pending_hex,
                     secret,
                     cursor,
@@ -1055,7 +1279,12 @@ impl UiState {
                 cursor,
                 ..
             } => (pending_hex.is_some(), *cursor),
-            Screen::PairingEntry {
+            Screen::NameEntry {
+                pending_hex,
+                cursor,
+                ..
+            } => (pending_hex.is_some(), *cursor),
+            Screen::SecretEntry {
                 pending_hex,
                 cursor,
                 ..
@@ -1068,9 +1297,9 @@ impl UiState {
         let (pending_hex, cursor) = position;
         if pending_hex {
             match &mut self.screen {
-                Screen::ChatView { pending_hex, .. } | Screen::PairingEntry { pending_hex, .. } => {
-                    *pending_hex = None
-                }
+                Screen::ChatView { pending_hex, .. }
+                | Screen::NameEntry { pending_hex, .. }
+                | Screen::SecretEntry { pending_hex, .. } => *pending_hex = None,
                 _ => {}
             }
         } else if cursor > 0 {
@@ -1231,6 +1460,21 @@ impl UiState {
         core::mem::replace(&mut self.pending_announcement, false)
     }
 
+    /// The contact name the run loop still has to persist.
+    pub fn take_pending_rename(&mut self) -> Option<RenameCommand> {
+        self.pending_rename.take()
+    }
+
+    /// True once the user left the scan list and repeats must stop.
+    pub fn take_scan_cancel(&mut self) -> bool {
+        core::mem::replace(&mut self.cancel_scan, false)
+    }
+
+    /// One peer the run loop should send an add-contact request to.
+    pub fn take_contact_request(&mut self) -> Option<[u8; 16]> {
+        self.pending_contact_request.take()
+    }
+
     pub fn take_pending_pairing(&mut self) -> Option<PairingCommand> {
         self.pending_pairing.take()
     }
@@ -1278,16 +1522,25 @@ impl UiState {
 
     pub fn handle_pairing_event(&mut self, event: PairingEvent) {
         if event.succeeded {
+            let name = self.pending_contact_name.clone();
             let contact = Contact {
                 device_id: event.peer_id,
                 key: event.key,
-                custom_name: heapless::String::new(),
+                custom_name: name.clone(),
                 blocked: false,
             };
             self.paired_contact(&contact);
+            // The handshake saves the contact without a name, so write it now.
+            if !name.is_empty() {
+                self.pending_rename = Some(RenameCommand {
+                    device_id: event.peer_id,
+                    name,
+                });
+            }
         } else {
             self.set_pairing_status(event.peer_id, PairingUiStatus::Failed);
         }
+        self.pending_contact_name.clear();
     }
 
     /// Insert or update the contact for a successful pairing.
@@ -1296,12 +1549,6 @@ impl UiState {
         self.discovered_devices
             .retain(|device_id| *device_id != contact.device_id);
         self.set_pairing_status(contact.device_id, PairingUiStatus::Paired);
-    }
-
-    pub fn set_announcement_status(&mut self, status: AnnouncementStatus) {
-        if matches!(self.screen, Screen::AnnouncementStatus { .. }) {
-            self.screen = Screen::AnnouncementStatus { status };
-        }
     }
 }
 

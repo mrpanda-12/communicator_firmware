@@ -15,7 +15,7 @@ use crate::hardware::keypad::KeypadQueue;
 use crate::network::{
     outbox,
     pairing::{PairingCoordinator, build_request_packet},
-    types::{DiscoveryList, PairingEvent},
+    types::{DiscoveryList, DiscoverySnapshot, PairingEvent},
 };
 use crate::notify;
 use crate::packet::{
@@ -36,6 +36,7 @@ use crate::ui::{
     state::{HistoryPageRequest, ManageAction, ManageCommand, OutgoingBody, OutgoingMessage},
 };
 use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::rng::Trng;
 use heapless::Vec as HeaplessVec;
 use state::MAX_CHAT_MESSAGES;
@@ -61,6 +62,11 @@ fn broadcast_sender_label(contacts: &ContactBook, sender: &[u8; 16]) -> heapless
 /// List rows that can have a conversation: every contact slot, including the
 /// broadcast entry that always occupies the first one.
 const MAX_VISIBLE_CONVERSATIONS: usize = contact::MAX_CONTACTS;
+
+/// A scan repeats its announcement at this rate while it is open.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
+/// ...and closes after this long, so a slow-booting peer still hears it.
+const SCAN_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpsSnapshot {
@@ -102,6 +108,33 @@ pub fn gps_snapshot(
     }
 }
 
+impl GpsSnapshot {
+    /// UTC seconds since 2000-01-01 for a record written now, or 0 when the
+    /// receiver has no dated fix. Local only: nothing on the wire changes.
+    pub fn utc_seconds(self) -> u32 {
+        let Some(date) = self.date else { return 0 };
+        if !self.has_time {
+            return 0;
+        }
+        let days = days_from_civil(date.year, date.month, date.day) - 10_957;
+        if days < 0 {
+            return 0;
+        }
+        days as u32 * 86_400 + self.hour as u32 * 3_600 + self.minute as u32 * 60
+    }
+}
+
+/// Days since 1970-01-01 for one proleptic Gregorian date.
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year } as i64;
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = (month as i64 + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// 3/ React to screen events, chat storage, and received-message notifications.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<'a, D>(
@@ -123,7 +156,7 @@ pub async fn run<'a, D>(
     mut discovery: embassy_sync::watch::Receiver<
         'a,
         embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-        DiscoveryList,
+        DiscoverySnapshot,
         1,
     >,
     radio_queue: &'a RadioQueue,
@@ -165,16 +198,29 @@ where
     let mut previous_state = None;
     let mut previous_gps = None;
     let mut synced = None;
+    // Announcement scan schedule: the next repeat and the window's end.
+    let mut next_announce = None;
+    let mut scan_until = None;
 
     loop {
+        // No scan runs outside a window, so this waits forever there.
+        let announce_timer = async move {
+            match next_announce {
+                Some(at) => Timer::at(at).await,
+                None => core::future::pending::<()>().await,
+            }
+        };
         match select(
             select(
                 select(gps.changed(), radio_config.changed()),
                 select(discovery.changed(), pairing_events.changed()),
             ),
             select(
-                select(popups.receive(), changes.changed()),
-                keypad_events.receive(),
+                select(
+                    select(popups.receive(), changes.changed()),
+                    keypad_events.receive(),
+                ),
+                announce_timer,
             ),
         )
         .await
@@ -187,87 +233,73 @@ where
                 state.radio_config = config;
             }
             Either::First(Either::Second(Either::First(devices))) => {
-                state.discovered_devices = filter_unsaved_peers(&state.contacts, devices);
+                state.discovered_devices = filter_unsaved_peers(&state.contacts, devices.heard);
+                state.announced_devices = filter_unsaved_peers(&state.contacts, devices.announced);
+                state.passive_devices =
+                    passive_peers(&state.discovered_devices, &state.announced_devices);
             }
             Either::First(Either::Second(Either::Second(event))) => {
                 if let Some(event) = event {
                     state.handle_pairing_event(event);
                 }
             }
-            Either::Second(Either::First(Either::First(popup))) => {
+            Either::Second(Either::First(Either::First(Either::First(popup)))) => {
                 handle_popup(&mut state, flash, popup).await;
             }
             // A storage-revision bump needs no immediate action; the loop
             // reads notify::revision() below on the next pass.
-            Either::Second(Either::First(Either::Second(_))) => {}
-            Either::Second(Either::Second(key)) => state.handle_keypad(key),
+            Either::Second(Either::First(Either::First(Either::Second(_)))) => {}
+            Either::Second(Either::First(Either::Second(key))) => state.handle_keypad(key),
+            // One due repeat of a running announcement scan.
+            Either::Second(Either::Second(())) => {
+                announce_once(state.device_id, flash, radio_queue).await;
+                let next = Instant::now() + ANNOUNCE_INTERVAL;
+                next_announce = match scan_until {
+                    Some(until) if next < until => Some(next),
+                    _ => {
+                        scan_until = None;
+                        None
+                    }
+                };
+            }
         }
 
         if state.take_pending_announcement() {
-            let status = match state.device_id {
-                Some(device_id) => {
-                    let packet_id = flash.reserve_packet_ids(1).await;
-                    match PacketData::new(
-                        packet_id,
-                        packet_id,
-                        0,
-                        1,
-                        device_id,
-                        [0; 16],
-                        false,
-                        PacketType::DeviceAnnounce,
-                        &[],
-                        DEFAULT_HOP_LIMIT,
-                        DEFAULT_HOP_LIMIT,
-                    ) {
-                        Ok(packet) => match radio_queue.add_packet(&packet) {
-                            Ok(()) => {
-                                defmt::info!("Queued unencrypted device announcement");
-                                AnnouncementStatus::Queued
-                            }
-                            Err(QueueError::Full) => {
-                                defmt::warn!("Could not announce device: TX queue is full");
-                                AnnouncementStatus::Failed
-                            }
-                            Err(QueueError::Packet(_) | QueueError::PacketTooLong { .. }) => {
-                                defmt::warn!("Could not build device announcement packet");
-                                AnnouncementStatus::Failed
-                            }
-                        },
-                        Err(_) => {
-                            defmt::warn!("Could not build device announcement packet");
-                            AnnouncementStatus::Failed
-                        }
-                    }
-                }
-                None => {
-                    defmt::warn!("Could not announce device: device identity unavailable");
-                    AnnouncementStatus::NoIdentity
-                }
-            };
-            state.set_announcement_status(status);
+            // A scan announces now, then repeats until its window closes.
+            let status = announce_once(state.device_id, flash, radio_queue).await;
+            if matches!(status, AnnouncementStatus::Queued) {
+                let now = Instant::now();
+                next_announce = Some(now + ANNOUNCE_INTERVAL);
+                scan_until = Some(now + SCAN_WINDOW);
+            }
+        }
+
+        // The universal BACK leaves the scan list: stop repeating immediately.
+        if state.take_scan_cancel() {
+            next_announce = None;
+            scan_until = None;
+        }
+
+        if let Some(peer_id) = state.take_contact_request() {
+            send_contact_request(state.device_id, peer_id, flash, radio_queue).await;
         }
 
         if let Some(pending) = state.take_pending_pairing() {
             pairing.begin(pending.peer_id, pending.key);
-            if state
+            if let Some(device_id) = state
                 .device_id
-                .is_some_and(|device_id| device_id < pending.peer_id)
+                .filter(|device_id| *device_id < pending.peer_id)
             {
-                let device_id = state.device_id;
                 let packet_id = flash.reserve_packet_ids(1).await;
-                let queued = match build_request_packet(
-                    &pending.key,
-                    packet_id,
-                    device_id.unwrap(),
-                    pending.peer_id,
-                ) {
-                    Some((packet, nonce)) => {
-                        pairing.set_request_nonce(pending.peer_id, nonce);
-                        radio_queue.add_packet(&packet).is_ok()
-                    }
-                    None => false,
-                };
+                let queued =
+                    match build_request_packet(&pending.key, packet_id, device_id, pending.peer_id)
+                    {
+                        Some((packet, nonce)) => {
+                            pairing.set_request_nonce(pending.peer_id, nonce);
+                            radio_queue.add_packet(&packet).is_ok()
+                        }
+                        None => false,
+                    };
                 if queued {
                     state.set_pairing_status(pending.peer_id, PairingUiStatus::RequestSent);
                 } else {
@@ -283,6 +315,38 @@ where
 
         if let Some(manage) = state.take_pending_manage() {
             apply_manage(&mut state, flash, manage).await;
+        }
+
+        if let Some(rename) = state.take_pending_rename() {
+            state
+                .contacts
+                .set_name(rename.device_id, rename.name.as_str());
+            // Only paired contacts have a flash record; unpaired peers live in
+            // the session until they pair.
+            let saved = flash
+                .with(async |session| {
+                    let Some(mut contact) = session
+                        .storage
+                        .load_contact(&rename.device_id, &mut session.buffer)
+                        .await
+                        .ok()
+                        .flatten()
+                    else {
+                        // Unpaired peers have no record; the name stays in RAM.
+                        return true;
+                    };
+                    contact.custom_name.clear();
+                    let _ = contact.custom_name.push_str(rename.name.as_str());
+                    session
+                        .storage
+                        .save_contact(&contact, &mut session.buffer)
+                        .await
+                        .is_ok()
+                })
+                .await;
+            if !saved {
+                defmt::warn!("Could not save the contact name");
+            }
         }
 
         if state.take_pending_reset_identity() {
@@ -367,7 +431,7 @@ where
                 .map(|entry| entry.kind)
                 .collect::<alloc::vec::Vec<_>>();
             for kind in kinds {
-                state.contacts.seed_preview(kind, "", false, false);
+                state.contacts.seed_preview(kind, "", false, false, 0);
             }
             defmt::info!("Deleted all chat history");
         }
@@ -468,11 +532,13 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
         return;
     }
 
+    // Stamp the record from GPS UTC; the chats list sorts and shows this.
+    let timestamp = state.gps_snapshot.utc_seconds();
     // Persist the sent message so a later ACK can turn it green after reboot.
     let stored = StoredMessage::new(
         message_id,
         Direction::Sent,
-        0,
+        timestamp,
         outgoing.message_type(),
         outgoing.text(),
         packet_id,
@@ -494,7 +560,7 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
         let preview = crate::ui::contact::preview_text(outgoing.text(), outgoing.coordinates());
         state
             .contacts
-            .seed_preview(conversation, preview.as_str(), true, false);
+            .seed_preview(conversation, preview.as_str(), true, false, timestamp);
         // The draft is sent and stored; do not leave it in the composer to resend.
         state.clear_chat_input();
     } else {
@@ -536,11 +602,111 @@ fn build_message_packets(
     Some(packets)
 }
 
+/// Queue one plaintext broadcast announcement and report how it went.
+async fn announce_once(
+    device_id: Option<[u8; 16]>,
+    flash: &Flash,
+    radio_queue: &RadioQueue,
+) -> AnnouncementStatus {
+    let Some(device_id) = device_id else {
+        defmt::warn!("Could not announce device: device identity unavailable");
+        return AnnouncementStatus::NoIdentity;
+    };
+    let packet_id = flash.reserve_packet_ids(1).await;
+    let packet = match PacketData::new(
+        packet_id,
+        packet_id,
+        0,
+        1,
+        device_id,
+        [0; 16],
+        false,
+        PacketType::DeviceAnnounce,
+        &[],
+        DEFAULT_HOP_LIMIT,
+        DEFAULT_HOP_LIMIT,
+    ) {
+        Ok(packet) => packet,
+        Err(_) => {
+            defmt::warn!("Could not build device announcement packet");
+            return AnnouncementStatus::Failed;
+        }
+    };
+    match radio_queue.add_packet(&packet) {
+        Ok(()) => {
+            defmt::info!("Queued unencrypted device announcement");
+            AnnouncementStatus::Queued
+        }
+        Err(QueueError::Full) => {
+            defmt::warn!("Could not announce device: TX queue is full");
+            AnnouncementStatus::Failed
+        }
+        Err(QueueError::Packet(_) | QueueError::PacketTooLong { .. }) => {
+            defmt::warn!("Could not build device announcement packet");
+            AnnouncementStatus::Failed
+        }
+    }
+}
+
+/// Send one plaintext add-contact request; it makes no key and pairs nothing.
+async fn send_contact_request(
+    device_id: Option<[u8; 16]>,
+    peer_id: [u8; 16],
+    flash: &Flash,
+    radio_queue: &RadioQueue,
+) {
+    let Some(device_id) = device_id else {
+        defmt::warn!("Could not answer announcement: device identity unavailable");
+        return;
+    };
+    let packet_id = flash.reserve_packet_ids(1).await;
+    let packet = match PacketData::new(
+        packet_id,
+        packet_id,
+        0,
+        1,
+        device_id,
+        peer_id,
+        false,
+        PacketType::DeviceAnnounceResponse,
+        &[],
+        DEFAULT_HOP_LIMIT,
+        DEFAULT_HOP_LIMIT,
+    ) {
+        Ok(packet) => packet,
+        Err(_) => {
+            defmt::warn!("Could not build add-contact request");
+            return;
+        }
+    };
+    match radio_queue.add_packet(&packet) {
+        Ok(()) => defmt::info!("Queued add-contact request"),
+        Err(QueueError::Full) => {
+            defmt::warn!("Could not queue add-contact request: TX queue is full")
+        }
+        Err(QueueError::Packet(_) | QueueError::PacketTooLong { .. }) => {
+            defmt::warn!("Could not queue add-contact request")
+        }
+    }
+}
+
 /// Process one new-message toast: reveal unknown senders in the lists,
 /// refresh the row preview, and show the toast unless the peer is blocked.
-async fn handle_popup(state: &mut UiState, flash: &Flash, popup: notify::Popup) {
+async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Popup) {
     let conversation = popup.conversation;
-    if popup.kind == notify::PopupKind::Alert {
+    if popup.popup_type == notify::PopupType::Alert {
+        state.show_popup(popup);
+        return;
+    }
+    // An add request names the peer and stores nothing.
+    if popup.popup_type == notify::PopupType::ContactRequest {
+        popup.name = match state
+            .contacts
+            .entry_by_kind(ConversationId::Direct(popup.sender))
+        {
+            Some(entry) => entry.name_or_id(),
+            None => crate::ui::contact::hex_id(popup.sender),
+        };
         state.show_popup(popup);
         return;
     }
@@ -554,6 +720,14 @@ async fn handle_popup(state: &mut UiState, flash: &Flash, popup: notify::Popup) 
     if blocked {
         return;
     }
+    // The toast names the sender on the left, falling back to the device ID.
+    popup.name = match state
+        .contacts
+        .entry_by_kind(ConversationId::Direct(popup.sender))
+    {
+        Some(entry) => entry.name_or_id(),
+        None => crate::ui::contact::hex_id(popup.sender),
+    };
     state.show_popup(popup);
 }
 
@@ -662,6 +836,7 @@ async fn load_conversation_page(state: &mut UiState, flash: &Flash, request: His
             preview.as_str(),
             newest.from_me,
             newest.acknowledged,
+            newest.timestamp,
         );
     }
     let selected = request
@@ -695,6 +870,7 @@ async fn seed_preview_conversation(
         preview.as_str(),
         record.from_me,
         record.acknowledged,
+        record.timestamp,
     );
 }
 
@@ -711,6 +887,17 @@ async fn seed_previews(state: &mut UiState, flash: &Flash) {
     for kind in kinds {
         seed_preview_conversation(state, flash, kind).await;
     }
+}
+
+/// Peers heard in traffic other than their own announcement.
+fn passive_peers(heard: &DiscoveryList, announced: &DiscoveryList) -> DiscoveryList {
+    let mut passive = DiscoveryList::new();
+    for device_id in heard {
+        if !announced.contains(device_id) {
+            let _ = passive.push(*device_id);
+        }
+    }
+    passive
 }
 
 fn filter_unsaved_peers(contacts: &ContactBook, devices: DiscoveryList) -> DiscoveryList {

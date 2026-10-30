@@ -65,68 +65,7 @@ where
 }
 
 /// 5/ Show saved contacts, passive nearby peers, and an active discovery scan.
-pub fn draw_contact_manager<D>(
-    display: &mut D,
-    contacts: &ContactBook,
-    selected: usize,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    text(display, "CONTACTS", 12, 38, CYAN, true)?;
-    let indices = contacts.visible_indices(true);
-    for (row, index) in indices.iter().enumerate() {
-        if let Some(entry) = contacts.entry(*index) {
-            draw_row(display, entry.display_name().as_str(), row, selected)?;
-        }
-    }
-    if indices.is_empty() {
-        text(
-            display,
-            "PAIR OR SCAN TO ADD A CONTACT",
-            12,
-            110,
-            MUTED,
-            false,
-        )?;
-    }
-    draw_row(display, "VIEW NEARBY PEERS", indices.len(), selected)?;
-    draw_row(display, "SCAN FOR DEVICES", indices.len() + 1, selected)?;
-    text(display, "ENTER OPEN    RIGHT MANAGE", 8, 218, MUTED, false)
-}
-
 /// 6/ Repaint just the old and new rows in the contact manager.
-pub fn update_contact_manager_selection<D>(
-    display: &mut D,
-    contacts: &ContactBook,
-    previous: usize,
-    selected: usize,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    if previous == selected {
-        return Ok(());
-    }
-    let indices = contacts.visible_indices(true);
-    let label_of = |row: usize| -> Option<String<32>> {
-        indices
-            .get(row)
-            .and_then(|index| contacts.entry(*index))
-            .map(|entry| entry.display_name())
-    };
-    for row in [previous, selected] {
-        if row == indices.len() {
-            draw_row(display, "VIEW NEARBY PEERS", row, selected)?;
-        } else if row == indices.len() + 1 {
-            draw_row(display, "SCAN FOR DEVICES", row, selected)?;
-        } else if let Some(label) = label_of(row) {
-            draw_row(display, label.as_str(), row, selected)?;
-        }
-    }
-    Ok(())
-}
-
 /// 3/ Draw the available entries for one selected Settings category.
 pub fn draw_settings_section<D>(
     display: &mut D,
@@ -183,7 +122,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     text(display, "CHATS", 12, 38, CYAN, true)?;
-    let indices = contacts.visible_indices(false);
+    let indices = contacts.chat_indices();
     for (row, index) in indices.iter().enumerate() {
         if let Some(entry) = contacts.entry(*index) {
             draw_chat_row(display, entry, row, selected)?;
@@ -214,7 +153,7 @@ where
     if previous == selected {
         return Ok(());
     }
-    let indices = contacts.visible_indices(false);
+    let indices = contacts.chat_indices();
     for row in [previous, selected] {
         if row == indices.len() {
             draw_row(display, "DELETE ALL CHATS", row, selected)?;
@@ -257,15 +196,18 @@ where
     let name_color = if entry.is_unknown() { UNKNOWN } else { WHITE };
     text(
         display,
-        entry.display_name().as_str(),
+        entry.name_or_id().as_str(),
         32,
         y,
         name_color,
         false,
     )?;
+    // The newest record's time sits on the right of the name line.
+    let time = time_label(entry.last_activity);
+    text(display, time.as_str(), 276, y, MUTED, false)?;
 
-    // One badge slot: SENDING.. on an unacknowledged message of ours, OK on
-    // the acknowledged one, and nothing on received messages.
+    // One badge slot on the preview line: SENDING.. on an unacknowledged
+    // message of ours, OK on the acknowledged one, nothing when received.
     let has_preview = !entry.preview.is_empty();
     if has_preview {
         text(display, entry.preview.as_str(), 32, y + 11, MUTED, false)?;
@@ -277,8 +219,8 @@ where
                 true => "OK",
                 false => "SENDING..",
             },
-            276,
-            y,
+            250,
+            y + 11,
             if entry.preview_acknowledged {
                 ACK_GREEN
             } else {
@@ -288,6 +230,21 @@ where
         );
     }
     Ok(())
+}
+
+/// `HH:MM` UTC for one stored record, or `--:--` before a GPS date is known.
+fn time_label(timestamp: u32) -> String<8> {
+    let mut label = String::new();
+    if timestamp == 0 {
+        let _ = label.push_str("--:--");
+        return label;
+    }
+    let seconds = timestamp % 86_400;
+    let _ = core::fmt::Write::write_fmt(
+        &mut label,
+        format_args!("{:02}:{:02}", seconds / 3_600, (seconds % 3_600) / 60),
+    );
+    label
 }
 
 fn update_rows<D>(

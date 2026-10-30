@@ -4,14 +4,13 @@ use embedded_graphics::{pixelcolor::Rgb565, prelude::DrawTarget};
 use heapless::String;
 
 use crate::{
-    network::types::DiscoveryList,
     radio::types::RadioConfig,
     ui::state::{
         FREQUENCY_PRESETS, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, SettingsSection,
     },
 };
 
-use super::{
+use crate::ui::render::{
     menu,
     style::{CYAN, MUTED, WARNING, WHITE, text},
 };
@@ -128,107 +127,11 @@ where
     text(display, "CHANGE IS SAVED AT ONCE", 12, 154, MUTED, false)
 }
 
-/// Show the delete and block actions for one contact.
-pub fn draw_contact_manage<D>(
-    display: &mut D,
-    device_id: &[u8; 16],
-    selected: usize,
-    blocked: bool,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    text(display, "MANAGE CONTACT", 12, 38, CYAN, true)?;
-    let mut identity = String::<40>::new();
-    let nothing = format_device_id(device_id);
-    let _ = identity.push_str(nothing.as_str());
-    text(display, identity.as_str(), 12, 72, WHITE, false)?;
-    draw_option(display, "DELETE CHAT + CONTACT", 112, selected == 0)?;
-    draw_option(
-        display,
-        match blocked {
-            true => "UNBLOCK CONTACT",
-            false => "BLOCK CONTACT",
-        },
-        142,
-        selected == 1,
-    )?;
-    text(display, "BACK: BACK TO LIST", 8, 218, MUTED, false)
-}
-
-/// 4/ Display recent sender IDs heard passively in any valid packet.
-pub fn draw_device_search<D>(
-    display: &mut D,
-    discovered: &DiscoveryList,
-    selected: usize,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    text(display, "NEARBY PEERS", 12, 38, CYAN, true)?;
-    text(display, "PASSIVE + SCAN DISCOVERY", 12, 68, MUTED, false)?;
-    if let Some(device_id) = discovered.get(selected) {
-        text(display, "UP/DOWN SELECTS A DEVICE", 12, 94, MUTED, false)?;
-        let identity = format_device_id(device_id);
-        text(display, identity.as_str(), 12, 122, WHITE, false)?;
-        text(display, "ENTER VIEW   BACK CONTACTS", 8, 218, WHITE, false)
-    } else {
-        text(display, "NO PEERS HEARD YET", 12, 112, WHITE, false)?;
-        text(display, "BACK: CONTACTS", 8, 218, WHITE, false)
-    }
-}
-
-/// 5/ Show that a recently heard peer can be messaged without adding it as a contact.
-pub fn draw_discovered_device<D>(
-    display: &mut D,
-    device_id: &[u8; 16],
-    selected: usize,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    text(display, "NEARBY PEER", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
-    text(display, identity.as_str(), 12, 78, WHITE, false)?;
-    draw_option(display, "INTRODUCE (UNENCRYPTED)", 112, selected == 0)?;
-    draw_option(display, "PAIR WITH SECRET", 142, selected == 1)?;
-    text(display, "UP/DOWN SELECT  ENTER OPEN", 8, 218, WHITE, false)
-}
-
-pub fn draw_pairing_entry<D>(
-    display: &mut D,
-    device_id: &[u8; 16],
-    secret: &str,
-    pending_hex: Option<u8>,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    text(display, "PAIR WITH SHARED SECRET", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
-    text(display, identity.as_str(), 12, 72, WHITE, false)?;
-    let mut masked = String::<66>::new();
-    for _ in secret.bytes() {
-        let _ = masked.push('*');
-    }
-    // A half-typed hex pair and the input cursor stay visible while masking.
-    if let Some(digit) = pending_hex {
-        let _ = write!(masked, "{digit:X}");
-    }
-    let _ = masked.push('_');
-    text(display, masked.as_str(), 12, 112, WHITE, false)?;
-    text(display, "USE 16+ RANDOM CHARACTERS", 12, 146, MUTED, false)?;
-    text(
-        display,
-        "LOWER ID STARTS; OTHER WAITS",
-        12,
-        168,
-        MUTED,
-        false,
-    )?;
-    text(display, "ENTER: PAIR   BACK: CANCEL", 8, 218, WHITE, false)
-}
-
+/// Show the name, password, block, and delete actions for one contact.
+/// 4/ Display heard sender IDs, passively or while an announce scan runs.
+/// 5/ Confirm adding one heard peer to the contact list.
+/// One-line contact name; an empty name keeps the device ID.
+/// Shared-secret password for the pairing handshake.
 pub fn draw_pairing_status<D>(
     display: &mut D,
     device_id: &[u8; 16],
@@ -273,42 +176,6 @@ where
     )
 }
 
-/// 7/ Show the outcome of a user-requested broadcast announcement.
-pub fn draw_announcement_status<D>(
-    display: &mut D,
-    status: crate::ui::state::AnnouncementStatus,
-) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    use crate::ui::state::AnnouncementStatus;
-
-    text(display, "DEVICE ANNOUNCEMENT", 12, 38, CYAN, true)?;
-    match status {
-        AnnouncementStatus::Sending => {
-            text(display, "ADDING TO RADIO QUEUE", 12, 92, MUTED, false)?;
-        }
-        AnnouncementStatus::Queued => {
-            text(display, "ANNOUNCEMENT QUEUED", 12, 92, WHITE, false)?;
-            text(
-                display,
-                "LISTENERS CAN SEE YOUR ID",
-                12,
-                114,
-                WARNING,
-                false,
-            )?;
-        }
-        AnnouncementStatus::Failed => {
-            text(display, "RADIO QUEUE IS FULL", 12, 92, WARNING, false)?;
-        }
-        AnnouncementStatus::NoIdentity => {
-            text(display, "DEVICE ID UNAVAILABLE", 12, 92, WARNING, false)?;
-        }
-    }
-    text(display, "ENTER / BACK: CONTACTS", 8, 218, WHITE, false)
-}
-
 /// 6/ Require an explicit acknowledgement before opening an unencrypted DM.
 pub fn draw_unencrypted_dm_warning<D>(display: &mut D, device_id: &[u8; 16]) -> Result<(), D::Error>
 where
@@ -319,7 +186,7 @@ where
         "UNENCRYPTED DM",
         12,
         38,
-        super::style::WARNING,
+        crate::ui::render::style::WARNING,
         true,
     )?;
     let identity = format_device_id(device_id);
@@ -329,7 +196,7 @@ where
         "ANYONE CAN READ THESE MESSAGES",
         12,
         108,
-        super::style::WARNING,
+        crate::ui::render::style::WARNING,
         false,
     )?;
     text(
@@ -337,7 +204,7 @@ where
         "DO NOT SEND PRIVATE DETAILS",
         12,
         128,
-        super::style::WARNING,
+        crate::ui::render::style::WARNING,
         false,
     )?;
     text(display, "ENTER: CONTINUE", 12, 172, WHITE, false)?;

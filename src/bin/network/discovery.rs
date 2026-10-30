@@ -1,34 +1,41 @@
+use crate::network::types::{DiscoveryList, DiscoverySnapshot};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     watch::{Receiver, Watch},
 };
-use heapless::Vec;
 
-use crate::network::types::DiscoveryList;
-
-/// 1/ Keep a bounded list of device IDs heard in accepted packets.
+/// 1/ Keep bounded lists of peers heard on the air, announced or passive.
 pub struct DeviceDiscovery {
-    devices: Watch<CriticalSectionRawMutex, DiscoveryList, 1>,
+    devices: Watch<CriticalSectionRawMutex, DiscoverySnapshot, 1>,
 }
 
 impl DeviceDiscovery {
-    /// 2/ Start with an empty list that the UI can read immediately.
+    /// 2/ Start with empty lists that the UI can read immediately.
     pub const fn new() -> Self {
         Self {
-            devices: Watch::new_with(Vec::new()),
+            devices: Watch::new_with(DiscoverySnapshot::new()),
         }
     }
 
-    /// 3/ Record a heard device and move repeated IDs to the end.
+    /// 3/ Record a peer heard in any accepted packet.
     pub fn remember(&self, device_id: [u8; 16]) {
         let sender = self.devices.sender();
-        let mut devices = sender.try_get().unwrap_or_default();
-        remember_device(&mut devices, device_id);
-        sender.send(devices);
+        let mut snapshot = sender.try_get().unwrap_or_default();
+        remember_device(&mut snapshot.heard, device_id);
+        sender.send(snapshot);
     }
 
-    /// 4/ Give the UI a live view of announced devices.
-    pub fn receiver(&self) -> Option<Receiver<'_, CriticalSectionRawMutex, DiscoveryList, 1>> {
+    /// 3/ Record a peer that announced itself, for the active search list.
+    pub fn remember_announce(&self, device_id: [u8; 16]) {
+        let sender = self.devices.sender();
+        let mut snapshot = sender.try_get().unwrap_or_default();
+        remember_device(&mut snapshot.heard, device_id);
+        remember_device(&mut snapshot.announced, device_id);
+        sender.send(snapshot);
+    }
+
+    /// 4/ Give the UI a live view of both lists.
+    pub fn receiver(&self) -> Option<Receiver<'_, CriticalSectionRawMutex, DiscoverySnapshot, 1>> {
         self.devices.receiver()
     }
 }

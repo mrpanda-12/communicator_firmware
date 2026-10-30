@@ -24,7 +24,7 @@ pub const DEFAULT_HOP_LIMIT: u8 = 3;
 
 /// Allocate packet IDs from one counter shared by all local producers.
 /// A batch reservation keeps fragments of one message consecutive and prevents
-/// the UI, protocol responses, and diagnostic producer from colliding.
+/// the UI, protocol responses, and announcements from colliding.
 static LOCAL_PACKET_ID: AtomicU32 = AtomicU32::new(0);
 /// First ID of the most recent reservation, reported as the last message ID.
 static LAST_MESSAGE_ID: AtomicU32 = AtomicU32::new(0);

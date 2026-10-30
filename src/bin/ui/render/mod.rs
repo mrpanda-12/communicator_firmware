@@ -1,10 +1,10 @@
 mod chat;
 mod help;
-mod menu;
+pub mod menu;
 mod navigation;
 mod popup;
-mod settings;
-mod style;
+pub mod screens;
+pub mod style;
 mod top_bar;
 
 use embedded_graphics::{
@@ -94,7 +94,7 @@ where
         (Screen::ContactsList { selected: old }, Screen::ContactsList { selected })
             if previous.contacts == state.contacts =>
         {
-            menu::update_contact_manager_selection(display, &state.contacts, *old, *selected)
+            screens::contacts::update_selection(display, &state.contacts, *old, *selected)
         }
         (
             Screen::SettingsSection {
@@ -103,7 +103,7 @@ where
             },
             Screen::SettingsSection { section, selected },
         ) if old_section == section => {
-            settings::update_selection(display, *section, *old, *selected)
+            screens::settings::update_selection(display, *section, *old, *selected)
         }
         (Screen::ChatsList { selected: old }, Screen::ChatsList { selected })
             if previous.contacts == state.contacts && previous.messages == state.messages =>
@@ -192,40 +192,68 @@ where
         Screen::MainMenu { selected } => menu::draw_main(display, *selected),
         Screen::ChatsList { selected } => menu::draw_chat_list(display, &state.contacts, *selected),
         Screen::ContactsList { selected } => {
-            menu::draw_contact_manager(display, &state.contacts, *selected)
+            screens::contacts::draw(display, &state.contacts, *selected)
         }
         Screen::ContactManage {
             device_id,
             selected,
             ..
         } => {
-            let blocked = state
+            let entry = state
                 .contacts
-                .entry_by_kind(ConversationId::Direct(*device_id))
-                .is_some_and(|entry| entry.blocked);
-            settings::draw_contact_manage(display, device_id, *selected, blocked)
+                .entry_by_kind(ConversationId::Direct(*device_id));
+            let blocked = entry.is_some_and(|entry| entry.blocked);
+            let has_key = entry.is_some_and(|entry| entry.key.is_some());
+            let name = entry
+                .map(|entry| entry.custom_name.clone())
+                .unwrap_or_default();
+            screens::contacts::draw_manage(
+                display,
+                device_id,
+                *selected,
+                blocked,
+                has_key,
+                name.as_str(),
+            )
         }
-        Screen::DeviceSearch { selected } => {
-            settings::draw_device_search(display, &state.discovered_devices, *selected)
+        Screen::AnnounceDevices { selected } => {
+            screens::announce::draw(display, &state.discovered_devices, *selected)
         }
+        Screen::Devices { selected } => screens::devices::draw(
+            display,
+            &state.announced_devices,
+            &state.passive_devices,
+            *selected,
+        ),
         Screen::DiscoveredDevice {
             device_id,
             selected,
-        } => settings::draw_discovered_device(display, device_id, *selected),
+            ..
+        } => screens::add_contact::draw_confirm(display, device_id, *selected),
         Screen::UnencryptedDmWarning { device_id, .. } => {
-            settings::draw_unencrypted_dm_warning(display, device_id)
+            screens::settings::draw_unencrypted_dm_warning(display, device_id)
         }
-        Screen::PairingEntry {
+        Screen::NameEntry {
             device_id,
+            name,
+            pending_hex,
+            ..
+        } => screens::add_contact::draw_name(display, device_id, name.as_str(), *pending_hex),
+        Screen::SecretEntry {
+            device_id,
+            name,
             secret,
             pending_hex,
             ..
-        } => settings::draw_pairing_entry(display, device_id, secret.as_str(), *pending_hex),
+        } => screens::add_contact::draw_secret(
+            display,
+            device_id,
+            name.as_str(),
+            secret.as_str(),
+            *pending_hex,
+        ),
         Screen::PairingStatus { device_id, status } => {
-            settings::draw_pairing_status(display, device_id, *status)
-        }
-        Screen::AnnouncementStatus { status } => {
-            settings::draw_announcement_status(display, *status)
+            screens::settings::draw_pairing_status(display, device_id, *status)
         }
         Screen::Navigation {
             target_latitude_microdegrees,
@@ -240,9 +268,9 @@ where
         ),
         Screen::Settings { selected } => menu::draw_settings(display, *selected),
         Screen::SettingsSection { section, selected } => {
-            settings::draw(display, *section, *selected)
+            screens::settings::draw(display, *section, *selected)
         }
-        Screen::SettingsItem { section, item } => settings::draw_item(
+        Screen::SettingsItem { section, item } => screens::settings::draw_item(
             display,
             *section,
             *item,
@@ -252,10 +280,14 @@ where
             state.timezone_offset_minutes,
         ),
         Screen::IdentityReset { status } => {
-            settings::draw_identity_reset(display, state.device_id, *status)
+            screens::settings::draw_identity_reset(display, state.device_id, *status)
         }
-        Screen::FrequencyChange { selected } => settings::draw_frequency_change(display, *selected),
-        Screen::FrequencyStatus { status } => settings::draw_frequency_status(display, *status),
+        Screen::FrequencyChange { selected } => {
+            screens::settings::draw_frequency_change(display, *selected)
+        }
+        Screen::FrequencyStatus { status } => {
+            screens::settings::draw_frequency_status(display, *status)
+        }
         Screen::ChatView {
             conversation,
             unencrypted_dm,

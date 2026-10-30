@@ -29,5 +29,5 @@ where
         .reset_pin(reset)
         .orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
         .init(&mut delay)
-        .expect("Failed to initialize ILI9341 display")
+        .unwrap_or_else(|_| crate::fatal("ILI9341 display did not initialize"))
 }

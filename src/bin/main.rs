@@ -21,7 +21,16 @@ static DEVICE_ID: Watch<CriticalSectionRawMutex, Option<[u8; 16]>, 1> = Watch::n
 static RADIO_QUEUE: RadioQueue = RadioQueue::new();
 static RADIO_CONTROL: RadioControl = RadioControl::new();
 
-const FIRMWARE_VERSION: &str = "0.0.8";
+/// UTC seconds for a record written now; zero when no dated GPS fix exists.
+pub fn now_utc_seconds() -> u32 {
+    GPS_SNAPSHOT
+        .sender()
+        .try_get()
+        .map_or(0, |snapshot| snapshot.utc_seconds())
+}
+
+/// Shown in Settings → Device info; the package version is the single source.
+const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RADIO_CONFIG: RadioConfig = RadioConfig {
     frequency_band: FrequencyBand::SubGhz,
     bandwidth: LoRaBandwidth::Khz125,
@@ -32,6 +41,7 @@ const RADIO_CONFIG: RadioConfig = RadioConfig {
 
 use crate::{
     hardware::{
+        errorscreen,
         flash::FlashStore,
         gps::Gps,
         keypad::{KEYPAD_EVENTS, Keypad},
@@ -40,10 +50,6 @@ use crate::{
     },
     network::{
         discovery::DeviceDiscovery, packet_handler::PacketHandler, pairing::PairingCoordinator,
-    },
-    packet::{
-        packet_data::{DEFAULT_HOP_LIMIT, PacketData},
-        packet_type::PacketType,
     },
     radio::{
         control::RadioControl,
@@ -61,6 +67,7 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::{Duration, Timer};
+use embedded_hal::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
 // Keep esp-println's defmt-espflash global logger linked for defmt output.
@@ -108,7 +115,7 @@ fn init_display_spi(
             .with_frequency(Rate::from_mhz(10))
             .with_mode(Mode::_0),
     )
-    .expect("Failed to initialize display SPI3")
+    .unwrap_or_else(|_| fatal("display SPI3 did not initialize"))
     .with_sck(sck)
     .with_mosi(mosi)
 }
@@ -116,7 +123,7 @@ fn init_display_spi(
 /// Open the flash map over the reserved range from the real partition layout.
 fn init_flash_storage(flash: peripherals::FLASH<'static>) -> FlashStore<'static> {
     FlashStore::new(flash, FLASH_DATA_START..FLASH_DATA_END)
-        .expect("Invalid flash data partition range")
+        .unwrap_or_else(|_| fatal("flash data partition range is invalid"))
 }
 
 /// Keep the ADC entropy source alive for every use of the ESP-HAL TRNG.
@@ -125,7 +132,7 @@ fn init_trng(
     adc1: peripherals::ADC1<'static>,
 ) -> (TrngSource<'static>, Trng) {
     let source = TrngSource::new(rng, adc1);
-    let trng = Trng::try_new().expect("Could not initialize ESP-HAL TRNG");
+    let trng = Trng::try_new().unwrap_or_else(|_| fatal("TRNG source did not initialize"));
     (source, trng)
 }
 
@@ -178,7 +185,7 @@ fn init_radio<'q>(
     gpio38: peripherals::GPIO38<'static>,
     radio_queue: &'q RadioQueue,
     radio_control: &'q RadioControl,
-) -> Radio<'static, 'q, Spi<'static, esp_hal::Blocking>> {
+) -> Result<Radio<'static, 'q, Spi<'static, esp_hal::Blocking>>, &'static str> {
     let radio_pins = pinout::radio_pins(gpio40, gpio45, gpio46, gpio42, gpio41, gpio39, gpio38);
 
     let spi = Spi::new(
@@ -187,7 +194,7 @@ fn init_radio<'q>(
             .with_frequency(Rate::from_mhz(1))
             .with_mode(Mode::_0),
     )
-    .expect("Failed to initialize SPI2")
+    .map_err(|_| "radio SPI2 did not initialize")?
     .with_sck(radio_pins.spi_sck)
     .with_mosi(radio_pins.spi_mosi)
     .with_miso(radio_pins.spi_miso);
@@ -199,10 +206,10 @@ fn init_radio<'q>(
         radio_pins.reset,
         radio_pins.irq,
     )
-    .expect("Failed to initialize LR1121");
+    .map_err(|_| "LR1121 radio did not respond")?;
 
     Radio::new(RADIO_CONFIG, lr1121, radio_queue, radio_control)
-        .expect("Failed to configure LR1121")
+        .map_err(|_| "LR1121 rejected its configuration")
 }
 
 /// Open the MCP23017 button expander on I2C0 with its interrupt on GPIO16.
@@ -211,26 +218,26 @@ fn init_keypad(
     sda: peripherals::GPIO17<'static>,
     scl: peripherals::GPIO18<'static>,
     irq: peripherals::GPIO16<'static>,
-) -> Keypad<I2c<'static, esp_hal::Blocking>> {
+) -> Result<Keypad<I2c<'static, esp_hal::Blocking>>, &'static str> {
     let bus = I2c::new(
         i2c0,
         I2cConfig::default().with_frequency(Rate::from_khz(400)),
     )
-    .expect("Failed to initialize keypad I2C")
+    .map_err(|_| "keypad I2C did not initialize")?
     .with_sda(sda)
     .with_scl(scl);
     // INTA is open-drain active-low, so the ESR pull-up sets the idle level.
     let irq = Input::new(irq, InputConfig::default().with_pull(Pull::Up));
-    Keypad::new(bus, irq)
+    Ok(Keypad::new(bus, irq))
 }
 
 fn init_gps(
     uart1: peripherals::UART1<'static>,
     gpio4: peripherals::GPIO4<'static>,
     gpio5: peripherals::GPIO5<'static>,
-) -> Gps<'static> {
+) -> Result<Gps<'static>, &'static str> {
     let gps_pins = pinout::gps_pins(uart1, gpio4, gpio5);
-    Gps::new(gps_pins.uart, gps_pins.rx, gps_pins.tx).expect("Failed to initialize GPS")
+    Gps::new(gps_pins.uart, gps_pins.rx, gps_pins.tx).map_err(|_| "GPS UART did not initialize")
 }
 
 async fn gps_task(mut gps: Gps<'static>) -> ! {
@@ -253,6 +260,19 @@ enum StoppedService<R> {
     Radio(R),
     Gps,
     Keypad,
+}
+
+/// Stop with a named reason when no display exists to draw a fault page on.
+///
+/// Only failures before the panel is up take this path: the flash range, the
+/// TRNG, or the display bus itself. With no screen the reason can only reach
+/// the serial log, but the board still restarts after the same ten seconds a
+/// visible fault page waits.
+pub fn fatal(reason: &str) -> ! {
+    defmt::error!("Boot stopped: {}; rebooting in 10 s", reason);
+    let mut delay = embassy_time::Delay;
+    delay.delay_ms(10_000);
+    esp_hal::system::software_reset()
 }
 
 /// Restart the firmware when a service task stops serving the application.
@@ -342,8 +362,8 @@ async fn main(_spawner: Spawner) -> ! {
     let display_reset = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
     let display_bus = init_display_spi(peripherals.SPI3, peripherals.GPIO12, peripherals.GPIO11);
     let display_spi = ExclusiveDevice::new(display_bus, display_cs, embassy_time::Delay)
-        .expect("Failed to create display SPI device");
-    let display = hardware::display::init(
+        .unwrap_or_else(|_| fatal("display SPI device did not initialize"));
+    let mut display = hardware::display::init(
         display_spi,
         display_dc,
         display_reset,
@@ -360,7 +380,7 @@ async fn main(_spawner: Spawner) -> ! {
             clock_source: timer::LSClockSource::APBClk,
             frequency: Rate::from_khz(20),
         })
-        .expect("Failed to configure display backlight PWM timer");
+        .unwrap_or_else(|_| fatal("backlight PWM timer did not configure"));
     let mut display_backlight =
         ledc.channel::<LowSpeed>(channel::Number::Channel0, peripherals.GPIO7);
     display_backlight
@@ -369,7 +389,7 @@ async fn main(_spawner: Spawner) -> ! {
             duty_pct: display_brightness,
             drive_mode: DriveMode::PushPull,
         })
-        .expect("Failed to configure display backlight PWM channel");
+        .unwrap_or_else(|_| fatal("backlight PWM channel did not configure"));
 
     let discovery = DeviceDiscovery::new();
     let pairing = PairingCoordinator::new();
@@ -384,14 +404,17 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO38,
         &RADIO_QUEUE,
         &RADIO_CONTROL,
-    );
-    let gps = init_gps(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5);
+    )
+    .unwrap_or_else(|reason| errorscreen::show(&mut display, reason));
+    let gps = init_gps(peripherals.UART1, peripherals.GPIO4, peripherals.GPIO5)
+        .unwrap_or_else(|reason| errorscreen::show(&mut display, reason));
     let keypad = init_keypad(
         peripherals.I2C0,
         peripherals.GPIO17,
         peripherals.GPIO18,
         peripherals.GPIO16,
-    );
+    )
+    .unwrap_or_else(|reason| errorscreen::show(&mut display, reason));
 
     // The worker reads the device identity from the shared watch, so an
     // identity reset takes effect without restarting the RX dispatcher.
@@ -409,41 +432,6 @@ async fn main(_spawner: Spawner) -> ! {
             defmt::warn!("Keypad event dropped: UI event queue is full");
         }
     });
-    let test_packet_producer = async {
-        loop {
-            // Read the live identity so the diagnostic follows an identity reset.
-            let Some(device_id) = DEVICE_ID.try_get().flatten().or(device_id) else {
-                defmt::warn!("Skipping test packet: device identity is unavailable");
-                Timer::after(Duration::from_secs(30)).await;
-                continue;
-            };
-            defmt::info!("Device identity: {}", device_id);
-            let packet_id = flash.reserve_packet_ids(1).await;
-            defmt::info!("Packet {:x}", packet_id);
-
-            let packet = PacketData::new(
-                packet_id,
-                packet_id,
-                0,
-                1,
-                device_id,
-                [0; 16],
-                false,
-                PacketType::Text,
-                b"Hello from the communicator",
-                DEFAULT_HOP_LIMIT,
-                DEFAULT_HOP_LIMIT,
-            )
-            .expect("valid test packet");
-
-            if RADIO_QUEUE.add_packet(&packet).is_err() {
-                defmt::warn!("Test packet queue is full; dropping packet");
-            }
-
-            Timer::after(Duration::from_secs(30)).await;
-        }
-    };
-
     // Background services. The console leaf exists only in a debug build, so a
     // production image has no reader task, no polling and no console strings.
     #[cfg(feature = "debug-console")]
@@ -494,6 +482,20 @@ async fn main(_spawner: Spawner) -> ! {
         }
     };
     GPS_SNAPSHOT.sender().send(ui::gps_snapshot(None, None));
+    // Read the shared watches before the display moves into the UI loop, so a
+    // failed subscription can still be shown on the fault page.
+    let pairing_events = pairing.event_receiver().unwrap_or_else(|| {
+        errorscreen::show(&mut display, "pairing event watch has no free receiver")
+    });
+    let discovery_events = discovery
+        .receiver()
+        .unwrap_or_else(|| errorscreen::show(&mut display, "discovery watch has no free receiver"));
+    let radio_config = RADIO_CONTROL.config_receiver().unwrap_or_else(|| {
+        errorscreen::show(&mut display, "radio config watch has no free receiver")
+    });
+    let gps_snapshot = GPS_SNAPSHOT.receiver().unwrap_or_else(|| {
+        errorscreen::show(&mut display, "GPS snapshot watch has no free receiver")
+    });
     let ui_fut = ui::run(
         display,
         device_id,
@@ -504,19 +506,11 @@ async fn main(_spawner: Spawner) -> ! {
         &flash,
         &RADIO_CONTROL,
         &trng,
-        pairing
-            .event_receiver()
-            .expect("Pairing event watch should be initialized"),
-        discovery
-            .receiver()
-            .expect("Discovery watch should be initialized"),
+        pairing_events,
+        discovery_events,
         &RADIO_QUEUE,
-        RADIO_CONTROL
-            .config_receiver()
-            .expect("Radio config watch should be initialized"),
-        GPS_SNAPSHOT
-            .receiver()
-            .expect("GPS snapshot watch should be initialized"),
+        radio_config,
+        gps_snapshot,
         &KEYPAD_EVENTS,
     );
     let services_and_ui_fut = async {
@@ -525,7 +519,7 @@ async fn main(_spawner: Spawner) -> ! {
             Either::Second(never) => match never {},
         }
     };
-    let _ = select(services_and_ui_fut, test_packet_producer).await;
+    let _ = services_and_ui_fut.await;
 
     loop {
         Timer::after(Duration::from_secs(1)).await;

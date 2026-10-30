@@ -25,6 +25,8 @@ pub struct ContactEntry {
     pub preview_from_me: bool,
     /// Whether that last message of ours was acknowledged.
     pub preview_acknowledged: bool,
+    /// UTC seconds of the newest record; 0 when no GPS date was known.
+    pub last_activity: u32,
 }
 
 impl ContactEntry {
@@ -38,6 +40,7 @@ impl ContactEntry {
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
+            last_activity: 0,
         }
     }
 
@@ -52,6 +55,7 @@ impl ContactEntry {
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
+            last_activity: 0,
         }
     }
 
@@ -66,6 +70,7 @@ impl ContactEntry {
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
+            last_activity: 0,
         }
     }
 
@@ -99,6 +104,23 @@ impl ContactEntry {
                     "{security} {:02X}{:02X}...",
                     device_id[0], device_id[1]
                 );
+            }
+        }
+        label
+    }
+
+    /// 3/ Name for a toast: the custom name, else the full device ID.
+    pub fn name_or_id(&self) -> String<CONTACT_NAME_CAPACITY> {
+        let mut label = String::new();
+        match self.kind {
+            ConversationId::Broadcast => {
+                let _ = label.push_str("BROADCAST [PUBLIC]");
+            }
+            ConversationId::Direct(device_id) if self.custom_name.is_empty() => {
+                label = hex_id(device_id);
+            }
+            ConversationId::Direct(_) => {
+                let _ = label.push_str(self.custom_name.as_str());
             }
         }
         label
@@ -207,6 +229,18 @@ impl ContactBook {
             .map_err(|_| ContactBookError::Full)
     }
 
+    /// Replace one entry's label; an empty name falls back to the device ID.
+    pub fn set_name(&mut self, device_id: [u8; 16], name: &str) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == ConversationId::Direct(device_id))
+        {
+            entry.custom_name.clear();
+            let _ = entry.custom_name.push_str(name);
+        }
+    }
+
     /// Register an unpaired sender so it shows up in the chats list.
     /// Returns `false` when an entry for this device already exists.
     pub fn note_unknown(&mut self, device_id: [u8; 16]) -> bool {
@@ -223,6 +257,7 @@ impl ContactBook {
         preview: &str,
         from_me: bool,
         acknowledged: bool,
+        timestamp: u32,
     ) {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.kind == kind) else {
             return;
@@ -231,6 +266,26 @@ impl ContactBook {
         let _ = entry.preview.push_str(preview);
         entry.preview_from_me = from_me;
         entry.preview_acknowledged = acknowledged;
+        entry.last_activity = timestamp;
+    }
+
+    /// Chat row order: the conversation with the newest record first. Equal
+    /// timestamps keep the book's order, so rows only move on a new message.
+    pub fn chat_indices(&self) -> Vec<usize, MAX_CONTACTS> {
+        let mut order = self.visible_indices(false);
+        for position in 1..order.len() {
+            let mut index = position;
+            while index > 0 {
+                let previous = self.entries[order[index - 1]].last_activity;
+                let current = self.entries[order[index]].last_activity;
+                if previous >= current {
+                    break;
+                }
+                order.swap(index - 1, index);
+                index -= 1;
+            }
+        }
+        order
     }
 
     /// 4/ A blocked peer is hidden everywhere until it is unblocked again.
@@ -262,6 +317,15 @@ impl Default for ContactBook {
     }
 }
 
+/// Full uppercase hex ID, used when a peer has no saved name.
+pub fn hex_id(device_id: [u8; 16]) -> String<CONTACT_NAME_CAPACITY> {
+    let mut label = String::new();
+    for byte in device_id {
+        let _ = write!(label, "{byte:02X}");
+    }
+    label
+}
+
 /// Cut one preview line for a message body.
 pub fn preview_text(text: &str, coordinates: Option<(i32, i32)>) -> String<PREVIEW_BYTES> {
     let mut preview = String::new();
@@ -270,10 +334,20 @@ pub fn preview_text(text: &str, coordinates: Option<(i32, i32)>) -> String<PREVI
             let _ = preview.push_str("[GPS]");
         }
         None => {
-            for character in text.chars().take(PREVIEW_CHARS) {
+            // A cut line ends in `..`, so the row shows text was dropped.
+            let total = text.chars().count();
+            let visible = if total > PREVIEW_CHARS {
+                PREVIEW_CHARS - 2
+            } else {
+                PREVIEW_CHARS
+            };
+            for character in text.chars().take(visible) {
                 if preview.push(character).is_err() {
                     break;
                 }
+            }
+            if total > PREVIEW_CHARS {
+                let _ = preview.push_str("..");
             }
         }
     }
