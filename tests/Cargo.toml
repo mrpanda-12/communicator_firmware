@@ -1,11 +1,11 @@
 [package]
-name = "communicator-host-tests"
+name = "communicator-tests"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Host-only harness: the real crate targets xtensa-esp32s3, so this crate
-# re-includes its hardware-independent modules and tests them on x86_64.
+# The real crate targets xtensa-esp32s3, so this crate re-includes its
+# hardware-independent modules and tests them on x86_64.
 [dependencies]
 heapless = "0.9.3"
 sequential-storage = { version = "8.0.2", default-features = false }

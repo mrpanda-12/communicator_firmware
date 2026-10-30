@@ -1,12 +1,12 @@
-//! Host-side test harness for the firmware's hardware-independent modules.
+//! Tests for the firmware's hardware-independent modules.
 //!
 //! The firmware crate is `#![no_std]` and targets `xtensa-esp32s3`, so its
 //! `#[cfg(test)]` code cannot run here. This crate pulls the pure modules out
 //! of `src/bin` with `#[path]` so the protocol, storage encoding, radio config,
 //! contact book, notification queue, outbox, date math, and hex formatting can
-//! be tested on the host.
+//! be tested here.
 //!
-//! Run with `cargo test` inside `host-tests/`.
+//! Run with `cargo test` inside `tests/`.
 
 pub mod network;
 pub mod packet;
@@ -41,8 +41,8 @@ struct TestLogger;
 
 unsafe impl defmt::Logger for TestLogger {
     fn acquire() {}
-    unsafe fn release() {}
     unsafe fn flush() {}
+    unsafe fn release() {}
     unsafe fn write(_bytes: &[u8]) {}
 }
 

@@ -94,7 +94,7 @@ Received messages use `notify::message_received`: one bounded popup is queued an
 | `ui/state.rs` | Screens, input behavior, commands, history-page selection, display-ready rows. |
 | `ui/render/` | TFT drawing by page and widget. |
 | `calendar.rs`, `hex.rs` | Shared civil-date conversion and device-ID formatting. |
-| `host-tests/` | Host-side test crate that re-includes the modules above via `#[path]`. |
+| `tests/` | Test crate that re-includes the modules above via `#[path]`. |
 
 ## Design boundaries and current limitations
 
@@ -104,6 +104,6 @@ Received messages use `notify::message_received`: one bounded popup is queued an
 - The outbox retransmits a whole direct message; there is no per-fragment resend. If a fragment is lost, the receiver does not deliver the incomplete message, so the sender's retry sends the complete set again.
 - `DeviceAnnounceResponse` is user-facing only as the ASK TO ADD request: plaintext, empty payload, nothing stored on receipt. `Heading` and `FrequencyChange` exist in the packet enum but have no sender or handler, and local frequency selection does not coordinate peers.
 - Discovery IDs and unpaired plaintext introductions are unauthenticated. Contact pair keys are stored as serialized key bytes, not encrypted at rest.
-- Automated tests run on the host from `host-tests/` (`cd host-tests && cargo test`) and cover the packet, storage, radio-type, calendar, contact, notification, and outbox modules.
+- Automated tests are in `tests/` (`cd tests && cargo test`) and cover the packet, storage, radio-type, calendar, contact, notification, and outbox modules.
 
 Wire and cryptographic details are in [protocol reference](protocol-specification.md), worker operation in [radio guide](packets-and-radio.md), and persistence in [storage guide](storage-and-identity.md).

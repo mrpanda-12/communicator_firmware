@@ -63,12 +63,12 @@ cargo run --release --features debug-console
 
 Without the feature the module is not compiled at all: no reader task, no USB peripheral setup, and no console strings in the image. Resetting the IDs makes the next packets reuse IDs peers may still remember, so duplicates are dropped after a reset; the feature exists for test setups, not for the UI.
 
-### Host tests
+### Tests
 
-`host-tests/` is a separate crate that re-includes the hardware-independent modules from `src/bin` with `#[path]` and stubs the chip-specific parts.
+`tests/` is a separate crate that re-includes the hardware-independent modules from `src/bin` with `#[path]` and stubs the chip-specific parts.
 
 ```sh
-cd host-tests
+cd tests
 cargo test
 ```
 

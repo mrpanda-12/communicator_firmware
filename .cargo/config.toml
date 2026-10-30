@@ -5,7 +5,7 @@ include = ["esp-config.toml"]
 runner = "espflash flash --monitor --chip esp32s3 --partition-table partitions.csv --log-format defmt"
 
 # Bare-metal firmware needs no C runtime startup files. Kept target-scoped so
-# host builds (host-tests/) still link against the normal glibc startup.
+# test builds (tests/) still link against the normal glibc startup.
 rustflags = [
   "-C", "link-arg=-nostartfiles",
 ]
