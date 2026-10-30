@@ -75,7 +75,7 @@ Queueing an ACK can fail when the TX FIFO is full. Received ACKs cancel the matc
 
 The pairing coordinator permits one pending handshake. The devices derive the same pair key locally from a shared secret and sorted public IDs. The lower ID starts with `Request`; the higher ID authenticates it and responds with `Challenge`; the lower ID verifies the challenge and sends `Finish`; the higher ID verifies the final proof. Request/response nonces bind the exchange. The endpoint handling the final proof persists the `Contact` and publishes a success event; the other endpoint saves the contact when it verifies the corresponding stage. Failures terminate the pending operation and report to the UI.
 
-Pairing frame construction and verification live in `network/pairing.rs`; stage dispatch and contact persistence occur in `advance_pairing`. See [protocol reference](protocol-specification.md#pairing).
+Pairing frame construction and verification live in `network/pairing.rs`; stage dispatch and contact persistence occur in `advance_pairing`. The pairing frames are specified in [protocol reference](protocol-specification.md#pairing).
 
 ## Relaying
 

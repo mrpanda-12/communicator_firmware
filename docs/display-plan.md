@@ -60,7 +60,7 @@ The ACK reports that the receiver accepted and persisted the complete direct mes
 
 ### Coordinates and navigation
 
-A received coordinate is shown as a selectable `GPS` row. Enter opens a simple navigation page with target coordinate, approximate great-circle distance, absolute bearing, and—after enough local movement—an estimated left/right/straight correction. The course comes from successive GPS fixes after at least five metres of movement; it is not a compass heading. With no local fix, the screen waits. See [chat history and navigation](chat-fragmentation-and-navigation.md) for limitations.
+A received coordinate is shown as a selectable `GPS` row. Enter opens a simple navigation page with target coordinate, approximate great-circle distance, absolute bearing, and—after enough local movement—an estimated left/right/straight correction. The course comes from successive GPS fixes after at least five metres of movement; it is not a compass heading. With no local fix, the screen waits. Limitations are in [chat history and navigation](chat-fragmentation-and-navigation.md).
 
 ## Settings
 
@@ -102,4 +102,4 @@ If the radio, GPS, keypad, or a shared watch cannot initialize, the firmware dra
 | History paging | Read one four-record page by indexed storage ordinal. |
 | UTC offset | Persist the value; display applies it to GPS UTC. |
 
-For end-to-end message details and failure behavior see [messaging](messaging.md); for the actual GPIO/I2C matrix wiring see [pinout](pinout.md).
+End-to-end message details and failure behavior are in [messaging](messaging.md); GPIO/I2C matrix wiring is in [pinout](pinout.md).

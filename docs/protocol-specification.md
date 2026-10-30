@@ -50,7 +50,7 @@ The `packet_id` and `message_id` fields are 32-bit. Locally generated packets ta
 
 Every reservation writes the advanced counter to flash before any of its IDs can reach the air, then hands out the range. A reboot therefore resumes at the first unused ID: an ID that was sent is never replayed, and only a reservation interrupted before it was queued is skipped. Holding the flash session for the whole reserve-and-write keeps concurrent producers from claiming the same range. The counter wraps after 4,294,967,296 reservations. The settings screen's PACKET IDS page shows the last assigned packet and message ID, the next ID, and the percentage of the 32-bit space left.
 
-A `debug-console` build (see below) can reset the counter to zero over the cable for test setups.
+A `debug-console` build (described below) can reset the counter to zero over the cable for test setups.
 
 `message_id` is used to correlate a whole logical message and to identify an ACK target. It is not an encryption nonce: AES-GCM has its own random 12-byte nonce per encrypted packet.
 
@@ -163,7 +163,7 @@ Flow:
 
 The pending handshake is a single slot in `PairingCoordinator`; a new attempt replaces it. Frames are unicast and require the destination ID to match. A failed verification ends the attempt without saving a contact. After identity reset, the ID changes and pairing must be repeated.
 
-Public device IDs are exchanged in headers throughout discovery and pairing. Pairing does not provide forward secrecy: the derived key is static for the ID pair and secret, and flash stores it as key bytes. Treat physical access to the device and flash contents as inside the threat model you are defending against.
+Public device IDs are exchanged in headers throughout discovery and pairing. Pairing does not provide forward secrecy: the derived key is static for the ID pair and secret, and flash stores it as key bytes. Physical access to the device and its flash contents is inside the threat model.
 
 ## Forwarding and hop limits
 

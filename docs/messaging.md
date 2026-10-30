@@ -77,7 +77,7 @@ Normal message history uses append-style map entries. One outgoing chat record i
 
 Settings and contacts are replaced through the map API. Identity reset writes one new identity. The RX path does read a peer contact record for direct packets; that is a flash read, not a flash write. Repeated storage failures are surfaced in logs, but most message-send failures are not currently presented in a dedicated on-screen error state.
 
-`Flash::with` protects the map and its shared 640-byte work buffer with one mutex. Keep the operation scoped; do not hold the guard across unrelated work. See [storage and identity](storage-and-identity.md) for partition layout and record encoding.
+`Flash::with` protects the map and its shared 640-byte work buffer with one mutex, held only for the operation it guards. Partition layout and record encoding are in [storage and identity](storage-and-identity.md).
 
 ## Opening and paging chat history
 

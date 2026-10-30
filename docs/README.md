@@ -23,7 +23,7 @@ The firmware transmits nothing on its own. The only unsolicited packet is the pl
 
 ## Documentation map
 
-| Guide | Read it for |
+| Guide | Contents |
 | --- | --- |
 | [Architecture and runtime](architecture.md) | Startup sequence, task ownership, and how events cross subsystem boundaries. |
 | [User interface](display-plan.md) | Screen behavior, keypad mapping, settings, and scrolling chat history. |
@@ -37,7 +37,7 @@ The firmware transmits nothing on its own. The only unsolicited packet is the pl
 
 ## Build and run
 
-The repository config selects `xtensa-esp32s3-none-elf` in `.cargo/config.toml` and uses unstable `build-std` support. Install the Espressif Rust toolchain with `espup`, source its environment export, and install `espflash` before building. The exact export-script path depends on the local installation.
+The repository config selects `xtensa-esp32s3-none-elf` in `.cargo/config.toml` and uses unstable `build-std` support. Building needs the Espressif Rust toolchain installed with `espup`, its environment export, and `espflash`. The export-script path depends on the local installation.
 
 ```sh
 source /path/to/export-esp.sh
@@ -50,7 +50,7 @@ Compiling requires the Xtensa linker, which the espup environment provides; `bui
 
 ### Debug console
 
-`--features debug-console` adds a reader task on the USB-serial/JTAG port for developer commands. Type a line in the `espflash monitor` window and press Enter:
+`--features debug-console` adds a reader task on the USB-serial/JTAG port for developer commands. Command lines are entered in the `espflash monitor` window:
 
 | Line | Effect |
 | --- | --- |
@@ -61,35 +61,44 @@ Compiling requires the Xtensa linker, which the espup environment provides; `bui
 cargo run --release --features debug-console
 ```
 
-Without the feature the module is not compiled at all: no reader task, no USB peripheral setup, and no console strings in the image. Resetting the IDs means the next packets reuse IDs peers may still remember, so expect duplicates to be dropped after a reset; it exists for test setups, not for the UI.
+Without the feature the module is not compiled at all: no reader task, no USB peripheral setup, and no console strings in the image. Resetting the IDs makes the next packets reuse IDs peers may still remember, so duplicates are dropped after a reset; the feature exists for test setups, not for the UI.
 
-`cargo test` does not build for this target: the Xtensa `no_std` toolchain has no `test` crate, so a test build stops at `error[E0463]: can't find crate for 'test'`. The `#[cfg(test)]` module in `ui/render/top_bar.rs` therefore never runs; it is kept only as a written description of the expected calendar arithmetic. No automated test covers the firmware, and verification is a two-board run. Do not treat formatting or a successful compile as evidence of RF, display, GPS, flash-endurance, or keypad operation.
+### Host tests
+
+`host-tests/` is a separate crate that re-includes the hardware-independent modules from `src/bin` with `#[path]` and stubs the chip-specific parts.
+
+```sh
+cd host-tests
+cargo test
+```
+
+The crate builds for `x86_64-unknown-linux-gnu` through its own `.cargo/config.toml`, so no toolchain export is needed. Covered modules: calendar, hex, packet framing and codec, fragmentation and reassembly, storage keys and records, radio configuration, navigation, contact book, notifications, and the outbox.
 
 ## First boot and radio pairing
 
-1. Confirm that the flashed partition table contains the `storage` data region at `0x210000` with size `0x1f0000`. The firmware opens the absolute range `0x210000..0x400000`; writes can erase pages inside it.
+1. The flashed partition table must contain the `storage` data region at `0x210000` with size `0x1f0000`. The firmware opens the absolute range `0x210000..0x400000`; writes can erase pages inside it.
 2. On first boot, the firmware creates a 16-byte device ID using the ESP hardware TRNG and saves it. If flash or the entropy source fails, identity-dependent traffic is unavailable.
-3. Put two compatible boards on the same supported profile. A receiver must use the same modulation parameters and sync word as the sender. The current default config is sub-GHz LoRa; a local settings retune does not inform the other board.
-4. Let each board hear a packet or use the contacts screen's scan action to send a `DeviceAnnounce`. Discovery is passive: this firmware does not reply with its identity automatically.
-5. Pair on both ends by entering the same strong secret. The keypad enters two hex digits per ASCII character. A minimum length is enforced in the UI, but the code does not make a low-entropy secret safe from offline guessing.
-6. Send a direct message. It is encrypted when the pair key is saved. The receiver stores it before producing an authenticated ACK. The sender's encrypted direct row changes from “SENDING..” to the acknowledged state only after that ACK is received and recorded.
+3. Two boards exchange traffic only when both use the same modulation parameters and sync word. The current default config is sub-GHz LoRa; a local settings retune does not inform the other board.
+4. Discovery is passive: a board enters the peer list after one of its own packets is heard, or after the contacts screen's scan action sends a `DeviceAnnounce`. This firmware does not reply with its identity automatically.
+5. Pairing needs the same strong secret on both ends. The keypad enters two hex digits per ASCII character. A minimum length is enforced in the UI, but the code cannot make a low-entropy secret resist offline guessing.
+6. A direct message is encrypted when the pair key is saved. The receiver stores it before producing an authenticated ACK. The sender's encrypted direct row changes from “SENDING..” to the acknowledged state only after that ACK is received and recorded.
 
-Broadcast traffic and explicitly selected unpaired introductions are plaintext. Do not use those paths for private content.
+Broadcast traffic and explicitly selected unpaired introductions are plaintext and carry no confidentiality.
 
 ## Important limits
 
 - The wire `packet_id` and `message_id` fields are 32-bit values. Local packet IDs come from one flash-persisted counter shared by the UI, radio receive responses, pairing packets, and announcements; it wraps only after 4,294,967,296 reservations. Each reservation persists the advanced counter before using it, so a power loss skips at most one interrupted reservation and never replays a sent ID. The settings screen's PACKET IDS page shows the last packet and message ID, the next ID, and the remaining percentage.
-- Protocol version 2 is not backward compatible: both boards must run firmware that uses the 47-byte header. A board running version 1 rejects version 2 frames, and the reverse is also true. Chat records written by version 1 firmware use the narrower ID layout and cannot be read by this firmware; delete the old conversations from the settings screens after upgrading.
+- Protocol version 2 is not backward compatible: both boards must run firmware that uses the 47-byte header. A board running version 1 rejects version 2 frames, and the reverse is also true. Chat records written by version 1 firmware use the narrower ID layout and cannot be read by this firmware; old conversations are deleted from the settings screens after upgrading.
 - The TX queue holds 32 encoded packets. The outbox keeps two messages for delivery; a third message is refused on screen and stays in the composer. The outbox is not persisted, so a reboot cancels pending retries.
 - A direct message is retransmitted after 20 s while the peer has not acknowledged it, up to three transmissions in total. A retry reuses the original encoded fragments, so the receiver's duplicate cache suppresses a second stored row. Broadcast and plaintext sends are not retried.
 - RX duplicate state and incomplete-fragment assemblies are RAM-only. The receiver retains at most 128 seen IDs, 128 accepted ACK records, and four incomplete messages. Before appending a received record, the newest eight records of that conversation are checked, so a retransmit after a reboot does not create a duplicate row.
 - Each conversation keeps at most 128 records; the oldest record is deleted when the next one is appended. Chat screens page through stored history, four records at a time.
 - The duty-cycle limiter accounts per RF band over a one-hour window at 10 %. A fresh boot starts with 6 s of credit and accrues 0.1 s per second, capped at 360 s.
-- The firmware's code supports LoRa receive on sub-GHz and 2.4 GHz profiles. S-band LR-FHSS is transmit-only in this radio implementation. The current board antenna/front-end suitability must be checked before changing bands.
+- The firmware's code supports LoRa receive on sub-GHz and 2.4 GHz profiles. S-band LR-FHSS is transmit-only in this radio implementation. Antenna and front-end suitability determine whether a band is usable.
 - Identity reset replaces the device ID but retains local contact and history records. Other devices must pair again to the new ID; the local contact book is not automatically migrated.
 - There is no OTA update and no second application slot: changing firmware means flashing over USB-serial/JTAG. The `storage` data partition occupies the flash an update slot would need, so an update path would cost either stored history or partition geometry.
 - Failure to initialize the radio, GPS, keypad, or a shared watch is not recoverable on this board, but it is visible: the firmware shows a startup error screen with the reason, counts down ten seconds, and reboots. Failures that happen before the display exists (flash range, TRNG, display bus or panel) can only be logged as `Boot stopped: <reason>`, and the board reboots after the same ten seconds. There is no recovery path that continues with a missing peripheral.
 
 ## Source and hardware references
 
-The pin map is maintained in [`src/bin/hardware/pinout.rs`](../src/bin/hardware/pinout.rs), and low-level LR1121 commands are in [`src/bin/hardware/lr1121/`](../src/bin/hardware/lr1121/). The supplied LR1121 manual is [`62740776.LR1121_UM_V2.2.pdf`](../62740776.LR1121_UM_V2.2.pdf). See [Board wiring](pinout.md) before connecting external modules. Verify the board revision's schematic and regulatory requirements; the radio's supported silicon range is not a certification that a specific antenna or region supports a transmission.
+The pin map is maintained in [`src/bin/hardware/pinout.rs`](../src/bin/hardware/pinout.rs), and low-level LR1121 commands are in [`src/bin/hardware/lr1121/`](../src/bin/hardware/lr1121/). The supplied LR1121 manual is [`62740776.LR1121_UM_V2.2.pdf`](../62740776.LR1121_UM_V2.2.pdf). Board wiring and electrical cautions are in [Board wiring](pinout.md). The board revision's schematic and regulatory requirements govern a build; the radio's supported silicon range does not certify an antenna or a region.

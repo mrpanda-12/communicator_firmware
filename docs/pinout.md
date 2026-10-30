@@ -1,6 +1,6 @@
 # Board wiring and pin map
 
-This is the wiring the firmware expects on the Waveshare ESP32-S3-LR1121-HF-Kit. GPIO numbers match `src/bin/hardware/pinout.rs` and the initialization in `src/bin/main.rs`. Verify the exposed pins against the board schematic before soldering; this document is not a substitute for the vendor schematic. Keep all logic at 3.3 V and do not drive ESP32 GPIOs with 5 V.
+This is the wiring the firmware expects on the Waveshare ESP32-S3-LR1121-HF-Kit. GPIO numbers match `src/bin/hardware/pinout.rs` and the initialization in `src/bin/main.rs`. The exposed pins follow the board schematic, which remains the authority. All logic is 3.3 V; ESP32 GPIOs are not 5 V tolerant.
 
 ## Pin assignments
 
@@ -11,7 +11,7 @@ This is the wiring the firmware expects on the Waveshare ESP32-S3-LR1121-HF-Kit.
 | 7 | TFT backlight PWM | Active-high input; driven by LEDC at 20 kHz. |
 | 8 | TFT reset | |
 | 9 | TFT D/C | Data/command select. |
-| 10 | TFT chip select | Dedicated; do not share with the radio. |
+| 10 | TFT chip select | Dedicated to the display, not shared with the radio. |
 | 11 | TFT MOSI | SPI3. |
 | 12 | TFT SCLK | SPI3. |
 | 16 | MCP23017 INTA | Open-drain active-low interrupt; firmware enables the internal pull-up. |
@@ -24,7 +24,7 @@ This is the wiring the firmware expects on the Waveshare ESP32-S3-LR1121-HF-Kit.
 | 42 | LR1121 NSS | SPI2 chip select. |
 | 45 | LR1121 MOSI | SPI2. |
 | 46 | LR1121 MISO | SPI2. |
-| 43/44 | UART0 TX/RX | Keep for programming and console output. |
+| 43/44 | UART0 TX/RX | Reserved for programming and console output. |
 
 The LR1121 uses SPI2 at 1 MHz and the display uses SPI3 at 10 MHz; they are separate buses. The LR1121's RF switch is controlled by the radio's own DIO pins through `SetDioAsRfSwitch`, so it needs no external GPIO. The board front end must still physically support the selected frequency.
 
@@ -36,10 +36,10 @@ The firmware opens UART1 at 9600 baud, 8-N-1, and parses NMEA GGA and RMC senten
 | --- | --- |
 | GPIO4 (UART1 RX) | module TX |
 | GPIO5 (UART1 TX) | module RX |
-| 3V3 (confirm module rating) | VCC |
+| 3V3 (per module rating) | VCC |
 | GND | GND |
 
-Confirm the specific breakout's supply range and current draw. If the module has been reconfigured before, do not assume it is still at its factory baud rate; check with a serial monitor before relying on parsing. The supported module has no PPS output, so the firmware does not use PPS timestamps.
+The specific breakout's supply range and current draw vary by module. A previously reconfigured module may not be at its factory baud rate, which parsing assumes. The supported module has no PPS output, so the firmware does not use PPS timestamps.
 
 ## Display (ILI9341 SPI TFT)
 
@@ -59,7 +59,7 @@ SPI3 is dedicated to the display; the microSD socket on many such modules is unu
 
 Backlight brightness is the `display_brightness` setting, loaded at boot (default 80) and applied to GPIO7 through LEDC PWM. There is no on-device brightness screen, so changing it currently means writing a new value into flash settings and rebooting.
 
-If a board revision exposes the bare backlight LEDs instead of a logic-level enable input, use a transistor driver with current limiting rather than driving LEDs from GPIO7.
+A board revision that exposes the bare backlight LEDs instead of a logic-level enable input needs a transistor driver with current limiting; GPIO7 drives a logic-level input only.
 
 ## Keypad (MCP23017 5×5 matrix)
 
@@ -84,7 +84,7 @@ The expander is at I²C address `0x20` (A0–A2 tied low) on a 400 kHz bus. PA0�
 | 2 | PB1 | row 4 |
 | 3–8 | PB2–PB7 | leave open |
 
-Breakouts usually silkscreen PA0–PA7/PB0–PB7, and the two headers are often in opposite order; follow the printed labels rather than pin position. Tying any of A0–A2 high changes the address and the keypad stops responding; if the breakout already ties them low, do not strap them elsewhere.
+Breakouts usually silkscreen PA0–PA7/PB0–PB7, and the two headers are often in opposite order, so the printed labels identify the pins rather than the pin position. Tying any of A0–A2 high changes the address and the keypad stops responding; a breakout that already ties them low needs no further strapping.
 
 Parts for one keypad: one MCP23017, 24 keys (one cell is unused), 24 × 1N4148-class diodes, two 4.7 kΩ I²C pull-ups, one 10 kΩ reset resistor.
 
@@ -129,13 +129,13 @@ R4 PB1 - [ UP ]>- [DOWN ]>- [LEFT ]>- [RIGHT]>
 ```
 
 The five row lines run horizontally and the five column lines vertically, so
-each key bridges one crossing. Solder the keys on the top side and the diodes
+each key bridges one crossing. Keys sit on the top side and the diodes
 underneath next to their key; a diode fitted backwards blocks its own key and
 leaves the rest working, which is the easy fault to find.
 
 Either series order works along the cell; only the diode direction matters. One diode per key is required: without them, three keys forming a rectangle connect a driven-high column through two switches to the low column, so two column outputs fight each other far beyond the expander's per-pin current rating, and a floating-column design also reports a phantom fourth key. With diodes, current can only flow row → switch → column. The 100 kΩ row pull-up limits current to roughly 33 µA, so a silicon diode drops only about 0.3 V, well below the expander's input-low threshold, and reverse leakage is negligible.
 
-Do not fit a key at row 4 column 4. A practical build is five horizontal row wires and five vertical column wires with one key-plus-diode across each crossing; keep the diode close to the key and check the band direction before soldering all of them.
+Row 4 column 4 has no key. A practical build is five horizontal row wires and five vertical column wires with one key-plus-diode across each crossing, the diode close to its key and its band facing the column.
 
 ### How the firmware scans
 
@@ -145,29 +145,27 @@ Columns rest low, so pressing a key pulls its pulled-up row low and latches the 
 
 If the expander does not answer, the worker logs a warning, retries every two seconds, and reconfigures when it responds. A missing keypad therefore removes input only; it does not stop the radio, GPS, or display.
 
-For the logical key meanings and the two-hex-digits-per-character behavior, see [display and controls](display-plan.md).
+Logical key meanings and the two-hex-digits-per-character behavior are in [display and controls](display-plan.md).
 
 ## Consolidated GPIO usage
 
 | GPIO | Assignment |
 | ---: | --- |
-| 0–3 | Free; review boot strapping before using GPIO0. |
+| 0–3 | Free; GPIO0 is a boot-strapping pin. |
 | 4, 5 | GPS UART1. |
 | 6 | Free. |
 | 7–12 | TFT (backlight, reset, D/C, CS, MOSI, SCLK). |
 | 13–15 | Free. |
 | 16–18 | Keypad interrupt and I²C. |
-| 19–37 | Not assigned by this firmware; check module flash/PSRAM and board access first. |
-| 38–42, 45, 46 | LR1121; do not reassign. |
+| 19–37 | Not assigned by this firmware; module flash/PSRAM and board access take precedence. |
+| 38–42, 45, 46 | LR1121 pins, fixed by the firmware. |
 | 43, 44 | UART0 console/programming. |
 
-## Bring-up checklist
+## Bring-up points
 
-1. Compare the connector labels on your board revision with the table above, especially GPIO4–18, and confirm they are not reserved by the kit adapters.
-2. Verify each module's supply range, logic levels, pull-ups, and current draw. Do not power the TFT backlight from a GPIO.
-3. Confirm GPS NMEA output on GPIO4/5 at the expected baud rate.
-4. Confirm the ILI9341 initializes on SPI3 and that CS/D-C/RESET/backlight behave as expected.
-5. Bring up the MCP23017 at address `0x20` on GPIO17/18, confirm INTA pulses low on a press and returns high after a scan, then test all 25 cells. Press three keys that form a rectangle to confirm the diodes prevent a phantom key.
-6. Leave the LR1121 and GPS pins unchanged when adding the expander.
-
-Wiring is one part of board verification; RF range, antenna suitability, display behavior, keypad soldering, and regulatory limits all require physical testing that the repository does not record.
+1. Connector labels differ between board revisions, especially GPIO4–18, and kit adapters can reserve pins that the table assigns.
+2. Each module sets its own supply range, logic levels, pull-ups, and current draw; the TFT backlight is not powered from a GPIO.
+3. GPS NMEA output on GPIO4/5 runs at the baud rate the parser expects.
+4. The ILI9341 initializes on SPI3 with CS, D/C, RESET, and backlight as in the display table.
+5. The MCP23017 answers at `0x20` on GPIO17/18, INTA pulses low on a press and returns high after a scan, and all 25 cells scan. Three keys forming a rectangle confirm that the diodes prevent a phantom key.
+6. Adding the expander leaves the LR1121 and GPS pins unchanged.

@@ -4,7 +4,7 @@ This guide covers the chat-specific behavior on top of the message lifecycle: ho
 
 ## History storage and paging
 
-Every conversation has its own indexed record sequence in flash (see [storage and identity](storage-and-identity.md)). The chat view shows four records at a time (`MAX_CHAT_MESSAGES = 4`).
+Every conversation has its own indexed record sequence in flash (described in [storage and identity](storage-and-identity.md)). The chat view shows four records at a time (`MAX_CHAT_MESSAGES = 4`).
 
 - Opening a conversation loads its newest page.
 - Up/Down move the selection while the composer is empty and the send menu is closed.
@@ -86,7 +86,7 @@ The navigation screen compares the received target with the latest local GPS fix
 
 Course estimation uses successive local fixes: the first valid fix anchors the estimate, and once the device has moved at least five metres the bearing between anchor and current fix becomes the course and the anchor advances. GPS drift at rest can therefore produce a noisy or unavailable course, and a stationary device cannot produce one at all.
 
-Limitations to keep in mind:
+Limitations:
 
 - There is no compass or heading sensor; “turn left/right” compares movement direction to the target bearing, not the direction the device is facing.
 - There is no map, road network, route calculation, turn-by-turn guidance, or safety-critical accuracy claim.

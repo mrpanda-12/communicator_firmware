@@ -13,16 +13,16 @@ factory,app,factory,0x10000,0x200000
 storage,data,undefined,0x210000,0x1f0000
 ```
 
-`main.rs` opens the absolute range `0x210000..0x400000` (end exclusive), which matches that row. `MapConfig::try_new` validates the range geometry only: it cannot verify the flashed partition table or prevent overlap, and normal operation can erase 4 KiB pages inside the range. Never point these constants at NVS, app, or bootloader space.
+`main.rs` opens the absolute range `0x210000..0x400000` (end exclusive), which matches that row. `MapConfig::try_new` validates the range geometry only: it cannot verify the flashed partition table or prevent overlap, and normal operation can erase 4 KiB pages inside the range. These constants do not overlap NVS, app, or bootloader space.
 
-Before first use, confirm what the board actually has:
+The flashed table can differ from `partitions.csv`; `espflash read-flash` reads the actual table:
 
 ```sh
 espflash read-flash 0x8000 0x1000 /tmp/communicator-partition-table.bin --chip esp32s3
 espflash partition-table /tmp/communicator-partition-table.bin --to-csv
 ```
 
-0x8000 is the standard ESP-IDF partition-table offset; if the bootloader was changed, use the configured offset. The `.cargo/config.toml` runner passes this repository's `partitions.csv` when flashing.
+0x8000 is the standard ESP-IDF partition-table offset; a changed bootloader uses its configured offset. The `.cargo/config.toml` runner passes this repository's `partitions.csv` when flashing.
 
 Startup opens the map, then:
 
@@ -159,4 +159,4 @@ When a valid ACK arrives for an encrypted direct message, `mark_acknowledged` sc
 - Chat text and coordinates are written as plaintext record fields even when they arrived encrypted over the air. The packet layer's encryption does not extend to records, so anyone with physical access to the flash can read them.
 - Erasing a conversation removes its records through the storage map; it does not guarantee physical erasure of every cell copy on the flash device.
 
-See [messaging](messaging.md) for the end-to-end write/read flow and failure behavior, and [protocol reference](protocol-specification.md) for over-the-air key derivation and framing.
+The end-to-end write/read flow and failure behavior are in [messaging](messaging.md); over-the-air key derivation and framing are in [protocol reference](protocol-specification.md).

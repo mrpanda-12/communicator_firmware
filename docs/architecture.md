@@ -6,12 +6,12 @@ The firmware executable is `src/bin/main.rs`. It initializes one ESP32-S3 board 
 
 `main` performs setup in this order:
 
-1. Initialize ESP-HAL at the maximum configured CPU clock, install the project heap, and start the Embassy runtime using TIMG0.
-2. Create the internal-flash map over `0x210000..0x400000`. Those bounds match the `storage` row in `partitions.csv`; the storage layer can erase pages inside that range.
-3. Start the TRNG entropy source. Read or create the 16-byte identity, choose a random starting value for the per-boot local packet-ID allocator, and load brightness, UTC offset, and contacts from flash.
-4. Move storage plus its reusable 640-byte scratch buffer into the shared `Flash` mutex. The receive path and UI take short exclusive turns through this handle.
-5. Initialize the ILI9341 on SPI3, its GPIO7 PWM backlight, the LR1121 on SPI2, the GPS on UART1, and the MCP23017 keypad expander on I2C0. A failure here, or in one of the shared watches, is not recoverable, but the board reports it: `hardware/errorscreen.rs` draws a startup error screen with the reason, counts down ten seconds, and calls `software_reset`. Failures before the panel is up (flash range, TRNG, display bus or panel) cannot be drawn; `fatal` logs `Boot stopped: <reason>` and reboots after the same ten seconds. The firmware never continues with a missing peripheral.
-6. Publish the device identity through `DEVICE_ID`, construct the radio worker and its packet handler, and enter the event-driven UI loop. Nothing is queued at boot: the only unsolicited transmission is the `DeviceAnnounce` broadcast from the contacts screen's ADD DEVICE scan.
+1. ESP-HAL starts at the maximum configured CPU clock, the project heap is installed, and the Embassy runtime starts on TIMG0.
+2. The internal-flash map is created over `0x210000..0x400000`. Those bounds match the `storage` row in `partitions.csv`; the storage layer can erase pages inside that range.
+3. The TRNG entropy source starts. The 16-byte identity is read or created, a random starting value is chosen for the per-boot local packet-ID allocator, and brightness, UTC offset, and contacts are loaded from flash.
+4. Storage and its reusable 640-byte scratch buffer move into the shared `Flash` mutex. The receive path and UI take short exclusive turns through this handle.
+5. The ILI9341 on SPI3, its GPIO7 PWM backlight, the LR1121 on SPI2, the GPS on UART1, and the MCP23017 keypad expander on I2C0 are initialized. A failure here, or in one of the shared watches, is not recoverable, but the board reports it: `hardware/errorscreen.rs` draws a startup error screen with the reason, counts down ten seconds, and calls `software_reset`. Failures before the panel is up (flash range, TRNG, display bus or panel) cannot be drawn; `fatal` logs `Boot stopped: <reason>` and reboots after the same ten seconds. The firmware never continues with a missing peripheral.
+6. The device identity is published through `DEVICE_ID`, the radio worker and its packet handler are constructed, and the event-driven UI loop starts. Nothing is queued at boot: the only unsolicited transmission is the `DeviceAnnounce` broadcast from the contacts screen's ADD DEVICE scan.
 
 The partition geometry and board wiring are described in [storage and identity](storage-and-identity.md) and [board wiring](pinout.md).
 
@@ -66,13 +66,13 @@ LR1121 RX IRQ
     → authenticated ACK queued after successful persistence (direct paired only)
 ```
 
-Broadcasts and packets for other devices may be forwarded after hop-limit decrement. The RX worker does not draw pixels or hold a second chat-history cache. Read [packet handler](packet-handler.md) for the ordering and packet-type matrix.
+Broadcasts and packets for other devices may be forwarded after hop-limit decrement. The RX worker does not draw pixels or hold a second chat-history cache. The ordering and packet-type matrix are in [packet handler](packet-handler.md).
 
 ## UI and event flow
 
 `UiState` is the screen state machine and command producer. A key mutates screen state or sets one pending command (send, pairing, announcement, identity reset, frequency request, contact action, deletion, or history-page request). The UI loop consumes those commands and performs radio/storage operations outside the renderer. `ui/render/` functions draw the state; `draw_if_changed` repaints the affected region or page rather than running storage or networking logic during rendering.
 
-Received messages use `notify::message_received`: one bounded popup is queued and the history revision is incremented. A revision wake causes an open chat to reload its newest page; list previews are read from flash on boot or when a message notification arrives. Pressing Up/Down while the chat composer is empty browses records in pages of four; the selected row can open coordinate navigation. See [user interface](display-plan.md) and [chat history](chat-fragmentation-and-navigation.md).
+Received messages use `notify::message_received`: one bounded popup is queued and the history revision is incremented. A revision wake causes an open chat to reload its newest page; list previews are read from flash on boot or when a message notification arrives. Pressing Up/Down while the chat composer is empty browses records in pages of four; the selected row can open coordinate navigation. Screen behavior is detailed in [user interface](display-plan.md) and [chat history](chat-fragmentation-and-navigation.md).
 
 ## Module responsibilities
 
@@ -93,6 +93,8 @@ Received messages use `notify::message_received`: one bounded popup is queued an
 | `notify/` | Bounded popup channel and chat-history revision signal. |
 | `ui/state.rs` | Screens, input behavior, commands, history-page selection, display-ready rows. |
 | `ui/render/` | TFT drawing by page and widget. |
+| `calendar.rs`, `hex.rs` | Shared civil-date conversion and device-ID formatting. |
+| `host-tests/` | Host-side test crate that re-includes the modules above via `#[path]`. |
 
 ## Design boundaries and current limitations
 
@@ -102,6 +104,6 @@ Received messages use `notify::message_received`: one bounded popup is queued an
 - The outbox retransmits a whole direct message; there is no per-fragment resend. If a fragment is lost, the receiver does not deliver the incomplete message, so the sender's retry sends the complete set again.
 - `DeviceAnnounceResponse` is user-facing only as the ASK TO ADD request: plaintext, empty payload, nothing stored on receipt. `Heading` and `FrequencyChange` exist in the packet enum but have no sender or handler, and local frequency selection does not coordinate peers.
 - Discovery IDs and unpaired plaintext introductions are unauthenticated. Contact pair keys are stored as serialized key bytes, not encrypted at rest.
-- No automated test can be built for this target: `cargo test` stops at `error[E0463]: can't find crate for 'test'` because the Xtensa `no_std` toolchain ships no `test` crate, so the embedded `#[cfg(test)]` module never executes. Nothing in this tree is proof of RF range, keypad soldering, storage endurance, or a physical board run.
+- Automated tests run on the host from `host-tests/` (`cd host-tests && cargo test`) and cover the packet, storage, radio-type, calendar, contact, notification, and outbox modules.
 
-Use [protocol reference](protocol-specification.md) for wire and cryptographic details, [radio guide](packets-and-radio.md) for worker operation, and [storage guide](storage-and-identity.md) for persistence.
+Wire and cryptographic details are in [protocol reference](protocol-specification.md), worker operation in [radio guide](packets-and-radio.md), and persistence in [storage guide](storage-and-identity.md).
