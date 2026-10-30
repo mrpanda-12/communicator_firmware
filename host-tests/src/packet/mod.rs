@@ -1,0 +1,12 @@
+#[path = "../../../src/bin/packet/fragment.rs"]
+pub mod fragment;
+#[path = "../../../src/bin/packet/packet_data.rs"]
+pub mod packet_data;
+#[path = "../../../src/bin/packet/packet_deserializer.rs"]
+pub mod packet_deserializer;
+#[path = "../../../src/bin/packet/packet_error.rs"]
+pub mod packet_error;
+#[path = "../../../src/bin/packet/packet_serializer.rs"]
+pub mod packet_serializer;
+#[path = "../../../src/bin/packet/packet_type.rs"]
+pub mod packet_type;

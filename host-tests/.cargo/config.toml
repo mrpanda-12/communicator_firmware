@@ -1,0 +1,8 @@
+# The parent `.cargo/config.toml` targets xtensa and enables build-std; host
+# tests need neither.
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = []
+
+[unstable]
+build-std = []

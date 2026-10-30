@@ -4,11 +4,13 @@ include = ["esp-config.toml"]
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor --chip esp32s3 --partition-table partitions.csv --log-format defmt"
 
-[build]
+# Bare-metal firmware needs no C runtime startup files. Kept target-scoped so
+# host builds (host-tests/) still link against the normal glibc startup.
 rustflags = [
   "-C", "link-arg=-nostartfiles",
 ]
 
+[build]
 target = "xtensa-esp32s3-none-elf"
 
 [unstable]

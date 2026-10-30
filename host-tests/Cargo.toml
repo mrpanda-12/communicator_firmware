@@ -1,0 +1,15 @@
+[package]
+name = "communicator-host-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Host-only harness: the real crate targets xtensa-esp32s3, so this crate
+# re-includes its hardware-independent modules and tests them on x86_64.
+[dependencies]
+heapless = "0.9.3"
+sequential-storage = { version = "8.0.2", default-features = false }
+embassy-sync = "0.8.0"
+critical-section = { version = "1.2.0", features = ["std"] }
+defmt = "1.2.0"
+libm = "0.2.16"
