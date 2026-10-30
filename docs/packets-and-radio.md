@@ -103,9 +103,9 @@ A local retune does not notify peers, and this firmware has no handler for the `
 
 The driver implements the startup sequence this board needs, not the LR1121's complete command set. Consult [`62740776.LR1121_UM_V2.2.pdf`](../62740776.LR1121_UM_V2.2.pdf) for register-level behavior.
 
-## Debug diagnostic
+## Idle traffic
 
-`main.rs` runs a development producer that queues a plaintext broadcast `Text` packet containing `Hello from the communicator` every 30 seconds with hop limit 3. It uses the shared local packet-ID allocator and logs the device ID and packet ID. This is not part of the chat feature: it will appear in peers' broadcast history on reception, and any board running this firmware transmits it by default. Remove or gate it before treating a deployment as private or quiet.
+The firmware queues no packet on its own. The only unsolicited transmission is the `DeviceAnnounce` broadcast produced by the contacts screen's ADD DEVICE scan: plaintext, empty payload, hop limit 3, repeated every two seconds while the scan is open and stopped when the window closes or BACK is pressed. Chat, coordinate, ACK, pairing, and add-contact-request packets are sent only in response to a user action or an incoming authenticated message.
 
 ## Verifying a link on hardware
 

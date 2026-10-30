@@ -11,7 +11,7 @@ The UI and network use `ConversationId`:
 
 Each complete logical chat entry is one `StoredMessage`. A message may consist of several radio packets, but fragments are not stored as separate chat rows. The storage map assigns each conversation a monotonically increasing 32-bit record ordinal and stores a separate record count.
 
-Incoming records have `from_me = false`, sender ID, packet/message IDs, encryption state, type, and text or coordinates. Outgoing records have `from_me = true`. Current callers supply timestamp `0`; it is a placeholder, not GPS time. An encrypted direct outgoing record starts unacknowledged. A later authenticated ACK updates its acknowledged flag.
+Incoming records have `from_me = false`, sender ID, packet/message IDs, encryption state, type, and text or coordinates. Outgoing records have `from_me = true`. The timestamp is UTC seconds since 2000-01-01 taken from the current GPS fix, or `0` without a dated fix; it is local to the storing device and never travels on the wire. An encrypted direct outgoing record starts unacknowledged. A later authenticated ACK updates its acknowledged flag.
 
 ## Outbound path
 

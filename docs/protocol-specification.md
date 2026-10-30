@@ -37,7 +37,7 @@ A single-packet message has `fragment_index = 0` and `fragment_count = 1`.
 | `0x04` | `Heading` | Declared type; no sender or handler in this firmware. |
 | `0x05` | `DeviceAnnounce` | Plaintext broadcast request; empty payload. |
 | `0x06` | `FrequencyChange` | Declared announcement type; no handler or automatic retune. |
-| `0x07` | `DeviceAnnounceResponse` | Parsed type; this firmware never sends it. |
+| `0x07` | `DeviceAnnounceResponse` | Plaintext direct add-contact request; sent from the devices screen. It pairs nothing and only prompts the peer. |
 | `0x08` | `PairingConfirm` | Authenticated three-stage pairing frame. |
 
 Unknown type bytes never reach the packet handler because deserialization fails.
@@ -46,7 +46,7 @@ Unknown type bytes never reach the packet handler because deserialization fails.
 
 A device ID is 16 random bytes created from the ESP32-S3 TRNG and stored in flash. It is a public address, not a secret and not cryptographic proof of identity. Regenerating it changes the key-derivation context, so peers must pair again.
 
-The `packet_id` and `message_id` fields are 32-bit. Locally generated packets take IDs from one process-wide allocator whose counter is stored in flash under the `packet_ids` setting. A fragmented chat message reserves one contiguous block: the first value is the message ID and each fragment increments `packet_id` by its index. Pairing, ACK, announcement, and diagnostic sends reserve one ID each from the same allocator.
+The `packet_id` and `message_id` fields are 32-bit. Locally generated packets take IDs from one process-wide allocator whose counter is stored in flash under the `packet_ids` setting. A fragmented chat message reserves one contiguous block: the first value is the message ID and each fragment increments `packet_id` by its index. Pairing, ACK, and announcement sends reserve one ID each from the same allocator.
 
 Every reservation writes the advanced counter to flash before any of its IDs can reach the air, then hands out the range. A reboot therefore resumes at the first unused ID: an ID that was sent is never replayed, and only a reservation interrupted before it was queued is skipped. Holding the flash session for the whole reserve-and-write keeps concurrent producers from claiming the same range. The counter wraps after 4,294,967,296 reservations. The settings screen's PACKET IDS page shows the last assigned packet and message ID, the next ID, and the percentage of the 32-bit space left.
 
@@ -125,7 +125,9 @@ The sender matches an ACK to its own records by conversation plus the 32-bit log
 
 ### Device announcement (`0x05`)
 
-`DeviceAnnounce` is a plaintext broadcast with an empty payload. It announces the sender's public ID in the header. It is not authenticated, it proves no pairing secret, and this firmware never replies automatically with `DeviceAnnounceResponse`. Receipt adds the sender to the bounded nearby list. The contacts screen's scan action is what queues this packet.
+`DeviceAnnounce` is a plaintext broadcast with an empty payload. It announces the sender's public ID in the header. It is not authenticated, it proves no pairing secret, and this firmware never replies automatically with `DeviceAnnounceResponse`. Receipt adds the sender to the bounded nearby list. The contacts screen's ADD DEVICE action is what queues this packet.
+
+`DeviceAnnounceResponse` is the add-contact request: a plaintext direct frame with an empty payload, sent when the user picks ASK TO ADD. Receipt shows an "add me" popup naming the sender and stores nothing; a request from a blocked peer is dropped. It carries no key and starts no handshake.
 
 ## Pairing
 
@@ -139,7 +141,7 @@ key = PBKDF2-HMAC-SHA256(
     dkLen = 32)
 ```
 
-Sorting the two public IDs makes both sides derive the same key regardless of who initiated. The UI requires at least 16 entered characters, but password strength still determines resistance to offline guessing; a short or predictable secret is weak despite the KDF. The secret itself is not persisted. The derived contact key is stored in flash without application-level encryption.
+Sorting the two public IDs makes both sides derive the same key regardless of who initiated. The UI accepts any non-empty secret up to 64 characters, but password strength still determines resistance to offline guessing; a one-character secret is trivially guessable despite the KDF. The secret itself is not persisted. The derived contact key is stored in flash without application-level encryption.
 
 The lower device ID initiates, and stages are carried in a single `PairingConfirm` payload byte:
 
@@ -173,7 +175,7 @@ Because this is a simple flood, multiple relays may transmit duplicates of the s
 
 - No per-fragment retransmission; the outbox retries a whole message after 20 s, up to three rounds.
 - No radio-level acknowledgement or over-the-air frequency negotiation. The worker enforces a 10 % transmit duty cycle per band.
-- No handling for `Heading`, `FrequencyChange`, or incoming `DeviceAnnounceResponse`.
+- No handling for `Heading` or `FrequencyChange`.
 - No group/broadcast encryption.
-- No persistent packet-ID allocation or replay protection beyond the RAM duplicate cache.
+- No persistent replay protection. Duplicate suppression is a 128-entry RAM seen cache for received packets, plus a check of the newest eight stored records of that conversation before a record is appended; that second check is what suppresses a retransmit after a reboot. Packet-ID allocation itself is persistent: the counter advances in flash before any of its IDs can be sent.
 - No compression or binary text encoding; chat text is UTF-8 bytes.

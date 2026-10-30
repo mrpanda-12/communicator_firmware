@@ -31,7 +31,7 @@ Startup opens the map, then:
 3. Loads saved contacts into the in-memory contact book, skipping any record whose ID equals this device.
 4. Moves the storage manager plus its 640-byte scratch buffer into the shared `Flash` mutex.
 
-If the storage range constants are invalid, `main` logs an error and idles instead of touching flash.
+If the storage range constants are invalid, `fatal` logs `Boot stopped: ...`, waits ten seconds, and reboots without touching flash.
 
 ## Access pattern
 
@@ -93,8 +93,8 @@ If the entropy source or flash is unavailable, identity-dependent operations are
 
 A `Contact` stores the peer's 16-byte device ID, the 32-byte derived pair key, a 32-byte custom-name field, and a blocked flag. Its serialized size is 81 bytes.
 
-- Contacts are learned through a successful pairing handshake, not through discovery. A discovered or simply heard device exists only in the in-memory contact book/list until pairing.
-- `display_name()` returns the custom name if set, otherwise the 32-character uppercase hex ID. There is currently no UI to set a custom name, so saved contacts display their hex ID.
+- A contact is created from the devices screen by picking a peer and entering a name plus an optional password. Only a non-empty password runs the pairing handshake and saves a pair key; an empty password adds the peer with no key, so its traffic stays plaintext. A peer that is only heard on air stays in the in-memory discovery lists until the user adds it.
+- `display_name()` returns the custom name if set, otherwise the 32-character uppercase hex ID. Contact management sets, changes, and removes that name, and renaming a saved contact writes the record back to flash; every list and chat label reads the name through this one function.
 - A blocked contact is dropped on the receive path before any message is processed and is hidden from the lists.
 - Blocking or deleting a contact is written through the contact record and the removal path; an unpaired/unknown peer's block state exists only for the running session.
 - Contact records, including the pair key, are stored as plain map values. The firmware does not encrypt its flash.
@@ -107,7 +107,7 @@ A `Contact` stores the peer's 16-byte device ID, the 32-byte derived pair key, a
 | --- | --- |
 | `id` | 4-byte little-endian conversation ordinal (also the record's index when written) |
 | `from_me` | 1 byte, 0/1 |
-| `timestamp` | 4 bytes little-endian; current writers pass 0 |
+| `timestamp` | 4 bytes little-endian UTC seconds since 2000-01-01; 0 without a dated GPS fix |
 | `packet_id` | 4 bytes little-endian |
 | `message_id` | 4 bytes little-endian |
 | `sender_id` | 16 bytes |

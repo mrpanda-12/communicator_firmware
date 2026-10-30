@@ -19,7 +19,7 @@ The executable is `src/bin/main.rs`. It is `no_std`/`no_main`, uses ESP-HAL and 
 - Persists the packet-ID counter in flash and exposes it, with the remaining percentage, under Settings → Device → Packet IDs.
 - Caps each conversation at 128 stored records and drops the oldest one, and restarts the firmware when a service task stops.
 
-The default firmware also queues the diagnostic broadcast text `Hello from the communicator` every 30 seconds. This is in `main.rs`; it is not a chat send and is useful only for development/bring-up.
+The firmware transmits nothing on its own. The only unsolicited packet is the plaintext `DeviceAnnounce` broadcast queued by the contacts screen's ADD DEVICE scan, which repeats every two seconds while the scan is open and stops when the scan window closes or BACK is pressed.
 
 ## Documentation map
 
@@ -63,7 +63,7 @@ cargo run --release --features debug-console
 
 Without the feature the module is not compiled at all: no reader task, no USB peripheral setup, and no console strings in the image. Resetting the IDs means the next packets reuse IDs peers may still remember, so expect duplicates to be dropped after a reset; it exists for test setups, not for the UI.
 
-No host test suite currently exercises the full firmware. A small set of tests is embedded in `ui/render/top_bar.rs`, but the configured target is Xtensa. Do not treat formatting or a successful compile as evidence of RF, display, GPS, flash-endurance, or keypad operation. The keypad and radio need a board for physical verification.
+`cargo test` does not build for this target: the Xtensa `no_std` toolchain has no `test` crate, so a test build stops at `error[E0463]: can't find crate for 'test'`. The `#[cfg(test)]` module in `ui/render/top_bar.rs` therefore never runs; it is kept only as a written description of the expected calendar arithmetic. No automated test covers the firmware, and verification is a two-board run. Do not treat formatting or a successful compile as evidence of RF, display, GPS, flash-endurance, or keypad operation.
 
 ## First boot and radio pairing
 
@@ -78,7 +78,7 @@ Broadcast traffic and explicitly selected unpaired introductions are plaintext. 
 
 ## Important limits
 
-- The wire `packet_id` and `message_id` fields are 32-bit values. Local packet IDs come from one flash-persisted counter shared by the UI, radio receive responses, pairing packets, and diagnostic sender; it wraps only after 4,294,967,296 reservations. Each reservation persists the advanced counter before using it, so a power loss skips at most one interrupted reservation and never replays a sent ID. The settings screen's PACKET IDS page shows the last packet and message ID, the next ID, and the remaining percentage.
+- The wire `packet_id` and `message_id` fields are 32-bit values. Local packet IDs come from one flash-persisted counter shared by the UI, radio receive responses, pairing packets, and announcements; it wraps only after 4,294,967,296 reservations. Each reservation persists the advanced counter before using it, so a power loss skips at most one interrupted reservation and never replays a sent ID. The settings screen's PACKET IDS page shows the last packet and message ID, the next ID, and the remaining percentage.
 - Protocol version 2 is not backward compatible: both boards must run firmware that uses the 47-byte header. A board running version 1 rejects version 2 frames, and the reverse is also true. Chat records written by version 1 firmware use the narrower ID layout and cannot be read by this firmware; delete the old conversations from the settings screens after upgrading.
 - The TX queue holds 32 encoded packets. The outbox keeps two messages for delivery; a third message is refused on screen and stays in the composer. The outbox is not persisted, so a reboot cancels pending retries.
 - A direct message is retransmitted after 20 s while the peer has not acknowledged it, up to three transmissions in total. A retry reuses the original encoded fragments, so the receiver's duplicate cache suppresses a second stored row. Broadcast and plaintext sends are not retried.
@@ -87,6 +87,8 @@ Broadcast traffic and explicitly selected unpaired introductions are plaintext. 
 - The duty-cycle limiter accounts per RF band over a one-hour window at 10 %. A fresh boot starts with 6 s of credit and accrues 0.1 s per second, capped at 360 s.
 - The firmware's code supports LoRa receive on sub-GHz and 2.4 GHz profiles. S-band LR-FHSS is transmit-only in this radio implementation. The current board antenna/front-end suitability must be checked before changing bands.
 - Identity reset replaces the device ID but retains local contact and history records. Other devices must pair again to the new ID; the local contact book is not automatically migrated.
+- There is no OTA update and no second application slot: changing firmware means flashing over USB-serial/JTAG. The `storage` data partition occupies the flash an update slot would need, so an update path would cost either stored history or partition geometry.
+- Failure to initialize the radio, GPS, keypad, or a shared watch is not recoverable on this board, but it is visible: the firmware shows a startup error screen with the reason, counts down ten seconds, and reboots. Failures that happen before the display exists (flash range, TRNG, display bus or panel) can only be logged as `Boot stopped: <reason>`, and the board reboots after the same ten seconds. There is no recovery path that continues with a missing peripheral.
 
 ## Source and hardware references
 

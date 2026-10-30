@@ -39,9 +39,9 @@ A broadcast message row displays the sender label before the message. For paired
 
 ### Contacts and discovery
 
-Contacts lists saved contacts, nearby IDs, and a scan action. Nearby IDs are learned from accepted packet origins; scan queues an unauthenticated broadcast `DeviceAnnounce`. No automatic reply is sent, so a quiet peer may not be visible until it transmits. Selecting an unknown peer offers an unencrypted chat warning or pairing.
+Contacts lists saved contacts plus ADD DEVICE and DEVICES. ADD DEVICE queues an unauthenticated broadcast `DeviceAnnounce` every two seconds for five seconds and lists the replies; BACK stops the repeats. DEVICES is one screen with two sections: ACTIVE lists peers whose own announcement was heard, RECENTLY HEARD lists peers heard in any other packet. It never announces, the window scrolls with the selection, and BACK always returns to the contacts list. Each list keeps the eight most recently heard peers (`MAX_DISCOVERED_DEVICES`); hearing a ninth drops the oldest, while the contact book itself holds 32 entries. Selecting a peer offers ADD CONTACT, or ASK TO ADD, which queues a direct `DeviceAnnounceResponse`. That request is only a plaintext "add me" nudge: it carries no key, pairs nothing, and the peer sees it as a popup naming the sender. Adding asks for a name (empty keeps the device ID) and a password (empty leaves the peer unpaired and plaintext); only a password starts the pairing handshake. A saved contact's actions offer adding or changing a name, removing the name, adding a password, blocking, and deleting. No automatic reply is sent, so a quiet peer may not be visible until it transmits.
 
-Pairing uses the same strong shared secret entered on both devices. The UI requires at least 16 characters. Since two hex keys form an ASCII character, physical entry uses pairs. The secret is not transmitted; a derived key is saved only after the handshake succeeds. The application does not provide a password manager or an automatic peer challenge UI beyond this workflow.
+Pairing uses the same shared secret entered on both devices. The UI accepts any non-empty secret up to 64 characters; an empty secret adds the peer without a pair key. Since two hex keys form an ASCII character, physical entry uses pairs. The secret is not transmitted; a derived key is saved only after the handshake succeeds. The application does not provide a password manager or an automatic peer challenge UI beyond this workflow.
 
 ### Chat view and history scrolling
 
@@ -82,6 +82,10 @@ The top bar shows current GPS status/coordinates and UTC time/date. A nonzero co
 A received-message popup can cover any page. The receive side enqueues it only after the accepted message is saved to flash. A key dismisses the popup before the action underneath. The popup channel has bounded capacity; when full it drops its oldest entry so a newer toast can be queued.
 
 `render::draw_if_changed` retains the existing display pixels and updates the changed page/widget when possible. State changes to screens/overlays redraw the page; chat history changes redraw the message panel; GPS/offset changes redraw the bar. Rendering is separated from flash and radio operations: render functions receive display-ready state and do not load messages themselves.
+
+### Startup error screen
+
+If the radio, GPS, keypad, or a shared watch cannot initialize, the firmware draws an error page once the display is up: `STARTUP ERROR`, the reason below it, `THE DEVICE RESTARTS BY ITSELF.`, and a ten-second counter that repaints once per second. The board reboots when it reaches zero. Failures before the display exists (flash range, TRNG, display bus or panel) cannot be drawn; they log `Boot stopped: <reason>` and reboot after the same ten seconds. No key interrupts the countdown.
 
 ## State-to-subsystem boundary
 
