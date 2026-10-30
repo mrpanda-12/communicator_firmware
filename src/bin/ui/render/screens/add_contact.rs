@@ -7,7 +7,8 @@ use heapless::String;
 
 use crate::ui::render::style::{CYAN, MUTED, WHITE, text};
 
-use super::{draw_option, format_device_id};
+use super::draw_option;
+use crate::hex::hex_device_id;
 
 /// Confirm adding a heard peer; asking to add only nudges it, no key is made.
 pub fn draw_confirm<D>(
@@ -19,7 +20,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     text(display, "ADD TO CONTACTS?", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
+    let identity = hex_device_id(device_id);
     text(display, identity.as_str(), 12, 78, WHITE, false)?;
     draw_option(display, "ADD CONTACT", 112, selected == 0)?;
     draw_option(display, "ASK TO ADD", 142, selected == 1)?;
@@ -38,7 +39,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     text(display, "CONTACT NAME", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
+    let identity = hex_device_id(device_id);
     text(display, identity.as_str(), 12, 72, MUTED, false)?;
     let mut line = String::<36>::new();
     let _ = line.push_str(name);
@@ -63,7 +64,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     text(display, "CONTACT PASSWORD", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
+    let identity = hex_device_id(device_id);
     text(display, identity.as_str(), 12, 66, MUTED, false)?;
     let label = if name.is_empty() {
         "NAME: DEVICE ID"

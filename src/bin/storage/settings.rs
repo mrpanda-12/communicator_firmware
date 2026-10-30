@@ -2,6 +2,14 @@ use sequential_storage::map::{Key, SerializationError};
 
 const MAX_KEY_BYTES: usize = 32;
 
+// Namespace bytes are part of the on-flash key format: renaming these symbols is
+// safe, but changing a value orphans every record already written under it.
+const NAMESPACE_SETTING: u8 = b's';
+const NAMESPACE_CONTACT: u8 = b'c';
+const NAMESPACE_MESSAGE: u8 = b'm';
+const NAMESPACE_MESSAGE_COUNT: u8 = b'n';
+const NAMESPACE_MESSAGE_BASE: u8 = b'b';
+
 /// Keys carry a one-byte namespace so settings, contacts, and message records
 /// cannot alias one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,36 +25,39 @@ impl StorageKey {
         if name.is_empty() || name.len() + 1 > MAX_KEY_BYTES {
             return None;
         }
-        Some(Self::from_parts(b's', name))
+        Some(Self::from_parts(NAMESPACE_SETTING, name))
     }
 
     pub(crate) fn contact(device_id: &[u8; 16]) -> Self {
-        Self::from_parts(b'c', device_id)
+        Self::from_parts(NAMESPACE_CONTACT, device_id)
     }
 
     pub(crate) const fn is_contact(&self) -> bool {
-        self.len == 17 && self.bytes[0] == b'c'
+        self.len == 17 && self.bytes[0] == NAMESPACE_CONTACT
     }
 
     pub(crate) fn message(device_id: &[u8; 16], index: u32) -> Self {
         let mut value = [0; 20];
         value[..16].copy_from_slice(device_id);
         value[16..].copy_from_slice(&index.to_le_bytes());
-        Self::from_parts(b'm', &value)
+        Self::from_parts(NAMESPACE_MESSAGE, &value)
     }
 
     pub(crate) fn message_count(device_id: &[u8; 16]) -> Self {
-        Self::from_parts(b'n', device_id)
+        Self::from_parts(NAMESPACE_MESSAGE_COUNT, device_id)
     }
 
     pub(crate) fn message_base(device_id: &[u8; 16]) -> Self {
-        Self::from_parts(b'b', device_id)
+        Self::from_parts(NAMESPACE_MESSAGE_BASE, device_id)
     }
 
     /// True for the record, count, and base namespaces of a conversation,
     /// whatever the device ID is, so "delete all chats" can enumerate them.
     pub(crate) fn is_conversation_message(&self) -> bool {
-        matches!(self.bytes.first(), Some(b'm' | b'n' | b'b'))
+        matches!(
+            self.bytes.first().copied(),
+            Some(NAMESPACE_MESSAGE | NAMESPACE_MESSAGE_COUNT | NAMESPACE_MESSAGE_BASE)
+        )
     }
 
     fn from_parts(namespace: u8, value: &[u8]) -> Self {

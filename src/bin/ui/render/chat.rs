@@ -13,7 +13,7 @@ use crate::ui::state::ChatRow;
 
 use super::style::{ACK_GREEN, BLUE, CYAN, MUTED, WARNING, WHITE, text, write_coordinate};
 
-/// 1/ Draw the selected conversation, composer, and context menu.
+/// Draw the selected conversation, composer, and context menu.
 pub fn draw<D>(
     display: &mut D,
     conversation: ConversationId,
@@ -40,7 +40,7 @@ where
     }
 }
 
-/// 2/ Repaint only the chat title row when the active conversation changes.
+/// Repaint only the chat title row when the active conversation changes.
 pub fn draw_header<D>(
     display: &mut D,
     conversation: ConversationId,
@@ -61,7 +61,7 @@ where
     text(display, title, 28, 34, WHITE, false)
 }
 
-/// 3/ Draw up to four history rows. Encryption tints them cyan; a sent row of
+/// Draw up to four history rows. Encryption tints them cyan; a sent row of
 /// an encrypted chat reads green once its ACK arrived, grey with SENDING.. before.
 pub fn draw_message_panel<D>(
     display: &mut D,
@@ -142,7 +142,7 @@ where
     Ok(())
 }
 
-/// 4/ Repaint only the chat composer when its text, nibble, or cursor changes.
+/// Repaint only the chat composer when its text, nibble, or cursor changes.
 pub fn draw_input<D>(display: &mut D, input: &str, pending_hex: Option<u8>) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -162,7 +162,7 @@ where
     text(display, "...", 294, 162, CYAN, false)
 }
 
-/// 5/ Draw the context menu overlay when it opens.
+/// Draw the context menu overlay when it opens.
 pub fn draw_context_menu<D>(display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -176,7 +176,7 @@ where
     text(display, "BACK CANCEL", 168, 146, MUTED, false)
 }
 
-/// 6/ Clear just the context menu overlay when it closes.
+/// Clear just the context menu overlay when it closes.
 pub fn clear_context_menu<D>(display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -186,7 +186,7 @@ where
         .draw(display)
 }
 
-/// 7/ Show the available chat navigation controls without implying keyboard hardware.
+/// Show the available chat navigation controls without implying keyboard hardware.
 fn draw_chat_controls<D>(display: &mut D, send_enabled: bool) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,

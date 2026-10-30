@@ -3,8 +3,9 @@ use sequential_storage::map::{SerializationError, Value};
 
 use crate::packet::packet_data::MAX_LOGICAL_MESSAGE_SIZE;
 
-/// Storage key attributed to broadcast history.
-pub const BROADCAST_ID: [u8; 16] = [0xff; 16];
+/// Storage key attributed to broadcast history. The wire and conversation
+/// layers mark broadcast with an all-zero peer ID instead.
+pub const BROADCAST_STORAGE_ID: [u8; 16] = [0xff; 16];
 
 /// One conversation: the public broadcast or a direct peer.
 ///
@@ -19,7 +20,7 @@ pub enum ConversationId {
 impl ConversationId {
     /// Map a peer ID to its conversation; the all-zero ID means broadcast.
     pub fn from_peer(peer_id: [u8; 16]) -> Self {
-        if peer_id == [0; 16] {
+        if peer_id == crate::packet::packet_data::BROADCAST_RECIPIENT {
             Self::Broadcast
         } else {
             Self::Direct(peer_id)
@@ -28,7 +29,7 @@ impl ConversationId {
 
     pub fn peer_id(self) -> [u8; 16] {
         match self {
-            Self::Broadcast => [0; 16],
+            Self::Broadcast => crate::packet::packet_data::BROADCAST_RECIPIENT,
             Self::Direct(peer_id) => peer_id,
         }
     }
@@ -40,17 +41,10 @@ impl ConversationId {
     /// Storage key of this conversation's history.
     pub fn storage_id(self) -> [u8; 16] {
         match self {
-            Self::Broadcast => BROADCAST_ID,
+            Self::Broadcast => BROADCAST_STORAGE_ID,
             Self::Direct(peer_id) => peer_id,
         }
     }
-}
-
-/// Direction of one message relative to this device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Sent,
-    Received,
 }
 
 /// Body bytes one message can carry, matching the protocol limit.
@@ -85,7 +79,7 @@ impl MessageType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredMessage {
     /// Per-conversation record ordinal; display order comes from the record index.
-    pub id: u32,
+    pub conversation_ordinal: u32,
     pub from_me: bool,
     pub timestamp: u32,
     pub kind: MessageType,
@@ -102,7 +96,7 @@ impl StoredMessage {
     /// Build one record that is ready to append for a complete message.
     pub fn new(
         conversation_ordinal: u32,
-        direction: Direction,
+        from_me: bool,
         timestamp: u32,
         kind: MessageType,
         text: &str,
@@ -114,8 +108,8 @@ impl StoredMessage {
         let mut stored_text = String::new();
         let _ = stored_text.push_str(text);
         Self {
-            id: conversation_ordinal,
-            from_me: direction == Direction::Sent,
+            conversation_ordinal,
+            from_me,
             timestamp,
             kind,
             text: stored_text,
@@ -128,7 +122,7 @@ impl StoredMessage {
     }
 }
 
-// id, from_me, timestamp, packet_id, message_id, sender_id, encrypted, kind, text_len.
+// ordinal, from_me, timestamp, packet_id, message_id, sender_id, encrypted, kind, text_len.
 const MESSAGE_FIXED_BYTES: usize = 4 + 1 + 4 + 4 + 4 + 16 + 1 + 1 + 2;
 /// One trailing byte records the acknowledged flag.
 const ACK_FLAG_BYTES: usize = 1;
@@ -150,7 +144,7 @@ impl<'a> Value<'a> for StoredMessage {
         }
 
         let mut offset = 0;
-        buffer[offset..offset + 4].copy_from_slice(&self.id.to_le_bytes());
+        buffer[offset..offset + 4].copy_from_slice(&self.conversation_ordinal.to_le_bytes());
         offset += 4;
         buffer[offset] = u8::from(self.from_me);
         offset += 1;
@@ -198,7 +192,7 @@ impl<'a> Value<'a> for StoredMessage {
             return Err(SerializationError::BufferTooSmall);
         }
         let mut offset = 0;
-        let id = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
+        let conversation_ordinal = u32::from_le_bytes(read_array::<4>(buffer, &mut offset)?);
         let from_me = match buffer[offset] {
             0 => false,
             1 => true,
@@ -263,7 +257,7 @@ impl<'a> Value<'a> for StoredMessage {
 
         Ok((
             Self {
-                id,
+                conversation_ordinal,
                 from_me,
                 timestamp,
                 kind,

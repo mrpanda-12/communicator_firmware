@@ -1,4 +1,5 @@
 use crate::crypto::KEY_SIZE;
+use crate::hex::hex_device_id;
 use heapless::String;
 use sequential_storage::map::{SerializationError, Value};
 
@@ -17,13 +18,7 @@ impl Contact {
     /// Uses the custom label or the device ID as uppercase hexadecimal.
     pub fn display_name(&self) -> String<32> {
         if self.custom_name.is_empty() {
-            let mut name = String::<32>::new();
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            for byte in self.device_id {
-                let _ = name.push(HEX[(byte >> 4) as usize] as char);
-                let _ = name.push(HEX[(byte & 0x0F) as usize] as char);
-            }
-            name
+            hex_device_id(&self.device_id)
         } else {
             self.custom_name.clone()
         }

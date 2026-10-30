@@ -1,4 +1,4 @@
-use crate::radio::types::{CodingRate, FrequencyBand, LoRaBandwidth, LrFhssProfile, PaMode};
+use crate::radio::types::{CodingRate, FrequencyBand, LoraBandwidth, LrFhssProfile, PaMode};
 
 // Configures the LR1121 RF band, transmit path, and modem settings.
 // LoRa-specific fields apply to sub-GHz and 2.4 GHz; S-band uses its LR-FHSS profile.
@@ -20,7 +20,7 @@ pub struct RadioConfig {
     pub lora_sync_word: u8,
 
     // Sets the LoRa bandwidth when the selected band uses LoRa.
-    pub bandwidth: LoRaBandwidth,
+    pub bandwidth: LoraBandwidth,
 
     // Selects the LoRa forward-error-correction coding rate.
     pub coding_rate: CodingRate,
@@ -84,12 +84,12 @@ impl RadioConfig {
             frequency_band,
             spreading_factor: 9,
             lora_sync_word: 0x12,
-            bandwidth: LoRaBandwidth::Khz125,
+            bandwidth: LoraBandwidth::Khz125,
             coding_rate: CodingRate::Cr45,
             tx_power_dbm: 10,
             pa_mode: match frequency_band {
                 FrequencyBand::SubGhz => PaMode::LowPower,
-                FrequencyBand::Sband | FrequencyBand::Ism2_4Ghz => PaMode::HighFrequency,
+                FrequencyBand::SBand | FrequencyBand::Ism2_4Ghz => PaMode::HighFrequencyPath,
             },
             preamble_symbols: 8,
             crc_enabled: true,
@@ -110,7 +110,7 @@ impl RadioConfig {
             .bandwidth
             .lr1121_encoding(self.frequency_band)
             .is_some()
-            || self.frequency_band == FrequencyBand::Sband;
+            || self.frequency_band == FrequencyBand::SBand;
         if !bandwidth_supported {
             return Err(ConfigError::UnsupportedBandwidth);
         }
@@ -121,8 +121,8 @@ impl RadioConfig {
 
         let pa_matches_band = match self.frequency_band {
             FrequencyBand::SubGhz => matches!(self.pa_mode, PaMode::LowPower | PaMode::HighPower),
-            FrequencyBand::Sband | FrequencyBand::Ism2_4Ghz => {
-                self.pa_mode == PaMode::HighFrequency
+            FrequencyBand::SBand | FrequencyBand::Ism2_4Ghz => {
+                self.pa_mode == PaMode::HighFrequencyPath
             }
         };
         if !pa_matches_band {
@@ -159,8 +159,8 @@ impl RadioConfig {
     // Uses the Semtech LoRa time-on-air formula and an LR-FHSS bit-rate estimate;
     // the duty-cycle limiter consumes this value, so an overestimate is safe.
     pub fn time_on_air_us(&self, packet_len: usize) -> u64 {
-        if self.frequency_band == FrequencyBand::Sband {
-            let bandwidth = u64::from(LrFhssProfile::SbandDefault.bandwidth().hz());
+        if self.frequency_band == FrequencyBand::SBand {
+            let bandwidth = u64::from(LrFhssProfile::SBandDefault.bandwidth().hz());
             // LR-FHSS carries roughly three bits per seven hertz of channel bandwidth.
             let bit_rate = (bandwidth * 3 / 7).max(1);
             let bits = 8 * (packet_len as u64 + 24);

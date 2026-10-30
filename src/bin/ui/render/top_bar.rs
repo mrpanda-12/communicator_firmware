@@ -18,7 +18,7 @@ use crate::ui::GpsSnapshot;
 
 use super::style::{BLUE, CYAN, WHITE, text};
 
-/// 1/ Draw GPS fix, coordinates, and the clock in the persistent top bar.
+/// Draw GPS fix, coordinates, and the clock in the persistent top bar.
 pub fn draw<D>(
     display: &mut D,
     gps: GpsSnapshot,
@@ -83,32 +83,7 @@ where
     )
 }
 
-/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
-    let month = month.min(12) as i32;
-    let y = year - if month <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = month - 3;
-    let doy = (153 * m + 2) / 5 + day as i32 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Inverse of `days_from_civil`: the civil date for days since the epoch.
-fn civil_from_days(days: i32) -> (i32, i32, i32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-    (year, month, day)
-}
+use crate::calendar::{civil_from_days, days_from_civil};
 
 #[cfg(test)]
 mod tests {

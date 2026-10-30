@@ -23,7 +23,7 @@ pub const MUTED: Rgb565 = Rgb565::new(35, 43, 52);
 pub const UNKNOWN: Rgb565 = Rgb565::new(60, 35, 0);
 pub const WARNING: Rgb565 = Rgb565::new(31, 40, 0);
 
-/// 1/ Draw one text line with the compact system font or the larger page-title font.
+/// Draw one text line with the compact system font or the larger page-title font.
 pub fn text<D>(
     display: &mut D,
     value: &str,

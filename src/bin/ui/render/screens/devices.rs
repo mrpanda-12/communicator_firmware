@@ -10,10 +10,10 @@ use embedded_graphics::{
 use crate::network::types::DiscoveryList;
 use crate::ui::render::style::{CYAN, MUTED, SELECTED, WHITE, text};
 
-use super::format_device_id;
+use crate::hex::hex_device_id;
 
 /// Lines drawn at once, section headers included.
-const MAX_LINES: usize = 7;
+const VISIBLE_LINES: usize = 7;
 const TOP: i32 = 56;
 const LINE_HEIGHT: i32 = 22;
 
@@ -76,8 +76,8 @@ where
 {
     text(display, "DEVICES", 12, 38, CYAN, true)?;
     let picked = selected_line(active.len(), recent.len(), selected);
-    let first = picked.saturating_sub(MAX_LINES - 1);
-    for offset in 0..MAX_LINES {
+    let first = picked.saturating_sub(VISIBLE_LINES - 1);
+    for offset in 0..VISIBLE_LINES {
         let index = first + offset;
         let Some(line) = line_at(active, recent, index) else {
             break;
@@ -93,7 +93,7 @@ where
                         .draw(display)?;
                 }
                 text(display, if chosen { ">" } else { " " }, 12, y, CYAN, false)?;
-                let label = format_device_id(&device_id);
+                let label = hex_device_id(&device_id);
                 text(display, label.as_str(), 24, y, WHITE, false)?;
             }
         }

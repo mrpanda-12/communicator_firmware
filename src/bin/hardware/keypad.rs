@@ -136,7 +136,7 @@ pub struct Keypad<I2C> {
 }
 
 impl<I2C: I2c> Keypad<I2C> {
-    /// 1/ Keep the bus and IRQ pin; configuration waits for the worker.
+    /// Keep the bus and IRQ pin; configuration waits for the worker.
     pub const fn new(i2c: I2C, irq: Input<'static>) -> Self {
         Self {
             i2c,
@@ -148,7 +148,7 @@ impl<I2C: I2c> Keypad<I2C> {
         }
     }
 
-    /// 2/ Sleep on the expander interrupt and call back once per settled press.
+    /// Sleep on the expander interrupt and call back once per settled press.
     ///
     /// This mirrors `Radio::run_worker`: the worker owns the bus and the caller
     /// decides what a key means, so a missing expander only stops key events.
@@ -195,7 +195,7 @@ impl<I2C: I2c> Keypad<I2C> {
         }
     }
 
-    /// 3/ Scan once and report a key only when a newly pressed key is stable.
+    /// Scan once and report a key only when a newly pressed key is stable.
     fn poll(&mut self) -> Result<Option<KeypadKey>, I2C::Error> {
         if !self.configured {
             self.configure()?;
@@ -225,7 +225,7 @@ impl<I2C: I2c> Keypad<I2C> {
         })
     }
 
-    /// 4/ True when no key change is waiting for another scan.
+    /// True when no key change is waiting for another scan.
     fn is_settled(&self) -> bool {
         self.candidate == self.debounced
     }
@@ -234,7 +234,7 @@ impl<I2C: I2c> Keypad<I2C> {
         self.irq.is_low()
     }
 
-    /// 5/ Rows become pulled-up interrupt inputs; columns idle low.
+    /// Rows become pulled-up interrupt inputs; columns idle low.
     fn configure(&mut self) -> Result<(), I2C::Error> {
         // Mirror INTB onto INTA and use an open-drain active-low output.
         self.write_register(REG_IOCON, IOCON_VALUE)?;
@@ -258,7 +258,7 @@ impl<I2C: I2c> Keypad<I2C> {
         Ok(())
     }
 
-    /// 6/ Drive one column low, read every row, then return to idle and re-arm.
+    /// Drive one column low, read every row, then return to idle and re-arm.
     fn scan(&mut self) -> Result<Option<KeypadKey>, I2C::Error> {
         let mut pressed = None;
         for column in 0..COLUMNS {
@@ -287,7 +287,7 @@ impl<I2C: I2c> Keypad<I2C> {
         Ok(pressed)
     }
 
-    /// 7/ Pull one column low while the other four stay high.
+    /// Pull one column low while the other four stay high.
     fn drive_column(&mut self, column: usize) -> Result<(), I2C::Error> {
         let mut columns_a = COLUMN_A_MASK;
         if column < 4 {
@@ -298,13 +298,13 @@ impl<I2C: I2c> Keypad<I2C> {
         self.write_register(REG_OLAT_B, columns_b)
     }
 
-    /// 8/ Leave every column low so any pressed key latches an interrupt.
+    /// Leave every column low so any pressed key latches an interrupt.
     fn idle_columns(&mut self) -> Result<(), I2C::Error> {
         self.write_register(REG_OLAT_A, 0)?;
         self.write_register(REG_OLAT_B, 0)
     }
 
-    /// 9/ Reading the ports clears the interrupt-on-change latch.
+    /// Reading the ports clears the interrupt-on-change latch.
     fn clear_interrupt(&mut self) -> Result<(), I2C::Error> {
         self.read_register(REG_GPIO_A)?;
         self.read_register(REG_GPIO_B)?;

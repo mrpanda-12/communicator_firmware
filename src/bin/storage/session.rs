@@ -50,7 +50,7 @@ impl Flash {
     /// from reserving the same range.
     pub async fn reserve_packet_ids(&self, count: u16) -> u32 {
         self.with(async |session| {
-            let first = packet_data::current_packet_id();
+            let first = packet_data::next_packet_id();
             let next = first.wrapping_add(u32::from(count));
             if session
                 .storage
@@ -60,7 +60,7 @@ impl Flash {
             {
                 defmt::warn!("Could not persist the next packet ID");
             }
-            packet_data::set_local_packet_ids(next, first);
+            packet_data::set_packet_ids(next, first);
             first
         })
         .await

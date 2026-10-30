@@ -29,8 +29,10 @@ use crate::radio::{
     radio_error::RadioError,
     types::RadioConfig,
 };
-use crate::storage::message::{ConversationId, Direction, StoredMessage};
+use crate::calendar::days_from_civil;
+use crate::storage::message::{ConversationId, StoredMessage};
 use crate::storage::session::Flash;
+use crate::ui::contact::preview_text;
 use crate::ui::{
     contact::ContactBook,
     state::{HistoryPageRequest, ManageAction, ManageCommand, OutgoingBody, OutgoingMessage},
@@ -45,14 +47,14 @@ use state::{
 };
 
 /// A broadcast row names the sender; unknown peers render a short ID instead.
-fn broadcast_sender_label(contacts: &ContactBook, sender: &[u8; 16]) -> heapless::String<32> {
-    match contacts.entry_by_kind(ConversationId::Direct(*sender)) {
-        Some(entry) => entry.display_name(),
+fn broadcast_sender_label(contacts: &ContactBook, sender_id: &[u8; 16]) -> heapless::String<32> {
+    match contacts.entry_by_conversation(ConversationId::Direct(*sender_id)) {
+        Some(entry) => entry.list_label(),
         None => {
             let mut label = heapless::String::<32>::new();
             let _ = core::fmt::Write::write_fmt(
                 &mut label,
-                format_args!("UNHEARD {:02X}{:02X}", sender[0], sender[1]),
+                format_args!("UNHEARD {:02X}{:02X}", sender_id[0], sender_id[1]),
             );
             label
         }
@@ -61,7 +63,6 @@ fn broadcast_sender_label(contacts: &ContactBook, sender: &[u8; 16]) -> heapless
 
 /// List rows that can have a conversation: every contact slot, including the
 /// broadcast entry that always occupies the first one.
-const MAX_VISIBLE_CONVERSATIONS: usize = contact::MAX_CONTACTS;
 
 /// A scan repeats its announcement at this rate while it is open.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -111,7 +112,7 @@ pub fn gps_snapshot(
 impl GpsSnapshot {
     /// UTC seconds since 2000-01-01 for a record written now, or 0 when the
     /// receiver has no dated fix. Local only: nothing on the wire changes.
-    pub fn utc_seconds(self) -> u32 {
+    pub fn timestamp(self) -> u32 {
         let Some(date) = self.date else { return 0 };
         if !self.has_time {
             return 0;
@@ -124,18 +125,8 @@ impl GpsSnapshot {
     }
 }
 
-/// Days since 1970-01-01 for one proleptic Gregorian date.
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year } as i64;
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let shifted_month = (month as i64 + 9) % 12;
-    let day_of_year = (153 * shifted_month + 2) / 5 + day as i64 - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
 
-/// 3/ React to screen events, chat storage, and received-message notifications.
+/// React to screen events, chat storage, and received-message notifications.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<'a, D>(
     mut display: D,
@@ -194,7 +185,7 @@ where
     seed_previews(&mut state, flash).await;
 
     let popups = notify::popup_receiver();
-    let mut changes = notify::revision_receiver();
+    let mut changes = notify::history_revision_receiver();
     let mut previous_state = None;
     let mut previous_gps = None;
     let mut synced = None;
@@ -247,7 +238,7 @@ where
                 handle_popup(&mut state, flash, popup).await;
             }
             // A storage-revision bump needs no immediate action; the loop
-            // reads notify::revision() below on the next pass.
+            // reads notify::history_revision() below on the next pass.
             Either::Second(Either::First(Either::First(Either::Second(_)))) => {}
             Either::Second(Either::First(Either::Second(key))) => state.handle_keypad(key),
             // One due repeat of a running announcement scan.
@@ -275,12 +266,12 @@ where
         }
 
         // The universal BACK leaves the scan list: stop repeating immediately.
-        if state.take_scan_cancel() {
+        if state.take_pending_scan_cancel() {
             next_announce = None;
             scan_until = None;
         }
 
-        if let Some(peer_id) = state.take_contact_request() {
+        if let Some(peer_id) = state.take_pending_contact_request() {
             send_contact_request(state.device_id, peer_id, flash, radio_queue).await;
         }
 
@@ -424,14 +415,14 @@ where
                 })
                 .await;
             // Every preview line is gone together with the records.
-            let kinds = state
+            let conversations = state
                 .contacts
                 .entries()
                 .iter()
-                .map(|entry| entry.kind)
+                .map(|entry| entry.conversation)
                 .collect::<alloc::vec::Vec<_>>();
-            for kind in kinds {
-                state.contacts.seed_preview(kind, "", false, false, 0);
+            for conversation in conversations {
+                state.contacts.seed_preview(conversation, "", false, false, 0);
             }
             defmt::info!("Deleted all chat history");
         }
@@ -439,12 +430,12 @@ where
         // Service an explicit arrow-key history page request first.
         if let Some(request) = state.take_pending_history_page() {
             load_conversation_page(&mut state, flash, request).await;
-            synced = Some((notify::revision(), state.active_conversation()));
+            synced = Some((notify::history_revision(), state.active_conversation()));
         }
 
         // Reload the latest page when the conversation changes or history moves.
         let active = state.active_conversation();
-        let revision = notify::revision();
+        let revision = notify::history_revision();
         if synced != Some((revision, active)) {
             synced = Some((revision, active));
             if let Some(conversation) = active {
@@ -533,11 +524,11 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
     }
 
     // Stamp the record from GPS UTC; the chats list sorts and shows this.
-    let timestamp = state.gps_snapshot.utc_seconds();
+    let timestamp = state.gps_snapshot.timestamp();
     // Persist the sent message so a later ACK can turn it green after reboot.
     let stored = StoredMessage::new(
         message_id,
-        Direction::Sent,
+        true,
         timestamp,
         outgoing.message_type(),
         outgoing.text(),
@@ -556,8 +547,8 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
         })
         .await;
     if saved {
-        notify::changed();
-        let preview = crate::ui::contact::preview_text(outgoing.text(), outgoing.coordinates());
+        notify::history_changed();
+        let preview = preview_text(outgoing.text(), outgoing.coordinates());
         state
             .contacts
             .seed_preview(conversation, preview.as_str(), true, false, timestamp);
@@ -702,10 +693,10 @@ async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Pop
     if popup.popup_type == notify::PopupType::ContactRequest {
         popup.name = match state
             .contacts
-            .entry_by_kind(ConversationId::Direct(popup.sender))
+            .entry_by_conversation(ConversationId::Direct(popup.sender_id))
         {
             Some(entry) => entry.name_or_id(),
-            None => crate::ui::contact::hex_id(popup.sender),
+            None => crate::hex::hex_device_id(&popup.sender_id),
         };
         state.show_popup(popup);
         return;
@@ -715,7 +706,7 @@ async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Pop
     seed_preview_conversation(state, flash, conversation).await;
     let blocked = state
         .contacts
-        .entry_by_kind(conversation)
+        .entry_by_conversation(conversation)
         .is_some_and(|entry| entry.blocked);
     if blocked {
         return;
@@ -723,10 +714,10 @@ async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Pop
     // The toast names the sender on the left, falling back to the device ID.
     popup.name = match state
         .contacts
-        .entry_by_kind(ConversationId::Direct(popup.sender))
+        .entry_by_conversation(ConversationId::Direct(popup.sender_id))
     {
         Some(entry) => entry.name_or_id(),
-        None => crate::ui::contact::hex_id(popup.sender),
+        None => crate::hex::hex_device_id(&popup.sender_id),
     };
     state.show_popup(popup);
 }
@@ -749,7 +740,7 @@ async fn apply_manage(state: &mut UiState, flash: &Flash, manage: ManageCommand)
                 let _ = state.contacts.remove(index);
             }
             if deleted {
-                notify::changed();
+                notify::history_changed();
             }
             defmt::info!("Deleted one contact and its chat history");
         }
@@ -812,10 +803,15 @@ async fn load_conversation_page(state: &mut UiState, flash: &Flash, request: His
                     &mut session.buffer,
                 )
                 .await
-                .unwrap_or((0, 0, 0, alloc::vec::Vec::new()))
+                .unwrap_or_default()
         })
         .await;
-    let (total, base, start, records) = page;
+    let crate::hardware::flash::MessagePage {
+        total,
+        base,
+        start,
+        messages: records,
+    } = page;
     let mut rows: HeaplessVec<ChatRow, MAX_CHAT_MESSAGES> = HeaplessVec::new();
     for record in records.iter() {
         let sender_label = match &request.conversation {
@@ -830,7 +826,7 @@ async fn load_conversation_page(state: &mut UiState, flash: &Flash, request: His
         && let Some(newest) = records.last()
     {
         let preview =
-            crate::ui::contact::preview_text(newest.text.as_str(), newest.kind.coordinates());
+            preview_text(newest.text.as_str(), newest.kind.coordinates());
         state.contacts.seed_preview(
             request.conversation,
             preview.as_str(),
@@ -864,7 +860,7 @@ async fn seed_preview_conversation(
         })
         .await;
     let Some(record) = newest else { return };
-    let preview = crate::ui::contact::preview_text(record.text.as_str(), record.kind.coordinates());
+    let preview = preview_text(record.text.as_str(), record.kind.coordinates());
     state.contacts.seed_preview(
         conversation,
         preview.as_str(),
@@ -876,16 +872,16 @@ async fn seed_preview_conversation(
 
 /// Fill every visible chat-list preview from flash at boot.
 async fn seed_previews(state: &mut UiState, flash: &Flash) {
-    let mut kinds: heapless::Vec<ConversationId, MAX_VISIBLE_CONVERSATIONS> = heapless::Vec::new();
+    let mut conversations: heapless::Vec<ConversationId, { contact::MAX_CONTACTS }> = heapless::Vec::new();
     for index in state.contacts.visible_indices(false).iter() {
         if let Some(entry) = state.contacts.entry(*index)
-            && kinds.push(entry.kind).is_err()
+            && conversations.push(entry.conversation).is_err()
         {
             break;
         }
     }
-    for kind in kinds {
-        seed_preview_conversation(state, flash, kind).await;
+    for conversation in conversations {
+        seed_preview_conversation(state, flash, conversation).await;
     }
 }
 

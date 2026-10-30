@@ -9,7 +9,7 @@ The LR1121 driver in `src/bin/hardware/lr1121/` and the worker in `src/bin/radio
 ```rust
 RadioConfig {
     frequency_band: FrequencyBand::SubGhz,
-    bandwidth: LoRaBandwidth::Khz125,
+    bandwidth: LoraBandwidth::Khz125,
     pa_mode: PaMode::HighPower,
     tx_power_dbm: 22,
     ..RadioConfig::new(869_400_000)
@@ -27,12 +27,12 @@ A working link needs matching frequency, bandwidth, spreading factor, coding rat
 | Band | Range | Modem | RX | Maximum encoded packet |
 | --- | --- | --- | --- | ---: |
 | `SubGhz` | 150–960 MHz | LoRa | Yes | 255 bytes |
-| `Sband` | 1.9–2.1 GHz | LR-FHSS | No; TX only | 133 bytes |
+| `SBand` | 1.9–2.1 GHz | LR-FHSS | No; TX only | 133 bytes |
 | `Ism2_4Ghz` | 2.4–2.5 GHz | LoRa | Yes | 255 bytes |
 
 LoRa bandwidths supported by the driver: sub-GHz 62.5/125/250/500 kHz; 2.4 GHz also 203/406/812 kHz. PA modes cap transmit power at 14 dBm (low power), 22 dBm (high power sub-GHz path), and 13 dBm (high-frequency path used for S-band and 2.4 GHz). This board's sub-GHz output is wired through the HP PA configuration for both sub-GHz modes.
 
-S-band uses the `SbandDefault` LR-FHSS profile: GMSK modulation, 5/6 coding rate, 136.72 kHz bandwidth, hopping enabled, two header blocks, and sync word `0x2C0F7995`. The LR1121 LR-FHSS implementation is transmit-only, and the worker does not start RX while configured for S-band. S-band requires an antenna/front end that actually supports 2 GHz.
+S-band uses the `SBandDefault` LR-FHSS profile: GMSK modulation, 5/6 coding rate, 136.72 kHz bandwidth, hopping enabled, two header blocks, and sync word `0x2C0F7995`. The LR1121 LR-FHSS implementation is transmit-only, and the worker does not start RX while configured for S-band. S-band requires an antenna/front end that actually supports 2 GHz.
 
 These are radio capabilities, not evidence that this board's RF path, antenna, or enclosure works in any band. No RF range or interoperability test is recorded here.
 

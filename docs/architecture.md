@@ -72,7 +72,7 @@ Broadcasts and packets for other devices may be forwarded after hop-limit decrem
 
 `UiState` is the screen state machine and command producer. A key mutates screen state or sets one pending command (send, pairing, announcement, identity reset, frequency request, contact action, deletion, or history-page request). The UI loop consumes those commands and performs radio/storage operations outside the renderer. `ui/render/` functions draw the state; `draw_if_changed` repaints the affected region or page rather than running storage or networking logic during rendering.
 
-Received messages use `notify::receive`: one bounded popup is queued and the history revision is incremented. A revision wake causes an open chat to reload its newest page; list previews are read from flash on boot or when a message notification arrives. Pressing Up/Down while the chat composer is empty browses records in pages of four; the selected row can open coordinate navigation. See [user interface](display-plan.md) and [chat history](chat-fragmentation-and-navigation.md).
+Received messages use `notify::message_received`: one bounded popup is queued and the history revision is incremented. A revision wake causes an open chat to reload its newest page; list previews are read from flash on boot or when a message notification arrives. Pressing Up/Down while the chat composer is empty browses records in pages of four; the selected row can open coordinate navigation. See [user interface](display-plan.md) and [chat history](chat-fragmentation-and-navigation.md).
 
 ## Module responsibilities
 

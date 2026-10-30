@@ -54,7 +54,7 @@ async fn handle(line: &[u8], flash: &Flash) {
     if line == PRINT_IDS {
         defmt::info!(
             "Next packet ID {:x}, last message ID {:x}",
-            packet_data::current_packet_id(),
+            packet_data::next_packet_id(),
             packet_data::last_message_id()
         );
     } else if line == RESET_IDS {
@@ -67,7 +67,7 @@ async fn handle(line: &[u8], flash: &Flash) {
                     .save_packet_ids(0, 0, &mut session.buffer)
                     .await
                     .is_ok();
-                packet_data::set_local_packet_ids(0, 0);
+                packet_data::set_packet_ids(0, 0);
                 saved
             })
             .await;

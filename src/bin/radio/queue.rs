@@ -13,20 +13,20 @@ pub const QUEUE_CAPACITY: usize = 32;
 
 pub type Packet = Vec<u8, MAX_PACKET_SIZE>;
 
-/// 1/ Hold the queues associated with one radio instance.
+/// Hold the queues associated with one radio instance.
 pub struct RadioQueue {
     packets: Channel<CriticalSectionRawMutex, Packet, QUEUE_CAPACITY>,
 }
 
 impl RadioQueue {
-    /// 2/ Create an empty TX queue for one radio worker.
+    /// Create an empty TX queue for one radio worker.
     pub const fn new() -> Self {
         Self {
             packets: Channel::new(),
         }
     }
 
-    /// 3/ Validate and encode a packet before adding it to this radio's FIFO.
+    /// Validate and encode a packet before adding it to this radio's FIFO.
     pub fn add_packet(&self, packet: &PacketData) -> Result<(), QueueError> {
         packet.validate().map_err(QueueError::Packet)?;
 
@@ -50,12 +50,12 @@ impl RadioQueue {
         self.packets.try_send(packet).map_err(|_| QueueError::Full)
     }
 
-    /// 4/ Let the owning radio worker wait for its next encoded packet.
+    /// Let the owning radio worker wait for its next encoded packet.
     pub(crate) async fn next_packet(&self) -> Packet {
         self.packets.receive().await
     }
 
-    /// 5/ Report queued packets without counting a packet already transmitting.
+    /// Report queued packets without counting a packet already transmitting.
     pub(crate) fn queued_packet_count(&self) -> usize {
         self.packets.len()
     }

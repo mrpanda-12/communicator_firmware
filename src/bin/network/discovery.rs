@@ -4,20 +4,20 @@ use embassy_sync::{
     watch::{Receiver, Watch},
 };
 
-/// 1/ Keep bounded lists of peers heard on the air, announced or passive.
+/// Keep bounded lists of peers heard on the air, announced or passive.
 pub struct DeviceDiscovery {
     devices: Watch<CriticalSectionRawMutex, DiscoverySnapshot, 1>,
 }
 
 impl DeviceDiscovery {
-    /// 2/ Start with empty lists that the UI can read immediately.
+    /// Start with empty lists that the UI can read immediately.
     pub const fn new() -> Self {
         Self {
             devices: Watch::new_with(DiscoverySnapshot::new()),
         }
     }
 
-    /// 3/ Record a peer heard in any accepted packet.
+    /// Record a peer heard in any accepted packet.
     pub fn remember(&self, device_id: [u8; 16]) {
         let sender = self.devices.sender();
         let mut snapshot = sender.try_get().unwrap_or_default();
@@ -25,7 +25,7 @@ impl DeviceDiscovery {
         sender.send(snapshot);
     }
 
-    /// 3/ Record a peer that announced itself, for the active search list.
+    /// Record a peer that announced itself, for the active search list.
     pub fn remember_announce(&self, device_id: [u8; 16]) {
         let sender = self.devices.sender();
         let mut snapshot = sender.try_get().unwrap_or_default();
@@ -34,7 +34,7 @@ impl DeviceDiscovery {
         sender.send(snapshot);
     }
 
-    /// 4/ Give the UI a live view of both lists.
+    /// Give the UI a live view of both lists.
     pub fn receiver(&self) -> Option<Receiver<'_, CriticalSectionRawMutex, DiscoverySnapshot, 1>> {
         self.devices.receiver()
     }

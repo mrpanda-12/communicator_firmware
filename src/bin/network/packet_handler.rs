@@ -27,7 +27,7 @@ use crate::{
     radio::queue::{Packet, QueueError, RadioQueue},
     storage::{
         contact::Contact,
-        message::{Direction, MessageType, StoredMessage},
+        message::{MessageType, StoredMessage},
         session::Flash,
     },
 };
@@ -46,7 +46,7 @@ type PairKey = [u8; crypto::KEY_SIZE];
 
 /// One authenticated fragment, kept so a retransmit still gets its ACK.
 struct Accepted {
-    sender: [u8; 16],
+    sender_id: [u8; 16],
     packet_id: u32,
     message_id: u32,
     fingerprint: [u8; 32],
@@ -158,9 +158,9 @@ impl PacketHandler {
     }
 
     /// Record one fragment key; true when it was already seen.
-    fn is_duplicate(&mut self, sender: [u8; 16], packet_id: u32) -> bool {
+    fn is_duplicate(&mut self, sender_id: [u8; 16], packet_id: u32) -> bool {
         // Report a repeated key so the caller can drop the duplicate.
-        let key = (sender, packet_id);
+        let key = (sender_id, packet_id);
         if self.seen.contains(&key) {
             return true;
         }
@@ -199,7 +199,7 @@ impl PacketHandler {
             .accepted
             .iter()
             .find(|accepted| {
-                accepted.sender == packet.from
+                accepted.sender_id == packet.from
                     && accepted.packet_id == packet.packet_id
                     && accepted.message_id == packet.message_id
                     && accepted.fingerprint == content
@@ -254,8 +254,8 @@ impl PacketHandler {
         // Cache every fragment so a retransmit can be acknowledged again.
         let message_id = message.first_packet.message_id;
         for fragment in message.accepted_fragments.iter() {
-            self.remember(Accepted {
-                sender: packet.from,
+            self.remember_accepted(Accepted {
+                sender_id: packet.from,
                 packet_id: fragment.packet_id,
                 message_id,
                 fingerprint: fragment.fingerprint,
@@ -310,8 +310,8 @@ impl PacketHandler {
         let conversation = ConversationId::from_peer(packet.from);
         let stored = StoredMessage::new(
             packet.message_id,
-            Direction::Received,
-            crate::now_utc_seconds(),
+            false,
+            crate::now_timestamp(),
             MessageType::Coords {
                 latitude_microdegrees: latitude,
                 longitude_microdegrees: longitude,
@@ -330,8 +330,8 @@ impl PacketHandler {
         let Some(key) = pair_key else {
             return;
         };
-        self.remember(Accepted {
-            sender: packet.from,
+        self.remember_accepted(Accepted {
+            sender_id: packet.from,
             packet_id: packet.packet_id,
             message_id: packet.message_id,
             fingerprint: fingerprint(packet),
@@ -372,7 +372,7 @@ impl PacketHandler {
             .await;
         match marked {
             Ok(0) => defmt::warn!("Received ACK for a message that is not stored"),
-            Ok(_) => notify::changed(),
+            Ok(_) => notify::history_changed(),
             Err(_) => defmt::warn!("Could not mark the acknowledged message in flash"),
         }
     }
@@ -542,10 +542,10 @@ impl PacketHandler {
     }
 
     /// Store one accepted fragment, replacing an older copy of the same fragment.
-    fn remember(&mut self, accepted: Accepted) {
+    fn remember_accepted(&mut self, accepted: Accepted) {
         // Drop any earlier record for this fragment so the newest copy survives.
         if let Some(index) = self.accepted.iter().position(|known| {
-            known.sender == accepted.sender && known.packet_id == accepted.packet_id
+            known.sender_id == accepted.sender_id && known.packet_id == accepted.packet_id
         }) {
             self.accepted.remove(index);
         }
@@ -710,8 +710,8 @@ async fn deliver_text(
 
     let stored = StoredMessage::new(
         first.message_id,
-        Direction::Received,
-        crate::now_utc_seconds(),
+        false,
+        crate::now_timestamp(),
         MessageType::Text,
         text,
         first.packet_id,
@@ -769,7 +769,7 @@ async fn save_message(
             Some(_) => "[GPS]",
             None => stored.text.as_str(),
         };
-        notify::receive(conversation, stored.sender_id, body);
+        notify::message_received(conversation, stored.sender_id, body);
         SaveResult::Stored
     } else {
         defmt::warn!("Could not save the received message to flash");

@@ -128,7 +128,7 @@ A conversation keeps at most 128 records. Before appending when the count minus 
 
 ## Reading and paging
 
-`load_message_page(device_id, start, max_messages, buffer)` returns `(total, base, start, records)`:
+`load_message_page(device_id, start, max_messages, buffer)` returns a `MessagePage { total, base, start, messages }`:
 
 - With `start = None` it returns the newest `max_messages` records.
 - With `Some(n)` it returns records from ordinal `n`, clipped to the retained range `base..total`.

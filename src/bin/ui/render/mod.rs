@@ -21,7 +21,7 @@ use super::{
     state::{Screen, UiState},
 };
 
-/// 1/ Draw the fixed status bar, then dispatch to the active page renderer.
+/// Draw the fixed status bar, then dispatch to the active page renderer.
 pub fn draw<D>(display: &mut D, state: &UiState, gps: GpsSnapshot) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -31,7 +31,7 @@ where
     draw_page(display, state)
 }
 
-/// 2/ Redraw changed UI objects and retain pixels for every unchanged object.
+/// Redraw changed UI objects and retain pixels for every unchanged object.
 pub fn draw_if_changed<D>(
     display: &mut D,
     state: &UiState,
@@ -94,7 +94,7 @@ where
         (Screen::ContactsList { selected: old }, Screen::ContactsList { selected })
             if previous.contacts == state.contacts =>
         {
-            screens::contacts::update_selection(display, &state.contacts, *old, *selected)
+            screens::contacts::update_contacts_selection(display, &state.contacts, *old, *selected)
         }
         (
             Screen::SettingsSection {
@@ -103,7 +103,7 @@ where
             },
             Screen::SettingsSection { section, selected },
         ) if old_section == section => {
-            screens::settings::update_selection(display, *section, *old, *selected)
+            screens::settings::update_settings_item_selection(display, *section, *old, *selected)
         }
         (Screen::ChatsList { selected: old }, Screen::ChatsList { selected })
             if previous.contacts == state.contacts && previous.messages == state.messages =>
@@ -201,7 +201,7 @@ where
         } => {
             let entry = state
                 .contacts
-                .entry_by_kind(ConversationId::Direct(*device_id));
+                .entry_by_conversation(ConversationId::Direct(*device_id));
             let blocked = entry.is_some_and(|entry| entry.blocked);
             let has_key = entry.is_some_and(|entry| entry.key.is_some());
             let name = entry

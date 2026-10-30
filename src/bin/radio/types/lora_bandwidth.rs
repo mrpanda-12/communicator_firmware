@@ -2,7 +2,7 @@ use super::FrequencyBand;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u32)]
-pub enum LoRaBandwidth {
+pub enum LoraBandwidth {
     Khz62_5 = 62_500,
     #[default]
     Khz125 = 125_000,
@@ -13,7 +13,7 @@ pub enum LoRaBandwidth {
     Khz812 = 812_000,
 }
 
-impl LoRaBandwidth {
+impl LoraBandwidth {
     pub const fn hz(self) -> u32 {
         self as u32
     }
@@ -31,7 +31,7 @@ impl LoRaBandwidth {
             (FrequencyBand::Ism2_4Ghz, Self::Khz406) => Some(0x0E),
             (FrequencyBand::Ism2_4Ghz, Self::Khz500) => Some(0x06),
             (FrequencyBand::Ism2_4Ghz, Self::Khz812) => Some(0x0F),
-            (FrequencyBand::Sband, _) => None,
+            (FrequencyBand::SBand, _) => None,
             (_, Self::Khz203 | Self::Khz406 | Self::Khz812) => None,
         }
     }

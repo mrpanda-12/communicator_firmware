@@ -201,7 +201,11 @@ fn build_pairing_packet(
     .ok()?;
 
     let (aad, aad_len) = pairing_aad(&packet, stage, request_nonce, response_nonce);
-    let (nonce, ciphertext, tag) = crypto::encrypt(key, &[], &aad[..aad_len]).ok()?;
+    let crypto::Sealed {
+        nonce,
+        ciphertext,
+        tag,
+    } = crypto::encrypt(key, &[], &aad[..aad_len]).ok()?;
     if !ciphertext.is_empty() {
         return None;
     }

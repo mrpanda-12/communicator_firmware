@@ -16,7 +16,11 @@ pub const TAG_SIZE: usize = GCM_TAG_SIZE;
 const PAIR_KDF_ROUNDS: u32 = 100_000;
 
 /// One authenticated ciphertext: the nonce, the ciphertext, and the tag.
-pub type Sealed = ([u8; NONCE_SIZE], Vec<u8>, [u8; TAG_SIZE]);
+pub struct Sealed {
+    pub nonce: [u8; NONCE_SIZE],
+    pub ciphertext: Vec<u8>,
+    pub tag: [u8; TAG_SIZE],
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
@@ -62,7 +66,11 @@ pub fn encrypt(key: &[u8; KEY_SIZE], data: &[u8], aad: &[u8]) -> Result<Sealed, 
         .encrypt_inout_detached(&nonce_ref, aad, ciphertext.as_mut_slice().into())
         .map_err(|_| CryptoError::EncryptionFailed)?;
 
-    Ok((nonce, ciphertext, tag.into()))
+    Ok(Sealed {
+        nonce,
+        ciphertext,
+        tag: tag.into(),
+    })
 }
 
 pub fn decrypt(
@@ -94,7 +102,11 @@ pub fn encrypt_packet_payload(
         return Err(CryptoError::EncryptionFailed);
     }
     let aad = packet.authenticated_header();
-    let (nonce, ciphertext, tag) = encrypt(key, plaintext, &aad)?;
+    let Sealed {
+        nonce,
+        ciphertext,
+        tag,
+    } = encrypt(key, plaintext, &aad)?;
     packet.payload.clear();
     packet
         .payload

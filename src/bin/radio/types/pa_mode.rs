@@ -6,7 +6,7 @@ pub enum PaMode {
     // Uses the high-power PA path for longer-range links within board limits.
     HighPower,
     // Uses the high-frequency PA path for S-band and 2.4 GHz operation.
-    HighFrequency,
+    HighFrequencyPath,
 }
 
 impl PaMode {
@@ -15,7 +15,7 @@ impl PaMode {
         match self {
             Self::LowPower => 14,
             Self::HighPower => 22,
-            Self::HighFrequency => 13,
+            Self::HighFrequencyPath => 13,
         }
     }
 
@@ -25,7 +25,7 @@ impl PaMode {
     pub(crate) const fn lr1121_register_values(self) -> (u8, u8, u8, u8) {
         match self {
             Self::LowPower | Self::HighPower => (0x01, 0x01, 0x04, 0x07),
-            Self::HighFrequency => (0x02, 0x00, 0x07, 0x00),
+            Self::HighFrequencyPath => (0x02, 0x00, 0x07, 0x00),
         }
     }
 }

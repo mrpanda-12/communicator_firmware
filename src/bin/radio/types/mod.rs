@@ -11,7 +11,7 @@ pub mod rx_buffer_status;
 
 pub use coding_rate::CodingRate;
 pub use frequency_band::FrequencyBand;
-pub use lora_bandwidth::LoRaBandwidth;
+pub use lora_bandwidth::LoraBandwidth;
 pub use lr_fhss::{
     LrFhssBandwidth, LrFhssBitRate, LrFhssCodingRate, LrFhssDeviceOffset, LrFhssGridSpacing,
     LrFhssHeaderCount, LrFhssHopSeed, LrFhssHopping, LrFhssModulation, LrFhssProfile,

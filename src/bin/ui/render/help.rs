@@ -7,7 +7,7 @@ use embedded_graphics::{
 
 use super::style::{BLACK, CYAN, MUTED, WHITE, text};
 
-/// 1/ Cover the page with a short legend for the 5x5 keypad.
+/// Cover the page with a short legend for the 5x5 keypad.
 ///
 /// The full ASCII table is a later addition; this panel only explains how the
 /// current hex-pair entry works.

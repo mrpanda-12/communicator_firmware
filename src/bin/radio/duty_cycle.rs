@@ -11,7 +11,7 @@ const BURST_US: i64 = WINDOW_US * DUTY_PERCENT / 100;
 /// Airtime a fresh boot may spend before it has accrued any budget.
 const INITIAL_US: i64 = BURST_US / 60;
 
-/// 1/ Enforces a 10 % transmit duty cycle for each RF band.
+/// Enforces a 10 % transmit duty cycle for each RF band.
 ///
 /// A token bucket accrues airtime at 10 % of real time and starts full, so a
 /// fresh boot can transmit one window's worth of traffic before it is paced.
@@ -26,7 +26,7 @@ struct Budget {
 }
 
 impl DutyCycle {
-    /// 2/ Create a limiter with a full budget for every band.
+    /// Create a limiter with a full budget for every band.
     pub const fn new() -> Self {
         Self {
             budgets: [Budget {
@@ -36,7 +36,7 @@ impl DutyCycle {
         }
     }
 
-    /// 3/ Wait until the band has airtime available, then charge it.
+    /// Wait until the band has airtime available, then charge it.
     pub async fn reserve(&mut self, band: FrequencyBand, airtime_us: u64) {
         let airtime = airtime_us.max(1) as i64;
 

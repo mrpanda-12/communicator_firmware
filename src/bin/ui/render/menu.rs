@@ -35,7 +35,7 @@ where
     )
 }
 
-/// 1/ Redraw only the two menu rows whose selection marker changed.
+/// Redraw only the two menu rows whose selection marker changed.
 pub fn update_main_selection<D>(
     display: &mut D,
     previous: usize,
@@ -52,7 +52,7 @@ where
     )
 }
 
-/// 2/ Redraw only the settings rows whose selection marker changed.
+/// Redraw only the settings rows whose selection marker changed.
 pub fn update_settings_selection<D>(
     display: &mut D,
     previous: usize,
@@ -64,9 +64,9 @@ where
     update_rows(display, &["DEVICE", "FREQUENCY", "GPS"], previous, selected)
 }
 
-/// 5/ Show saved contacts, passive nearby peers, and an active discovery scan.
-/// 6/ Repaint just the old and new rows in the contact manager.
-/// 3/ Draw the available entries for one selected Settings category.
+/// Show saved contacts, passive nearby peers, and an active discovery scan.
+/// Repaint just the old and new rows in the contact manager.
+/// Draw the available entries for one selected Settings category.
 pub fn draw_settings_section<D>(
     display: &mut D,
     section: SettingsSection,
@@ -89,7 +89,7 @@ where
     )
 }
 
-/// 4/ Repaint only the old and new selected entries inside a Settings category.
+/// Repaint only the old and new selected entries inside a Settings category.
 pub fn update_settings_section_selection<D>(
     display: &mut D,
     section: SettingsSection,
@@ -111,7 +111,7 @@ where
     Ok(())
 }
 
-/// 7/ Render the permanent broadcast conversation plus every saved contact,
+/// Render the permanent broadcast conversation plus every saved contact,
 /// each with its newest-message preview and sending / acknowledged badge.
 pub fn draw_chat_list<D>(
     display: &mut D,
@@ -140,7 +140,7 @@ where
     )
 }
 
-/// 8/ Update the old and new selected chat rows without repainting the list.
+/// Update the old and new selected chat rows without repainting the list.
 pub fn update_chat_selection<D>(
     display: &mut D,
     contacts: &ContactBook,
@@ -203,7 +203,7 @@ where
         false,
     )?;
     // The newest record's time sits on the right of the name line.
-    let time = time_label(entry.last_activity);
+    let time = time_label(entry.last_timestamp);
     text(display, time.as_str(), 276, y, MUTED, false)?;
 
     // One badge slot on the preview line: SENDING.. on an unacknowledged

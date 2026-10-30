@@ -22,22 +22,25 @@ pub const GCM_OVERHEAD: usize = GCM_NONCE_SIZE + GCM_TAG_SIZE;
 
 pub const DEFAULT_HOP_LIMIT: u8 = 3;
 
-/// Allocate packet IDs from one counter shared by all local producers.
+/// Recipient bytes that mark broadcast traffic on the wire.
+pub const BROADCAST_RECIPIENT: [u8; 16] = [0; 16];
+
+/// Next packet ID to hand out, from one counter shared by all local producers.
 /// A batch reservation keeps fragments of one message consecutive and prevents
 /// the UI, protocol responses, and announcements from colliding.
-static LOCAL_PACKET_ID: AtomicU32 = AtomicU32::new(0);
+static NEXT_PACKET_ID: AtomicU32 = AtomicU32::new(0);
 /// First ID of the most recent reservation, reported as the last message ID.
 static LAST_MESSAGE_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Set both counters: once at boot from flash, then from the reserved range.
-pub fn set_local_packet_ids(next: u32, last_message_id: u32) {
-    LOCAL_PACKET_ID.store(next, Ordering::Relaxed);
+pub fn set_packet_ids(next: u32, last_message_id: u32) {
+    NEXT_PACKET_ID.store(next, Ordering::Relaxed);
     LAST_MESSAGE_ID.store(last_message_id, Ordering::Relaxed);
 }
 
 /// Report the ID the next reservation starts from.
-pub fn current_packet_id() -> u32 {
-    LOCAL_PACKET_ID.load(Ordering::Relaxed)
+pub fn next_packet_id() -> u32 {
+    NEXT_PACKET_ID.load(Ordering::Relaxed)
 }
 
 /// Report the first ID of the most recent reservation.
@@ -167,8 +170,8 @@ impl PacketData {
     }
 
     pub fn is_broadcast(&self) -> bool {
-        // Detects broadcast traffic by checking for an all-zero recipient ID.
-        self.to.iter().all(|&byte| byte == 0)
+        // Detects broadcast traffic by checking for the reserved recipient ID.
+        self.to == BROADCAST_RECIPIENT
     }
 
     pub fn is_for(&self, device_id: &[u8; 16]) -> bool {

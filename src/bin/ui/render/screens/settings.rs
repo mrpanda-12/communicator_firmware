@@ -10,12 +10,14 @@ use crate::{
     },
 };
 
+use super::draw_option;
+use crate::hex::{hex_device_id, write_hex};
 use crate::ui::render::{
     menu,
     style::{CYAN, MUTED, WARNING, WHITE, text},
 };
 
-/// 1/ Draw one category's setting rows or the selected row's detail page.
+/// Draw one category's setting rows or the selected row's detail page.
 pub fn draw<D>(display: &mut D, section: SettingsSection, selected: usize) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -23,8 +25,8 @@ where
     menu::draw_settings_section(display, section, selected)
 }
 
-/// 2/ Update just the selection rows when the highlighted setting changes.
-pub fn update_selection<D>(
+/// Update just the selection rows when the highlighted setting changes.
+pub fn update_settings_item_selection<D>(
     display: &mut D,
     section: SettingsSection,
     previous: usize,
@@ -36,7 +38,7 @@ where
     menu::update_settings_section_selection(display, section, previous, selected)
 }
 
-/// 3/ Show the persisted device identity and describe other setting actions.
+/// Show the persisted device identity and describe other setting actions.
 pub fn draw_item<D>(
     display: &mut D,
     section: SettingsSection,
@@ -77,7 +79,7 @@ fn draw_packet_ids<D>(display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let next = crate::packet::packet_data::current_packet_id();
+    let next = crate::packet::packet_data::next_packet_id();
     let last_packet = next.saturating_sub(1);
     let last_message = crate::packet::packet_data::last_message_id();
     let used = u64::from(next) * 100 / u64::from(u32::MAX);
@@ -127,11 +129,7 @@ where
     text(display, "CHANGE IS SAVED AT ONCE", 12, 154, MUTED, false)
 }
 
-/// Show the name, password, block, and delete actions for one contact.
-/// 4/ Display heard sender IDs, passively or while an announce scan runs.
-/// 5/ Confirm adding one heard peer to the contact list.
-/// One-line contact name; an empty name keeps the device ID.
-/// Shared-secret password for the pairing handshake.
+/// Show the pairing handshake's progress for one peer.
 pub fn draw_pairing_status<D>(
     display: &mut D,
     device_id: &[u8; 16],
@@ -141,7 +139,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     text(display, "SECURE PAIRING", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
+    let identity = hex_device_id(device_id);
     text(display, identity.as_str(), 12, 78, WHITE, false)?;
     let (label, color) = match status {
         PairingUiStatus::Starting => ("STARTING PAIR REQUEST", MUTED),
@@ -154,29 +152,7 @@ where
     text(display, "ENTER / BACK: RETURN", 8, 218, WHITE, false)
 }
 
-fn draw_option<D>(display: &mut D, label: &str, y: i32, selected: bool) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    text(
-        display,
-        if selected { ">" } else { " " },
-        12,
-        y,
-        CYAN,
-        false,
-    )?;
-    text(
-        display,
-        label,
-        30,
-        y,
-        if selected { WHITE } else { MUTED },
-        false,
-    )
-}
-
-/// 6/ Require an explicit acknowledgement before opening an unencrypted DM.
+/// Require an explicit acknowledgement before opening an unencrypted DM.
 pub fn draw_unencrypted_dm_warning<D>(display: &mut D, device_id: &[u8; 16]) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -189,7 +165,7 @@ where
         crate::ui::render::style::WARNING,
         true,
     )?;
-    let identity = format_device_id(device_id);
+    let identity = hex_device_id(device_id);
     text(display, identity.as_str(), 12, 78, WHITE, false)?;
     text(
         display,
@@ -223,7 +199,7 @@ where
     text(display, "RESET IDENTITY", 12, 38, CYAN, true)?;
     match device_id {
         Some(device_id) => {
-            let identity = format_device_id(&device_id);
+            let identity = hex_device_id(&device_id);
             text(display, identity.as_str(), 12, 72, MUTED, false)?;
         }
         None => text(display, "NO IDENTITY YET", 12, 72, MUTED, false)?,
@@ -305,15 +281,7 @@ where
     text(display, "ENTER / BACK: SETTINGS", 8, 218, WHITE, false)
 }
 
-fn format_device_id(device_id: &[u8; 16]) -> String<40> {
-    let mut identity = String::<40>::new();
-    for byte in device_id {
-        let _ = write!(identity, "{byte:02X}");
-    }
-    identity
-}
-
-/// 8/ Show the configured frequency and transmit power without duplicating radio values.
+/// Show the configured frequency and transmit power without duplicating radio values.
 fn draw_radio_info<D>(display: &mut D, config: RadioConfig) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -329,7 +297,7 @@ where
     text(display, power.as_str(), 12, 128, WHITE, false)
 }
 
-/// 9/ Show the complete device identity on one line and the firmware version below it.
+/// Show the complete device identity on one line and the firmware version below it.
 fn draw_device_info<D>(
     display: &mut D,
     device_id: Option<[u8; 16]>,
@@ -341,12 +309,7 @@ where
     if let Some(device_id) = device_id {
         let mut identity = String::<56>::new();
         let _ = identity.write_str("ID: ");
-        for (index, byte) in device_id.iter().enumerate() {
-            if index > 0 {
-                let _ = identity.write_char(':');
-            }
-            let _ = write!(identity, "{byte:02X}");
-        }
+        let _ = write_hex(&mut identity, &device_id, Some(':'));
         text(display, identity.as_str(), 12, 104, WHITE, false)?;
     } else {
         text(display, "DEVICE ID UNAVAILABLE", 12, 104, MUTED, false)?;

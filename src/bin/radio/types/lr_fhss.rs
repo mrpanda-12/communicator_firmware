@@ -100,61 +100,61 @@ pub enum LrFhssDeviceOffset {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LrFhssProfile {
-    SbandDefault,
+    SBandDefault,
 }
 
 impl LrFhssProfile {
     pub const fn header_count(self) -> LrFhssHeaderCount {
         match self {
-            Self::SbandDefault => LrFhssHeaderCount::Two,
+            Self::SBandDefault => LrFhssHeaderCount::Two,
         }
     }
 
     pub const fn coding_rate(self) -> LrFhssCodingRate {
         match self {
-            Self::SbandDefault => LrFhssCodingRate::Cr5_6,
+            Self::SBandDefault => LrFhssCodingRate::Cr5_6,
         }
     }
 
     pub const fn modulation(self) -> LrFhssModulation {
         match self {
-            Self::SbandDefault => LrFhssModulation::Gmsk,
+            Self::SBandDefault => LrFhssModulation::Gmsk,
         }
     }
 
     pub const fn grid_spacing(self) -> LrFhssGridSpacing {
         match self {
-            Self::SbandDefault => LrFhssGridSpacing::NonFcc,
+            Self::SBandDefault => LrFhssGridSpacing::NonFcc,
         }
     }
 
     pub const fn hopping(self) -> LrFhssHopping {
         match self {
-            Self::SbandDefault => LrFhssHopping::Enabled,
+            Self::SBandDefault => LrFhssHopping::Enabled,
         }
     }
 
     pub const fn bandwidth(self) -> LrFhssBandwidth {
         match self {
-            Self::SbandDefault => LrFhssBandwidth::Khz136_72,
+            Self::SBandDefault => LrFhssBandwidth::Khz136_72,
         }
     }
 
     pub const fn max_payload_size(self) -> usize {
         match self {
-            Self::SbandDefault => 133,
+            Self::SBandDefault => 133,
         }
     }
 
     pub const fn hop_seed(self) -> LrFhssHopSeed {
         match self {
-            Self::SbandDefault => LrFhssHopSeed::Default,
+            Self::SBandDefault => LrFhssHopSeed::Default,
         }
     }
 
     pub const fn device_offset(self) -> LrFhssDeviceOffset {
         match self {
-            Self::SbandDefault => LrFhssDeviceOffset::Neutral,
+            Self::SBandDefault => LrFhssDeviceOffset::Neutral,
         }
     }
 }

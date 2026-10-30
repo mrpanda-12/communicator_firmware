@@ -9,7 +9,7 @@ use heapless::Vec;
 use crate::packet::packet_data::{MAX_FRAGMENT_COUNT, PacketData};
 
 /// Messages kept in RAM until the peer acknowledges them.
-pub const OUTBOX_SLOTS: usize = 2;
+pub const MAX_OUTBOX_SLOTS: usize = 2;
 /// Transmissions attempted for one message, including the first one.
 const MAX_ATTEMPTS: u8 = 3;
 /// Delay between the end of one transmission round and the next retry.
@@ -29,16 +29,16 @@ struct Pending {
 }
 
 const EMPTY: State = State {
-    slots: [const { None }; OUTBOX_SLOTS],
+    slots: [const { None }; MAX_OUTBOX_SLOTS],
 };
 
 static OUTBOX: Mutex<CriticalSectionRawMutex, RefCell<State>> = Mutex::new(RefCell::new(EMPTY));
 
 struct State {
-    slots: [Option<Pending>; OUTBOX_SLOTS],
+    slots: [Option<Pending>; MAX_OUTBOX_SLOTS],
 }
 
-/// 1/ Take ownership of one message's fragments for delivery.
+/// Take ownership of one message's fragments for delivery.
 pub fn submit(
     message_id: u32,
     packets: Vec<PacketData, MAX_FRAGMENT_COUNT>,
@@ -61,7 +61,7 @@ pub fn submit(
     })
 }
 
-/// 2/ Drop one message once its acknowledgement arrives.
+/// Drop one message once its acknowledgement arrives.
 pub fn acknowledge(message_id: u32) {
     OUTBOX.lock(|cell| {
         for slot in cell.borrow_mut().slots.iter_mut() {
@@ -75,7 +75,7 @@ pub fn acknowledge(message_id: u32) {
     });
 }
 
-/// 3/ Send whatever fits, then schedule or perform the next retry.
+/// Send whatever fits, then schedule or perform the next retry.
 ///
 /// `drained` is true when the radio FIFO is empty, so a retry timer only starts
 /// after the previous round has actually left the queue. Returns the number of

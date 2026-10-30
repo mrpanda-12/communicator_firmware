@@ -27,12 +27,24 @@ pub enum StoreError {
     Storage(sequential_storage::Error<FlashStorageError>),
 }
 
+/// One page of stored conversation history.
+#[derive(Default)]
+pub struct MessagePage {
+    /// Total records in the conversation.
+    pub total: u32,
+    /// Ordinal of the oldest retained record.
+    pub base: u32,
+    /// Ordinal of the first record in `messages`.
+    pub start: u32,
+    pub messages: Vec<StoredMessage>,
+}
+
 pub struct FlashStore<'d> {
     storage: MapStorage<StorageKey, AsyncFlash<'d>, StorageCache>,
 }
 
 impl<'d> FlashStore<'d> {
-    /// 1/ Open the reserved flash partition and prepare its indexed storage map.
+    /// Open the reserved flash partition and prepare its indexed storage map.
     ///
     /// The range must be dedicated to application data, erase-page aligned, and
     /// large enough for the map.
@@ -47,11 +59,11 @@ impl<'d> FlashStore<'d> {
         Ok(Self { storage })
     }
 
-    /// 2/ Read a typed setting by name; return `None` when the name has no value.
+    /// Read a typed setting by name; return `None` when the name has no value.
     ///
     /// Keep the type associated with each setting name stable between firmware
     /// versions because the serialized value has no separate type tag.
-    pub async fn get<V: for<'a> Value<'a>>(
+    pub async fn read_setting<V: for<'a> Value<'a>>(
         &mut self,
         name: &str,
         data_buffer: &mut [u8],
@@ -60,10 +72,10 @@ impl<'d> FlashStore<'d> {
         self.read_item::<V>(&key, data_buffer).await
     }
 
-    /// 3/ Save or replace a typed setting using the caller's reusable scratch buffer.
+    /// Save or replace a typed setting using the caller's reusable scratch buffer.
     ///
     /// The setting name must be nonempty and no longer than 31 UTF-8 bytes.
-    pub async fn set<V: for<'a> Value<'a>>(
+    pub async fn write_setting<V: for<'a> Value<'a>>(
         &mut self,
         name: &str,
         value: &V,
@@ -76,7 +88,7 @@ impl<'d> FlashStore<'d> {
             .map_err(StoreError::Storage)
     }
 
-    /// 4/ Find a contact by its 16-byte device ID without loading other contacts.
+    /// Find a contact by its 16-byte device ID without loading other contacts.
     pub async fn read_contact(
         &mut self,
         device_id: &[u8; 16],
@@ -86,8 +98,8 @@ impl<'d> FlashStore<'d> {
         self.read_item::<Contact>(&key, data_buffer).await
     }
 
-    /// 5/ Load the latest records stored under contact keys for the UI list.
-    pub async fn load_contacts(
+    /// Read the latest records stored under contact keys for the UI list.
+    pub async fn read_contacts(
         &mut self,
         data_buffer: &mut [u8],
     ) -> Result<Vec<Contact>, StoreError> {
@@ -122,7 +134,7 @@ impl<'d> FlashStore<'d> {
         Ok(contacts)
     }
 
-    /// 6/ Insert or replace a contact, including its serialized pairwise key.
+    /// Insert or replace a contact, including its serialized pairwise key.
     pub async fn write_contact(
         &mut self,
         contact: &Contact,
@@ -135,7 +147,7 @@ impl<'d> FlashStore<'d> {
             .map_err(StoreError::Storage)
     }
 
-    /// 7/ Append records under per-conversation keys that index monotonically.
+    /// Append records under per-conversation keys that index monotonically.
     ///
     /// The separate count entry advances only after all records have been
     /// written, so a retry after a partial failure can safely reuse those indices.
@@ -187,14 +199,14 @@ impl<'d> FlashStore<'d> {
             .map_err(StoreError::Storage)
     }
 
-    /// 8/ Read an indexed page of one conversation, oldest first.
-    pub async fn load_message_page(
+    /// Read an indexed page of one conversation, oldest first.
+    pub async fn read_message_page(
         &mut self,
         device_id: &[u8; 16],
         requested_start: Option<u32>,
         max_messages: usize,
         buffer: &mut [u8],
-    ) -> Result<(u32, u32, u32, Vec<StoredMessage>), StoreError> {
+    ) -> Result<MessagePage, StoreError> {
         if max_messages == 0 {
             return Err(StoreError::InvalidKey);
         }
@@ -222,11 +234,16 @@ impl<'d> FlashStore<'d> {
                 Err(error) => return Err(error),
             }
         }
-        Ok((count, base, start, messages))
+        Ok(MessagePage {
+            total: count,
+            base,
+            start,
+            messages,
+        })
     }
 
     /// Read the newest records of one conversation, oldest first.
-    pub async fn load_recent_messages(
+    pub async fn read_recent_messages(
         &mut self,
         device_id: &[u8; 16],
         max_messages: usize,
@@ -235,9 +252,9 @@ impl<'d> FlashStore<'d> {
         if max_messages == 0 {
             return Err(StoreError::InvalidKey);
         }
-        self.load_message_page(device_id, None, max_messages, buffer)
+        self.read_message_page(device_id, None, max_messages, buffer)
             .await
-            .map(|(_, _, _, messages)| messages)
+            .map(|page| page.messages)
     }
 
     /// Report whether the newest records already hold this delivery.
@@ -247,7 +264,7 @@ impl<'d> FlashStore<'d> {
     pub async fn recent_message_exists(
         &mut self,
         device_id: &[u8; 16],
-        sender: &[u8; 16],
+        sender_id: &[u8; 16],
         packet_id: u32,
         message_id: u32,
         buffer: &mut [u8],
@@ -269,7 +286,7 @@ impl<'d> FlashStore<'d> {
             };
             if message.packet_id == packet_id
                 && message.message_id == message_id
-                && message.sender_id == *sender
+                && message.sender_id == *sender_id
             {
                 return Ok(true);
             }
@@ -277,7 +294,7 @@ impl<'d> FlashStore<'d> {
         Ok(false)
     }
 
-    /// 9/ Mark every sent record with this message ID as acknowledged and count how many moved.
+    /// Mark every sent record with this message ID as acknowledged and count how many moved.
     pub async fn mark_acknowledged(
         &mut self,
         device_id: &[u8; 16],
@@ -309,7 +326,7 @@ impl<'d> FlashStore<'d> {
         Ok(marked)
     }
 
-    /// 10/ Erase every key of one conversation's history.
+    /// Erase every key of one conversation's history.
     ///
     /// This is a full underlying-flash scan-and-delete; a conversation occupies
     /// few records on this device, and count entries are erased alongside them.

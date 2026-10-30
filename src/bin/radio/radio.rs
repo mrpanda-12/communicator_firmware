@@ -11,7 +11,7 @@ use crate::radio::control::RadioControl;
 use crate::radio::duty_cycle::DutyCycle;
 use crate::radio::queue::{Packet, QueueError, RadioQueue};
 use crate::radio::radio_error::RadioError;
-use crate::radio::types::{FrequencyBand, LoRaBandwidth, PaMode, PacketStatus, RadioConfig};
+use crate::radio::types::{FrequencyBand, LoraBandwidth, PaMode, PacketStatus, RadioConfig};
 
 // Routes these LR1121 IRQ register bits to DIO9.
 const IRQ_TX_DONE: u32 = 1 << 2;
@@ -100,7 +100,7 @@ where
         self.lr1121.set_standby(1)?;
 
         match config.frequency_band {
-            FrequencyBand::Sband => self.lr1121.set_lr_fhss_packet_type()?,
+            FrequencyBand::SBand => self.lr1121.set_lr_fhss_packet_type()?,
             FrequencyBand::SubGhz | FrequencyBand::Ism2_4Ghz => {
                 self.lr1121.set_lora_packet_type()?;
             }
@@ -121,7 +121,7 @@ where
             .set_rssi_calibration_for_frequency(config.frequency_hz)?;
 
         match config.frequency_band {
-            FrequencyBand::Sband => {
+            FrequencyBand::SBand => {
                 self.lr1121.set_lr_fhss_modulation_params()?;
                 self.lr1121.set_lr_fhss_sync_word()?;
             }
@@ -206,7 +206,7 @@ where
         }
 
         if self.queue.queued_packet_count() == 0 && self.can_receive() {
-            self.start_rx_internal()?;
+            self.start_receive_internal()?;
         }
 
         loop {
@@ -228,7 +228,7 @@ where
                     if self.can_receive() {
                         if self.queue.queued_packet_count() == 0 {
                             self.tx_burst_count = 0;
-                            self.start_rx_internal()?;
+                            self.start_receive_internal()?;
                         } else if self.tx_burst_count >= TX_BURST_LIMIT {
                             self.listen_during_tx_burst(&mut on_packet_received).await?;
                         }
@@ -238,7 +238,7 @@ where
                     self.tx_burst_count = 0;
 
                     if self.queue.queued_packet_count() == 0 && self.can_receive() {
-                        self.start_rx_internal()?;
+                        self.start_receive_internal()?;
                     }
 
                     return Err(RadioError::TxTimeout);
@@ -315,7 +315,7 @@ where
             self.rx_active = false;
         }
 
-        if self.config.frequency_band == FrequencyBand::Sband {
+        if self.config.frequency_band == FrequencyBand::SBand {
             self.lr1121.build_lr_fhss_frame(payload)?;
         } else {
             self.lr1121.set_lora_packet_params(
@@ -343,7 +343,7 @@ where
         F: AsyncFnMut(Packet),
     {
         self.tx_burst_count = 0;
-        self.start_rx_internal()?;
+        self.start_receive_internal()?;
 
         match select(self.lr1121.wait_for_irq(), Timer::after(RX_WINDOW)).await {
             Either::First(()) => {
@@ -384,7 +384,7 @@ where
         }
 
         self.rx_payload_len = None;
-        self.start_rx_internal()
+        self.start_receive_internal()
     }
 
     pub fn start_receive_implicit(&mut self, payload_len: u8) -> Result<(), RadioError> {
@@ -404,10 +404,10 @@ where
         }
 
         self.rx_payload_len = Some(payload_len);
-        self.start_rx_internal()
+        self.start_receive_internal()
     }
 
-    fn start_rx_internal(&mut self) -> Result<(), RadioError> {
+    fn start_receive_internal(&mut self) -> Result<(), RadioError> {
         if !self.can_receive() {
             return Err(RadioError::InvalidConfiguration);
         }
@@ -516,7 +516,7 @@ where
         Ok(false)
     }
 
-    pub fn get_last_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
+    pub fn last_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
         self.lr1121.get_packet_status()
     }
 
@@ -542,17 +542,17 @@ where
         next_config.pa_mode = match frequency_band {
             FrequencyBand::SubGhz if self.config.pa_mode == PaMode::HighPower => PaMode::HighPower,
             FrequencyBand::SubGhz => PaMode::LowPower,
-            FrequencyBand::Sband | FrequencyBand::Ism2_4Ghz => PaMode::HighFrequency,
+            FrequencyBand::SBand | FrequencyBand::Ism2_4Ghz => PaMode::HighFrequencyPath,
         };
-        if frequency_band != FrequencyBand::Sband
+        if frequency_band != FrequencyBand::SBand
             && next_config
                 .bandwidth
                 .lr1121_encoding(frequency_band)
                 .is_none()
         {
-            next_config.bandwidth = LoRaBandwidth::Khz125;
+            next_config.bandwidth = LoraBandwidth::Khz125;
         }
-        if next_config.pa_mode == PaMode::HighFrequency {
+        if next_config.pa_mode == PaMode::HighFrequencyPath {
             next_config.tx_power_dbm = next_config.tx_power_dbm.min(13);
         }
         next_config
@@ -571,7 +571,7 @@ where
             self.config = previous_config;
             self.apply_hardware_config()?;
             if resume_receive && self.can_receive() {
-                self.start_rx_internal()?;
+                self.start_receive_internal()?;
             }
             return Err(error);
         }
@@ -579,13 +579,13 @@ where
         self.control.publish_config(self.config);
 
         if resume_receive && self.can_receive() {
-            self.start_rx_internal()?;
+            self.start_receive_internal()?;
         }
 
         Ok(())
     }
 
     fn can_receive(&self) -> bool {
-        self.config.frequency_band != FrequencyBand::Sband
+        self.config.frequency_band != FrequencyBand::SBand
     }
 }

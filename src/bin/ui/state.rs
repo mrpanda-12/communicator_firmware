@@ -16,7 +16,7 @@ pub const MAX_CHAT_MESSAGES: usize = 4;
 /// Characters of one message shown in a chat panel row.
 pub const ROW_TEXT_CHARS: usize = 28;
 /// Text bytes one message can carry, matching the protocol limit.
-pub const MAX_TEXT: usize = crate::packet::packet_data::MAX_LOGICAL_MESSAGE_SIZE;
+pub const MAX_TEXT_BYTES: usize = crate::packet::packet_data::MAX_LOGICAL_MESSAGE_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -166,7 +166,7 @@ pub enum Screen {
         conversation: ConversationId,
         unencrypted_dm: bool,
         from_discovery: bool,
-        input: String<MAX_TEXT>,
+        input: String<MAX_TEXT_BYTES>,
         cursor: usize,
         /// High nibble of a keystroke waiting for its second hex digit.
         pending_hex: Option<u8>,
@@ -282,7 +282,7 @@ pub struct RenameCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutgoingBody {
     /// Already-typed composer text.
-    Text(String<MAX_TEXT>),
+    Text(String<MAX_TEXT_BYTES>),
     /// Coordinates from the latest GPS fix.
     Coords {
         latitude_microdegrees: i32,
@@ -331,7 +331,7 @@ impl OutgoingMessage {
     }
 
     /// Sender-side packet payload without any packet framing.
-    pub fn payload(&self) -> Vec<u8, MAX_TEXT> {
+    pub fn payload(&self) -> Vec<u8, MAX_TEXT_BYTES> {
         let mut payload = Vec::new();
         match &self.body {
             OutgoingBody::Text(text) => {
@@ -414,8 +414,8 @@ pub struct UiState {
 
 /// The screen a chat entry opens: the warning when a direct chat has no key,
 /// the chat view itself otherwise.
-fn open_chat_target(device_has_key: bool, kind: ConversationId, from_discovery: bool) -> Screen {
-    if let ConversationId::Direct(device_id) = kind
+fn open_chat_target(device_has_key: bool, conversation: ConversationId, from_discovery: bool) -> Screen {
+    if let ConversationId::Direct(device_id) = conversation
         && !device_has_key
     {
         return Screen::UnencryptedDmWarning {
@@ -423,7 +423,7 @@ fn open_chat_target(device_has_key: bool, kind: ConversationId, from_discovery: 
             from_discovery,
         };
     }
-    chat_screen(kind, false, from_discovery)
+    chat_screen(conversation, false, from_discovery)
 }
 
 fn chat_screen(conversation: ConversationId, unencrypted_dm: bool, from_discovery: bool) -> Screen {
@@ -453,7 +453,7 @@ pub struct HistoryPageRequest {
 }
 
 impl UiState {
-    /// 1/ Start at the application menu with chats selected and the radio
+    /// Start at the application menu with chats selected and the radio
     /// clock showing UTC plus the saved offset.
     pub fn new(
         device_id: Option<[u8; 16]>,
@@ -495,7 +495,7 @@ impl UiState {
         }
     }
 
-    /// 2/ Apply a logical key event; the input hardware can map buttons to this API.
+    /// Apply a logical key event; the input hardware can map buttons to this API.
     pub fn handle_key(&mut self, key: Key) {
         // One key always hides the toast before it acts on the screen.
         if self.popup.is_some() {
@@ -523,17 +523,17 @@ impl UiState {
         };
         // These lookups run before the mutable screen match, because helper
         // methods inside its arms would borrow the whole state.
-        let (chats_clear_row, chats_row_kind) = match &self.screen {
-            Screen::ChatsList { selected } => (self.chat_rows(), self.chat_row_kind(*selected)),
+        let (chats_clear_row, chats_row_conversation) = match &self.screen {
+            Screen::ChatsList { selected } => (self.chat_rows(), self.chat_row_conversation(*selected)),
             _ => (0, None),
         };
-        let contacts_open_kind: Option<ConversationId> = match &self.screen {
+        let contacts_open_conversation: Option<ConversationId> = match &self.screen {
             Screen::ContactsList { selected } => {
                 let indices = self.contacts.visible_indices(true);
                 indices
                     .get(*selected)
                     .and_then(|index| self.contacts.entry(*index))
-                    .map(|entry| entry.kind)
+                    .map(|entry| entry.conversation)
             }
             _ => None,
         };
@@ -551,7 +551,7 @@ impl UiState {
             Screen::ChatsList { selected } => {
                 // Rows: every visible contact, then a "clear everything" row.
                 let is_clear = *selected + 1 == chats_clear_row;
-                let row_kind = chats_row_kind;
+                let row_conversation = chats_row_conversation;
                 match key {
                     Key::Back => self.screen = Screen::MainMenu { selected: 0 },
                     Key::Up => *selected = selected.saturating_sub(1),
@@ -559,19 +559,19 @@ impl UiState {
                     Key::Enter => {
                         if is_clear {
                             self.pending_delete_all = true;
-                        } else if let Some(kind) = row_kind {
-                            let has_key = match kind {
+                        } else if let Some(conversation) = row_conversation {
+                            let has_key = match conversation {
                                 ConversationId::Direct(device_id) => {
                                     self.contacts.direct_key(&device_id).is_some()
                                 }
                                 ConversationId::Broadcast => true,
                             };
-                            self.screen = open_chat_target(has_key, kind, false);
+                            self.screen = open_chat_target(has_key, conversation, false);
                         }
                     }
                     // RIGHT opens the delete / block actions of that contact.
                     Key::Right => {
-                        if let Some(ConversationId::Direct(device_id)) = row_kind {
+                        if let Some(ConversationId::Direct(device_id)) = row_conversation {
                             self.screen = Screen::ContactManage {
                                 device_id,
                                 selected: 0,
@@ -595,7 +595,7 @@ impl UiState {
                         if let Some(device_id) = indices
                             .get(*selected)
                             .and_then(|index| self.contacts.entry(*index))
-                            .and_then(|entry| match entry.kind {
+                            .and_then(|entry| match entry.conversation {
                                 ConversationId::Direct(device_id) => Some(device_id),
                                 ConversationId::Broadcast => None,
                             })
@@ -617,14 +617,14 @@ impl UiState {
                         self.screen = Screen::Devices { selected: 0 };
                     }
                     Key::Enter => {
-                        if let Some(kind) = contacts_open_kind {
-                            let has_key = match kind {
+                        if let Some(conversation) = contacts_open_conversation {
+                            let has_key = match conversation {
                                 ConversationId::Direct(device_id) => {
                                     self.contacts.direct_key(&device_id).is_some()
                                 }
                                 ConversationId::Broadcast => true,
                             };
-                            self.screen = open_chat_target(has_key, kind, false);
+                            self.screen = open_chat_target(has_key, conversation, false);
                         }
                     }
                     _ => {}
@@ -637,11 +637,11 @@ impl UiState {
             } => {
                 let have_entry = self
                     .contacts
-                    .entry_by_kind(ConversationId::Direct(*device_id))
+                    .entry_by_conversation(ConversationId::Direct(*device_id))
                     .is_some();
                 let entry = self
                     .contacts
-                    .entry_by_kind(ConversationId::Direct(*device_id));
+                    .entry_by_conversation(ConversationId::Direct(*device_id));
                 let currently_blocked = entry.is_some_and(|entry| entry.blocked);
                 let name = entry
                     .map(|entry| entry.custom_name.clone())
@@ -1193,12 +1193,12 @@ impl UiState {
     }
 
     /// Conversation of one CHATS row, or `None` for the clear-all row.
-    fn chat_row_kind(&self, row: usize) -> Option<ConversationId> {
+    fn chat_row_conversation(&self, row: usize) -> Option<ConversationId> {
         self.contacts
             .chat_indices()
             .get(row)
             .and_then(|index| self.contacts.entry(*index))
-            .map(|entry| entry.kind)
+            .map(|entry| entry.conversation)
     }
 
     /// Apply one 5x5 keypad key. Two hex digits type one ASCII character, so
@@ -1466,12 +1466,12 @@ impl UiState {
     }
 
     /// True once the user left the scan list and repeats must stop.
-    pub fn take_scan_cancel(&mut self) -> bool {
+    pub fn take_pending_scan_cancel(&mut self) -> bool {
         core::mem::replace(&mut self.cancel_scan, false)
     }
 
     /// One peer the run loop should send an add-contact request to.
-    pub fn take_contact_request(&mut self) -> Option<[u8; 16]> {
+    pub fn take_pending_contact_request(&mut self) -> Option<[u8; 16]> {
         self.pending_contact_request.take()
     }
 

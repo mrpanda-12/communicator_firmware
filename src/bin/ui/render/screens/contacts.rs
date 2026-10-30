@@ -7,7 +7,8 @@ use crate::ui::contact::ContactBook;
 use crate::ui::render::menu::draw_row;
 use crate::ui::render::style::{CYAN, MUTED, WHITE, text};
 
-use super::{draw_option, format_device_id};
+use super::draw_option;
+use crate::hex::hex_device_id;
 
 /// Rows the contacts list shows at once; it scrolls with the selection.
 const VISIBLE_ROWS: usize = 4;
@@ -19,7 +20,7 @@ fn row_label(contacts: &ContactBook, row: usize) -> Option<String<32>> {
         return indices
             .get(row)
             .and_then(|index| contacts.entry(*index))
-            .map(|entry| entry.display_name());
+            .map(|entry| entry.list_label());
     }
     let mut label = String::new();
     match row - indices.len() {
@@ -53,7 +54,7 @@ where
 }
 
 /// Repaint the contacts list for the new selection; scrolling shifts rows.
-pub fn update_selection<D>(
+pub fn update_contacts_selection<D>(
     display: &mut D,
     contacts: &ContactBook,
     _previous: usize,
@@ -78,7 +79,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     text(display, "MANAGE CONTACT", 12, 38, CYAN, true)?;
-    let identity = format_device_id(device_id);
+    let identity = hex_device_id(device_id);
     text(display, identity.as_str(), 12, 70, WHITE, false)?;
     draw_option(
         display,

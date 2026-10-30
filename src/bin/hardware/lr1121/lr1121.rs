@@ -553,7 +553,7 @@ where
 
     // Asks the LR1121 to build an LR-FHSS frame from an application payload.
     pub fn build_lr_fhss_frame(&mut self, payload: &[u8]) -> Result<(), RadioError> {
-        let profile = LrFhssProfile::SbandDefault;
+        let profile = LrFhssProfile::SBandDefault;
         let hop_sequence_seed = profile.hop_seed() as u16;
         let device_offset = profile.device_offset() as i8 as u8;
         let maximum_payload = profile.max_payload_size();
@@ -565,7 +565,7 @@ where
             });
         }
 
-        let mut params = [0u8; 9 + LrFhssProfile::SbandDefault.max_payload_size()];
+        let mut params = [0u8; 9 + LrFhssProfile::SBandDefault.max_payload_size()];
         params[0] = profile.header_count() as u8;
         params[1] = profile.coding_rate() as u8;
         params[2] = profile.modulation() as u8;

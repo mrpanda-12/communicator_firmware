@@ -13,11 +13,11 @@ use crate::{
 const DEVICE_ID_KEY: &str = "device_id";
 const PACKET_IDS_KEY: &str = "packet_ids";
 
-/// Persisted packet and message ID counters.
+/// Persisted next packet ID and last message ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketIds {
-    pub packet_id: u32,
-    pub message_id: u32,
+    pub next_packet_id: u32,
+    pub last_message_id: u32,
 }
 
 impl<'a> Value<'a> for PacketIds {
@@ -25,27 +25,27 @@ impl<'a> Value<'a> for PacketIds {
         let target = buffer
             .get_mut(..8)
             .ok_or(SerializationError::BufferTooSmall)?;
-        target[..4].copy_from_slice(&self.packet_id.to_le_bytes());
-        target[4..].copy_from_slice(&self.message_id.to_le_bytes());
+        target[..4].copy_from_slice(&self.next_packet_id.to_le_bytes());
+        target[4..].copy_from_slice(&self.last_message_id.to_le_bytes());
         Ok(8)
     }
 
     fn deserialize_from(buffer: &'a [u8]) -> Result<(Self, usize), SerializationError> {
         let source = buffer.get(..8).ok_or(SerializationError::BufferTooSmall)?;
-        let packet_id = u32::from_le_bytes(
+        let next_packet_id = u32::from_le_bytes(
             source[..4]
                 .try_into()
                 .map_err(|_| SerializationError::InvalidData)?,
         );
-        let message_id = u32::from_le_bytes(
+        let last_message_id = u32::from_le_bytes(
             source[4..]
                 .try_into()
                 .map_err(|_| SerializationError::InvalidData)?,
         );
         Ok((
             Self {
-                packet_id,
-                message_id,
+                next_packet_id,
+                last_message_id,
             },
             8,
         ))
@@ -82,7 +82,7 @@ impl<'flash> StorageManager<'flash> {
         Self { flash }
     }
 
-    pub async fn set_setting<T>(
+    pub async fn save_setting<T>(
         &mut self,
         key: &str,
         value: &T,
@@ -92,12 +92,12 @@ impl<'flash> StorageManager<'flash> {
         for<'a> T: Value<'a>,
     {
         self.flash
-            .set(key, value, buffer)
+            .write_setting(key, value, buffer)
             .await
             .map_err(store_error)
     }
 
-    pub async fn get_setting<T>(
+    pub async fn load_setting<T>(
         &mut self,
         key: &str,
         buffer: &mut [u8],
@@ -105,13 +105,13 @@ impl<'flash> StorageManager<'flash> {
     where
         for<'a> T: Value<'a>,
     {
-        self.flash.get::<T>(key, buffer).await.map_err(store_error)
+        self.flash.read_setting::<T>(key, buffer).await.map_err(store_error)
     }
 
     pub async fn load_device_id(&mut self, buffer: &mut [u8]) -> Result<Option<[u8; 16]>, String> {
         Ok(self
             .flash
-            .get::<DeviceIdRecord>(DEVICE_ID_KEY, buffer)
+            .read_setting::<DeviceIdRecord>(DEVICE_ID_KEY, buffer)
             .await
             .map_err(store_error)?
             .map(|stored| stored.0))
@@ -119,7 +119,7 @@ impl<'flash> StorageManager<'flash> {
 
     pub async fn save_device_id(&mut self, id: &[u8; 16], buffer: &mut [u8]) -> Result<(), String> {
         self.flash
-            .set(DEVICE_ID_KEY, &DeviceIdRecord(*id), buffer)
+            .write_setting(DEVICE_ID_KEY, &DeviceIdRecord(*id), buffer)
             .await
             .map_err(store_error)
     }
@@ -129,23 +129,23 @@ impl<'flash> StorageManager<'flash> {
         buffer: &mut [u8],
     ) -> Result<Option<PacketIds>, String> {
         self.flash
-            .get::<PacketIds>(PACKET_IDS_KEY, buffer)
+            .read_setting::<PacketIds>(PACKET_IDS_KEY, buffer)
             .await
             .map_err(store_error)
     }
 
     pub async fn save_packet_ids(
         &mut self,
-        packet_id: u32,
-        message_id: u32,
+        next_packet_id: u32,
+        last_message_id: u32,
         buffer: &mut [u8],
     ) -> Result<(), String> {
         self.flash
-            .set(
+            .write_setting(
                 PACKET_IDS_KEY,
                 &PacketIds {
-                    packet_id,
-                    message_id,
+                    next_packet_id,
+                    last_message_id,
                 },
                 buffer,
             )
@@ -198,7 +198,7 @@ impl<'flash> StorageManager<'flash> {
     }
 
     pub async fn load_contacts(&mut self, buffer: &mut [u8]) -> Result<Vec<Contact>, String> {
-        self.flash.load_contacts(buffer).await.map_err(store_error)
+        self.flash.read_contacts(buffer).await.map_err(store_error)
     }
 
     pub async fn append_messages(
@@ -219,9 +219,9 @@ impl<'flash> StorageManager<'flash> {
         start: Option<u32>,
         max_messages: usize,
         buffer: &mut [u8],
-    ) -> Result<(u32, u32, u32, Vec<crate::storage::message::StoredMessage>), String> {
+    ) -> Result<crate::hardware::flash::MessagePage, String> {
         self.flash
-            .load_message_page(device_id, start, max_messages, buffer)
+            .read_message_page(device_id, start, max_messages, buffer)
             .await
             .map_err(store_error)
     }
@@ -233,7 +233,7 @@ impl<'flash> StorageManager<'flash> {
         buffer: &mut [u8],
     ) -> Result<Vec<crate::storage::message::StoredMessage>, String> {
         self.flash
-            .load_recent_messages(device_id, max_messages, buffer)
+            .read_recent_messages(device_id, max_messages, buffer)
             .await
             .map_err(store_error)
     }
@@ -241,13 +241,13 @@ impl<'flash> StorageManager<'flash> {
     pub async fn recent_message_exists(
         &mut self,
         device_id: &[u8; 16],
-        sender: &[u8; 16],
+        sender_id: &[u8; 16],
         packet_id: u32,
         message_id: u32,
         buffer: &mut [u8],
     ) -> Result<bool, String> {
         self.flash
-            .recent_message_exists(device_id, sender, packet_id, message_id, buffer)
+            .recent_message_exists(device_id, sender_id, packet_id, message_id, buffer)
             .await
             .map_err(store_error)
     }

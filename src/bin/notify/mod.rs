@@ -36,16 +36,16 @@ pub struct Popup {
     pub conversation: ConversationId,
     pub popup_type: PopupType,
     /// Who sent the message; zeroed for local alerts.
-    pub sender: [u8; 16],
+    pub sender_id: [u8; 16],
     /// Sender name, or the device ID when the peer has no name yet.
     pub name: String<POPUP_NAME_CHARS>,
     pub text: String<POPUP_TEXT_CHARS>,
 }
 
 /// Popups that may wait for the UI; a full queue drops the oldest toast.
-pub static POPUPS: Channel<CriticalSectionRawMutex, Popup, 8> = Channel::new();
+pub static POPUP_QUEUE: Channel<CriticalSectionRawMutex, Popup, 8> = Channel::new();
 /// Fires whenever chat history may have changed (accept, ACK, delete).
-pub static CHANGED: Watch<CriticalSectionRawMutex, u32, 8> = Watch::new();
+pub static HISTORY_CHANGED: Watch<CriticalSectionRawMutex, u32, 8> = Watch::new();
 
 static REVISION: AtomicU32 = AtomicU32::new(0);
 
@@ -66,21 +66,21 @@ fn fit<const N: usize>(text: &str) -> String<N> {
 }
 
 /// Record one accepted message: queue a popup toast and bump the revision.
-pub fn receive(conversation: ConversationId, from: [u8; 16], text: &str) {
+pub fn message_received(conversation: ConversationId, from: [u8; 16], text: &str) {
     let popup = Popup {
         conversation,
         popup_type: PopupType::NewMessage,
-        sender: from,
+        sender_id: from,
         name: String::new(),
         text: fit(text),
     };
     // A full queue drops the oldest toast so the newest message is still shown.
-    if POPUPS.free_capacity() == 0 {
-        let receiver = POPUPS.receiver();
+    if POPUP_QUEUE.free_capacity() == 0 {
+        let receiver = POPUP_QUEUE.receiver();
         let _ = receiver.try_receive();
     }
-    let _ = POPUPS.try_send(popup);
-    changed();
+    let _ = POPUP_QUEUE.try_send(popup);
+    history_changed();
 }
 
 /// Warn that a flash append could not be stored.
@@ -93,15 +93,15 @@ pub fn contact_request(from: [u8; 16]) {
     let popup = Popup {
         conversation: ConversationId::from_peer(from),
         popup_type: PopupType::ContactRequest,
-        sender: from,
+        sender_id: from,
         name: String::new(),
         text: fit("WANTS TO ADD YOU"),
     };
-    if POPUPS.free_capacity() == 0 {
-        let receiver = POPUPS.receiver();
+    if POPUP_QUEUE.free_capacity() == 0 {
+        let receiver = POPUP_QUEUE.receiver();
         let _ = receiver.try_receive();
     }
-    let _ = POPUPS.try_send(popup);
+    let _ = POPUP_QUEUE.try_send(popup);
 }
 
 /// Warn that the outbox is full and the message stayed in the composer.
@@ -113,34 +113,34 @@ fn alert(conversation: ConversationId, text: &str) {
     let popup = Popup {
         conversation,
         popup_type: PopupType::Alert,
-        sender: [0; 16],
+        sender_id: [0; 16],
         name: String::new(),
         text: fit(text),
     };
-    if POPUPS.free_capacity() == 0 {
-        let receiver = POPUPS.receiver();
+    if POPUP_QUEUE.free_capacity() == 0 {
+        let receiver = POPUP_QUEUE.receiver();
         let _ = receiver.try_receive();
     }
-    let _ = POPUPS.try_send(popup);
+    let _ = POPUP_QUEUE.try_send(popup);
 }
 
 /// Signal the UI that history changed without an accompanying toast.
-pub fn changed() {
+pub fn history_changed() {
     let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
-    CHANGED.sender().send(revision);
+    HISTORY_CHANGED.sender().send(revision);
 }
 
 /// Current history revision; the UI compares this to its loaded snapshot.
-pub fn revision() -> u32 {
+pub fn history_revision() -> u32 {
     REVISION.load(Ordering::Relaxed)
 }
 
-pub fn revision_receiver() -> Receiver<'static, CriticalSectionRawMutex, u32, 8> {
-    CHANGED
+pub fn history_revision_receiver() -> Receiver<'static, CriticalSectionRawMutex, u32, 8> {
+    HISTORY_CHANGED
         .receiver()
         .unwrap_or_else(|| crate::fatal("history revision watch has no free receiver"))
 }
 
 pub fn popup_receiver() -> embassy_sync::channel::DynamicReceiver<'static, Popup> {
-    POPUPS.receiver().into()
+    POPUP_QUEUE.receiver().into()
 }

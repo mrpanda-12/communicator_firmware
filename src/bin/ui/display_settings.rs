@@ -14,10 +14,10 @@ pub const MAX_TIMEZONE_OFFSET: i32 = 14 * 60;
 /// One adjust step: 30 minutes.
 pub const TIMEZONE_STEP: i32 = 30;
 
-/// 1/ Load the saved backlight percentage and persist its default on first boot.
+/// Load the saved backlight percentage and persist its default on first boot.
 pub async fn load_brightness(storage: &mut StorageManager<'static>, flash_buffer: &mut [u8]) -> u8 {
     match storage
-        .get_setting::<u8>(BRIGHTNESS_SETTING, flash_buffer)
+        .load_setting::<u8>(BRIGHTNESS_SETTING, flash_buffer)
         .await
     {
         Ok(Some(brightness)) if brightness <= 100 => brightness,
@@ -27,7 +27,7 @@ pub async fn load_brightness(storage: &mut StorageManager<'static>, flash_buffer
         }
         Ok(None) => {
             if storage
-                .set_setting(BRIGHTNESS_SETTING, &DEFAULT_BRIGHTNESS, flash_buffer)
+                .save_setting(BRIGHTNESS_SETTING, &DEFAULT_BRIGHTNESS, flash_buffer)
                 .await
                 .is_ok()
             {
@@ -44,13 +44,13 @@ pub async fn load_brightness(storage: &mut StorageManager<'static>, flash_buffer
     }
 }
 
-/// 2/ Load the saved UTC offset in minutes, clamped to the supported range.
+/// Load the saved UTC offset in minutes, clamped to the supported range.
 pub async fn load_timezone_offset(
     storage: &mut StorageManager<'static>,
     flash_buffer: &mut [u8],
 ) -> i32 {
     match storage
-        .get_setting::<i32>(TIMEZONE_SETTING, flash_buffer)
+        .load_setting::<i32>(TIMEZONE_SETTING, flash_buffer)
         .await
     {
         Ok(Some(offset)) if (MIN_TIMEZONE_OFFSET..=MAX_TIMEZONE_OFFSET).contains(&offset) => offset,
@@ -60,7 +60,7 @@ pub async fn load_timezone_offset(
         }
         Ok(None) => {
             if storage
-                .set_setting(TIMEZONE_SETTING, &DEFAULT_TIMEZONE_OFFSET, flash_buffer)
+                .save_setting(TIMEZONE_SETTING, &DEFAULT_TIMEZONE_OFFSET, flash_buffer)
                 .await
                 .is_ok()
             {
@@ -75,14 +75,14 @@ pub async fn load_timezone_offset(
     }
 }
 
-/// 3/ Persist a new UTC offset in minutes.
+/// Persist a new UTC offset in minutes.
 pub async fn save_timezone_offset(
     storage: &mut StorageManager<'static>,
     offset: i32,
     flash_buffer: &mut [u8],
 ) -> Result<(), ()> {
     storage
-        .set_setting(TIMEZONE_SETTING, &offset, flash_buffer)
+        .save_setting(TIMEZONE_SETTING, &offset, flash_buffer)
         .await
         .map(|_| ())
         .map_err(|_| ())

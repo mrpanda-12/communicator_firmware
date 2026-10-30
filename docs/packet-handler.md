@@ -12,7 +12,7 @@ The handler then applies these checks in order:
 2. `PacketData::validate` checks protocol version, fragment index/count, payload bounds, encryption overhead, and hop limits. Invalid frames are rejected before dispatch.
 3. The current local identity is read from the `DEVICE_ID` watch. If absent, the frame is ignored; after identity reset, future packets use the newly published ID.
 4. A packet whose sender ID equals the local ID is discarded as an echo.
-5. The handler classifies the destination and checks its `(sender, packet_id)` duplicate cache. A duplicate is dropped before discovery, delivery, or forwarding; an accepted encrypted direct fragment may trigger an ACK repeat if its fingerprint and message context match the acceptance cache.
+5. The handler classifies the destination and checks its `(sender_id, packet_id)` duplicate cache. A duplicate is dropped before discovery, delivery, or forwarding; an accepted encrypted direct fragment may trigger an ACK repeat if its fingerprint and message context match the acceptance cache.
 6. The sender is added to the bounded nearby-device list, and one frame-level RX log is emitted.
 7. Supported local packet types are dispatched. Unconsumed broadcasts and packets for a different destination may be relayed after decrementing `hop_limit`.
 
@@ -49,7 +49,7 @@ AES-GCM covers packet immutable header fields as AAD; `hop_limit` is excluded be
 
 For direct text, each fragment is decrypted before `Defragmenter::push`. Broadcast text is supplied as plaintext. The reassembler keys an assembly by sender, destination, and message ID; it enforces matching fragment count, encryption state, type, and initial hop limit. Up to 16 fragments and 512 application bytes are accepted, with four incomplete assemblies retained in RAM. Fragments may arrive in any order; output is assembled by fragment index. A conflicting duplicate or inconsistent metadata discards the assembly. There is no fragment timeout or automatic resend.
 
-After completion, `deliver_text` requires valid UTF-8 and a body within storage capacity. It creates exactly one `StoredMessage` with `from_me = false`, then calls `save_message`. `save_message` returns success only when the record was appended. Only a successful append calls `notify::receive`, which queues a toast and increments the history revision. No chat row or toast is fabricated from a failed write.
+After completion, `deliver_text` requires valid UTF-8 and a body within storage capacity. It creates exactly one `StoredMessage` with `from_me = false`, then calls `save_message`. `save_message` returns success only when the record was appended. Only a successful append calls `notify::message_received`, which queues a toast and increments the history revision. No chat row or toast is fabricated from a failed write.
 
 Broadcast history is stored under the reserved `[0xff; 16]` storage key; direct history is stored under the sender's ID. Relayed frames are not chat records on the relay.
 
@@ -87,7 +87,7 @@ Packets addressed to this device are consumed locally and are not relayed. This 
 
 | Resource | Limit | Lifetime |
 | --- | ---: | --- |
-| Seen `(sender, packet_id)` keys | 128 | PacketHandler RAM; FIFO eviction. |
+| Seen `(sender_id, packet_id)` keys | 128 | PacketHandler RAM; FIFO eviction. |
 | Recent records checked for a duplicate delivery | 8 | Conversation flash; oldest of the window ignored. |
 | Accepted encrypted fragment ACK records | 128 | PacketHandler RAM; FIFO eviction. |
 | Incomplete text assemblies | 4 | PacketHandler RAM; oldest evicted when full. |

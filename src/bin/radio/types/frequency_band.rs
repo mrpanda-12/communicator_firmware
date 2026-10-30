@@ -2,7 +2,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrequencyBand {
     SubGhz,
-    Sband,
+    SBand,
     Ism2_4Ghz,
 }
 
@@ -11,14 +11,14 @@ impl FrequencyBand {
     pub const fn maximum_packet_size(self) -> usize {
         match self {
             Self::SubGhz | Self::Ism2_4Ghz => 255,
-            Self::Sband => 133,
+            Self::SBand => 133,
         }
     }
 
     pub const fn for_frequency(frequency_hz: u32) -> Option<Self> {
         match frequency_hz {
             150_000_000..=960_000_000 => Some(Self::SubGhz),
-            1_900_000_000..=2_100_000_000 => Some(Self::Sband),
+            1_900_000_000..=2_100_000_000 => Some(Self::SBand),
             2_400_000_000..=2_500_000_000 => Some(Self::Ism2_4Ghz),
             _ => None,
         }

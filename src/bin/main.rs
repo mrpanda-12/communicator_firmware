@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
+pub mod calendar;
 pub mod crypto;
 #[cfg(feature = "debug-console")]
 pub mod debug_console;
 pub mod hardware;
+pub mod hex;
 pub mod network;
 pub mod notify;
 pub mod packet;
@@ -22,18 +24,18 @@ static RADIO_QUEUE: RadioQueue = RadioQueue::new();
 static RADIO_CONTROL: RadioControl = RadioControl::new();
 
 /// UTC seconds for a record written now; zero when no dated GPS fix exists.
-pub fn now_utc_seconds() -> u32 {
+pub fn now_timestamp() -> u32 {
     GPS_SNAPSHOT
         .sender()
         .try_get()
-        .map_or(0, |snapshot| snapshot.utc_seconds())
+        .map_or(0, |snapshot| snapshot.timestamp())
 }
 
 /// Shown in Settings → Device info; the package version is the single source.
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RADIO_CONFIG: RadioConfig = RadioConfig {
     frequency_band: FrequencyBand::SubGhz,
-    bandwidth: LoRaBandwidth::Khz125,
+    bandwidth: LoraBandwidth::Khz125,
     pa_mode: PaMode::HighPower,
     tx_power_dbm: 22,
     ..RadioConfig::new(869_400_000)
@@ -55,7 +57,7 @@ use crate::{
         control::RadioControl,
         queue::RadioQueue,
         radio::Radio,
-        types::{FrequencyBand, LoRaBandwidth, PaMode, RadioConfig},
+        types::{FrequencyBand, LoraBandwidth, PaMode, RadioConfig},
     },
     storage::{
         session::{FLASH_BUFFER_SIZE, Flash, FlashSession},
@@ -137,7 +139,7 @@ fn init_trng(
 }
 
 /// Load the device ID and create it only when the flash store has no ID.
-async fn initialize_storage(
+async fn init_storage(
     flash: FlashStore<'static>,
     trng: &Trng,
     flash_buffer: &mut [u8],
@@ -246,7 +248,7 @@ async fn gps_task(mut gps: Gps<'static>) -> ! {
 
     loop {
         let _ = gps.poll();
-        let snapshot = ui::gps_snapshot(gps.get_coordinate(), gps.get_time());
+        let snapshot = ui::gps_snapshot(gps.coordinate(), gps.time());
         if snapshot != published {
             GPS_SNAPSHOT.sender().send(snapshot);
             published = snapshot;
@@ -317,7 +319,7 @@ async fn main(_spawner: Spawner) -> ! {
     let flash_store = init_flash_storage(peripherals.FLASH);
     let (_trng_source, trng) = init_trng(peripherals.RNG, peripherals.ADC1);
     let mut flash_buffer = [0u8; FLASH_BUFFER_SIZE];
-    let (mut storage, device_id) = initialize_storage(flash_store, &trng, &mut flash_buffer).await;
+    let (mut storage, device_id) = init_storage(flash_store, &trng, &mut flash_buffer).await;
 
     // Resume the packet-ID counter at the first ID the stored value reserved.
     // Each later reservation persists its own range before using it.
@@ -326,9 +328,9 @@ async fn main(_spawner: Spawner) -> ! {
         .await
         .ok()
         .flatten();
-    let next_id = saved_ids.map(|ids| ids.packet_id).unwrap_or(0);
-    let last_message_id = saved_ids.map(|ids| ids.message_id).unwrap_or(0);
-    packet::packet_data::set_local_packet_ids(next_id, last_message_id);
+    let next_id = saved_ids.map(|ids| ids.next_packet_id).unwrap_or(0);
+    let last_message_id = saved_ids.map(|ids| ids.last_message_id).unwrap_or(0);
+    packet::packet_data::set_packet_ids(next_id, last_message_id);
     let display_brightness =
         ui::display_settings::load_brightness(&mut storage, &mut flash_buffer).await;
     let timezone_offset_minutes =

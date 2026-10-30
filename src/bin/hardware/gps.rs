@@ -41,9 +41,9 @@ pub struct Gps<'d> {
     sentence: [u8; SENTENCE_MAX_LEN],
     sentence_len: usize,
     collecting_sentence: bool,
-    pub coordinate: Option<Coordinate>,
-    pub time: Option<GpsTime>,
-    pub last_sentence_error: Option<SentenceError>,
+    coordinate: Option<Coordinate>,
+    time: Option<GpsTime>,
+    last_sentence_error: Option<SentenceError>,
 }
 
 impl<'d> Gps<'d> {
@@ -94,16 +94,12 @@ impl<'d> Gps<'d> {
         Ok(total)
     }
 
-    pub fn get_coordinate(&self) -> Option<Coordinate> {
+    pub fn coordinate(&self) -> Option<Coordinate> {
         self.coordinate
     }
 
-    pub fn has_fix(&self) -> bool {
-        self.coordinate.is_some()
-    }
-
     // Returns the latest UTC time, with date populated when an RMC sentence arrived.
-    pub fn get_time(&self) -> Option<GpsTime> {
+    pub fn time(&self) -> Option<GpsTime> {
         self.time
     }
 

@@ -2,8 +2,8 @@ use core::fmt::Write;
 
 use heapless::{String, Vec};
 
-pub use crate::storage::contact::Contact;
-pub use crate::storage::message::ConversationId;
+use crate::storage::{contact::Contact, message::ConversationId};
+use crate::hex::{hex_device_id, write_hex};
 
 /// List capacity; the broadcast conversation occupies one slot.
 pub const MAX_CONTACTS: usize = 32;
@@ -16,7 +16,7 @@ const PREVIEW_BYTES: usize = 64;
 /// One addressable contact: identity, optional pair key, chat preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContactEntry {
-    pub kind: ConversationId,
+    pub conversation: ConversationId,
     pub custom_name: String<CONTACT_NAME_CAPACITY>,
     pub key: Option<[u8; 32]>,
     pub blocked: bool,
@@ -26,21 +26,21 @@ pub struct ContactEntry {
     /// Whether that last message of ours was acknowledged.
     pub preview_acknowledged: bool,
     /// UTC seconds of the newest record; 0 when no GPS date was known.
-    pub last_activity: u32,
+    pub last_timestamp: u32,
 }
 
 impl ContactEntry {
-    /// 1/ Keep the public broadcast conversation visible as the first entry.
+    /// Keep the public broadcast conversation visible as the first entry.
     pub fn broadcast() -> Self {
         Self {
-            kind: ConversationId::Broadcast,
+            conversation: ConversationId::Broadcast,
             custom_name: String::new(),
             key: None,
             blocked: false,
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
-            last_activity: 0,
+            last_timestamp: 0,
         }
     }
 
@@ -48,14 +48,14 @@ impl ContactEntry {
         let mut custom_name = String::new();
         let _ = custom_name.push_str(name);
         Self {
-            kind: ConversationId::Direct(device_id),
+            conversation: ConversationId::Direct(device_id),
             custom_name,
             key: Some(key),
             blocked,
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
-            last_activity: 0,
+            last_timestamp: 0,
         }
     }
 
@@ -63,30 +63,30 @@ impl ContactEntry {
     /// It gets a plain list row until the user blocks or deletes it.
     pub fn unknown(device_id: [u8; 16]) -> Self {
         Self {
-            kind: ConversationId::Direct(device_id),
+            conversation: ConversationId::Direct(device_id),
             custom_name: String::new(),
             key: None,
             blocked: false,
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
-            last_activity: 0,
+            last_timestamp: 0,
         }
     }
 
     pub fn is_deletable(&self) -> bool {
-        !matches!(self.kind, ConversationId::Broadcast)
+        !matches!(self.conversation, ConversationId::Broadcast)
     }
 
     /// True when this entry describes an air-heard peer that was never paired.
     pub fn is_unknown(&self) -> bool {
-        matches!(self.kind, ConversationId::Direct(_)) && self.key.is_none()
+        matches!(self.conversation, ConversationId::Direct(_)) && self.key.is_none()
     }
 
-    /// 2/ Format the broadcast label, custom contact name, or short device ID.
-    pub fn display_name(&self) -> String<CONTACT_NAME_CAPACITY> {
+    /// Format the broadcast label, custom contact name, or short device ID.
+    pub fn list_label(&self) -> String<CONTACT_NAME_CAPACITY> {
         let mut label = String::new();
-        match self.kind {
+        match self.conversation {
             ConversationId::Broadcast => {
                 let _ = label.push_str("BROADCAST [PUBLIC]");
             }
@@ -99,25 +99,23 @@ impl ContactEntry {
                 } else {
                     "UNKNOWN"
                 };
-                let _ = write!(
-                    label,
-                    "{security} {:02X}{:02X}...",
-                    device_id[0], device_id[1]
-                );
+                let _ = write!(label, "{security} ");
+                let _ = write_hex(&mut label, &device_id[..2], None);
+                let _ = label.push_str("...");
             }
         }
         label
     }
 
-    /// 3/ Name for a toast: the custom name, else the full device ID.
+    /// Name for a toast: the custom name, else the full device ID.
     pub fn name_or_id(&self) -> String<CONTACT_NAME_CAPACITY> {
         let mut label = String::new();
-        match self.kind {
+        match self.conversation {
             ConversationId::Broadcast => {
                 let _ = label.push_str("BROADCAST [PUBLIC]");
             }
             ConversationId::Direct(device_id) if self.custom_name.is_empty() => {
-                label = hex_id(device_id);
+                label = hex_device_id(&device_id);
             }
             ConversationId::Direct(_) => {
                 let _ = label.push_str(self.custom_name.as_str());
@@ -143,7 +141,7 @@ pub struct ContactBook {
 }
 
 impl ContactBook {
-    /// 3/ Seed the contact list with the reserved broadcast conversation.
+    /// Seed the contact list with the reserved broadcast conversation.
     pub fn new() -> Self {
         let mut entries = Vec::new();
         let _ = entries.push(ContactEntry::broadcast());
@@ -180,26 +178,26 @@ impl ContactBook {
         indices
     }
 
-    pub fn entry_by_kind(&self, kind: ConversationId) -> Option<&ContactEntry> {
-        self.entries.iter().find(|entry| entry.kind == kind)
+    pub fn entry_by_conversation(&self, conversation: ConversationId) -> Option<&ContactEntry> {
+        self.entries.iter().find(|entry| entry.conversation == conversation)
     }
 
     pub fn contains_direct(&self, device_id: &[u8; 16]) -> bool {
         self.entries
             .iter()
-            .any(|entry| entry.kind == ConversationId::Direct(*device_id))
+            .any(|entry| entry.conversation == ConversationId::Direct(*device_id))
     }
 
     pub fn direct_index(&self, device_id: &[u8; 16]) -> Option<usize> {
         self.entries
             .iter()
-            .position(|entry| entry.kind == ConversationId::Direct(*device_id))
+            .position(|entry| entry.conversation == ConversationId::Direct(*device_id))
     }
 
     pub fn direct_key(&self, device_id: &[u8; 16]) -> Option<&[u8; 32]> {
         self.entries
             .iter()
-            .find(|entry| entry.kind == ConversationId::Direct(*device_id))?
+            .find(|entry| entry.conversation == ConversationId::Direct(*device_id))?
             .key
             .as_ref()
     }
@@ -212,7 +210,7 @@ impl ContactBook {
         if let Some(existing) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.kind == ConversationId::Direct(contact.device_id))
+            .find(|entry| entry.conversation == ConversationId::Direct(contact.device_id))
         {
             existing.custom_name = contact.custom_name.clone();
             existing.key = Some(contact.key);
@@ -234,7 +232,7 @@ impl ContactBook {
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.kind == ConversationId::Direct(device_id))
+            .find(|entry| entry.conversation == ConversationId::Direct(device_id))
         {
             entry.custom_name.clear();
             let _ = entry.custom_name.push_str(name);
@@ -253,20 +251,20 @@ impl ContactBook {
     /// Seed one chat-list preview from flash at boot or after an event.
     pub fn seed_preview(
         &mut self,
-        kind: ConversationId,
+        conversation: ConversationId,
         preview: &str,
         from_me: bool,
         acknowledged: bool,
         timestamp: u32,
     ) {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.kind == kind) else {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.conversation == conversation) else {
             return;
         };
         entry.preview.clear();
         let _ = entry.preview.push_str(preview);
         entry.preview_from_me = from_me;
         entry.preview_acknowledged = acknowledged;
-        entry.last_activity = timestamp;
+        entry.last_timestamp = timestamp;
     }
 
     /// Chat row order: the conversation with the newest record first. Equal
@@ -276,8 +274,8 @@ impl ContactBook {
         for position in 1..order.len() {
             let mut index = position;
             while index > 0 {
-                let previous = self.entries[order[index - 1]].last_activity;
-                let current = self.entries[order[index]].last_activity;
+                let previous = self.entries[order[index - 1]].last_timestamp;
+                let current = self.entries[order[index]].last_timestamp;
                 if previous >= current {
                     break;
                 }
@@ -288,18 +286,18 @@ impl ContactBook {
         order
     }
 
-    /// 4/ A blocked peer is hidden everywhere until it is unblocked again.
+    /// A blocked peer is hidden everywhere until it is unblocked again.
     pub fn set_blocked(&mut self, device_id: &[u8; 16], blocked: bool) -> bool {
         self.entries
             .iter_mut()
-            .find(|entry| entry.kind == ConversationId::Direct(*device_id))
+            .find(|entry| entry.conversation == ConversationId::Direct(*device_id))
             .is_some_and(|entry| {
                 entry.blocked = blocked;
                 true
             })
     }
 
-    /// 5/ Delete a direct contact entry; broadcast stays.
+    /// Delete a direct contact entry; broadcast stays.
     pub fn remove(&mut self, index: usize) -> Result<ContactEntry, ContactBookError> {
         let Some(entry) = self.entries.get(index) else {
             return Err(ContactBookError::InvalidIndex);
@@ -315,15 +313,6 @@ impl Default for ContactBook {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Full uppercase hex ID, used when a peer has no saved name.
-pub fn hex_id(device_id: [u8; 16]) -> String<CONTACT_NAME_CAPACITY> {
-    let mut label = String::new();
-    for byte in device_id {
-        let _ = write!(label, "{byte:02X}");
-    }
-    label
 }
 
 /// Cut one preview line for a message body.
