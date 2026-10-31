@@ -21,6 +21,7 @@ use crate::packet::packet_type::PacketType;
 use crate::radio::types::{
     CodingRate, ConfigError, FrequencyBand, LoraBandwidth, LrFhssProfile, PaMode, RadioConfig,
 };
+use crate::storage::block::{BlockList, BlockedDevice};
 use crate::storage::contact::Contact;
 use crate::storage::message::{
     BROADCAST_STORAGE_ID, ConversationId, MAX_MESSAGE_PAYLOAD, MessageType, StoredMessage,
@@ -85,12 +86,11 @@ fn stored_text() -> StoredMessage {
     )
 }
 
-fn contact(device_byte: u8, name: &str, key: u8, blocked: bool) -> Contact {
+fn contact(device_byte: u8, name: &str, key: u8) -> Contact {
     Contact {
         device_id: id(device_byte),
         key: [key; KEY_SIZE],
         custom_name: hstring(name),
-        blocked,
     }
 }
 

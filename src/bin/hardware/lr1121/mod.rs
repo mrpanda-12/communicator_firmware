@@ -1,2 +1,2 @@
-pub mod lr1121;
+pub mod driver;
 pub mod opcode;

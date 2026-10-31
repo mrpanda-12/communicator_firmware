@@ -58,6 +58,8 @@ Both the receive path and the UI use this handle, so they cannot run overlapping
 | --- | --- | --- |
 | `s` | setting name bytes (≤31 UTF-8 bytes) | Typed settings. |
 | `c` | 16-byte device ID | One contact record. |
+| `x` | 16-byte device ID | One blocked device record. |
+| `y` | 16-byte conversation storage ID | One chat-index entry for a conversation that has history. |
 | `m` | 16-byte conversation ID + 4-byte little-endian record ordinal | One stored message. |
 | `n` | 16-byte conversation ID | Next record ordinal (count) for that conversation. |
 | `b` | 16-byte conversation ID | Oldest retained record ordinal (base) for that conversation. |
@@ -91,12 +93,12 @@ If the entropy source or flash is unavailable, identity-dependent operations are
 
 ## Contacts
 
-A `Contact` stores the peer's 16-byte device ID, the 32-byte derived pair key, a 32-byte custom-name field, and a blocked flag. Its serialized size is 81 bytes.
+A `Contact` stores the peer's 16-byte device ID, the 32-byte derived pair key, and a 32-byte custom-name field. Its serialized size is 81 bytes; the last byte is reserved (it held the block flag before blocking became a separate list) so records written by earlier firmware still parse.
 
 - A contact is created from the devices screen by picking a peer and entering a name plus an optional password. Only a non-empty password runs the pairing handshake and saves a pair key; an empty password adds the peer with no key, so its traffic stays plaintext. A peer that is only heard on air stays in the in-memory discovery lists until the user adds it.
 - `display_name()` returns the custom name if set, otherwise the 32-character uppercase hex ID. Contact management sets, changes, and removes that name, and renaming a saved contact writes the record back to flash; every list and chat label reads the name through this one function.
-- A blocked contact is dropped on the receive path before any message is processed and is hidden from the lists.
-- Blocking or deleting a contact is written through the contact record and the removal path; an unpaired/unknown peer's block state exists only for the running session.
+- Blocking is a separate list of device IDs, not a contact field: each blocked ID is its own record under the `x` namespace, so a peer with no contact record can be blocked and the list has no fixed capacity. Traffic addressed to this device from a blocked ID is dropped before it is dispatched, and that peer's rows are hidden from both lists; its broadcasts are still relayed for other peers.
+- Blocking writes one record and unblocking removes it, and both update the RAM copy the receive path checks. Settings → Blocked lists the IDs and ENTER unblocks one. Deleting a contact removes its contact and message records but leaves any block record alone.
 - Contact records, including the pair key, are stored as plain map values. The firmware does not encrypt its flash.
 
 ## Message records
@@ -122,7 +124,9 @@ The record stores both packet and message IDs in their full 32-bit wire width. A
 
 Only one record is written per logical chat message. The send path appends after all fragments are accepted by the TX queue; the receive path appends after full validation, decryption, and reassembly. Fragments and relays are never stored as chat rows.
 
-`append_messages` reads the conversation count and base, writes each message at `message(id, count)` while incrementing, and writes the updated count last. Writing the count last means a partial failure leaves the count unchanged, so a retry reuses the same indices instead of creating gaps.
+`append_messages` first writes the conversation's chat-index entry, then reads the conversation count and base, writes each message at `message(id, count)` while incrementing, and writes the updated count last. Writing the count last means a partial failure leaves the count unchanged, so a retry reuses the same indices instead of creating gaps.
+
+The chat index is why a conversation survives a reboot even when its peer was never saved as a contact: boot reads the index (`y` keys) and gives every listed conversation a row, hiding the ones whose device ID is blocked. Deleting one conversation removes its index entry, and deleting all chats removes every index entry with the message records.
 
 A conversation keeps at most 128 records. Before appending when the count minus the base reaches that cap, `append_messages` deletes the record at the base and advances the base entry, so the oldest row leaves as the newest arrives. The base key is the oldest retained ordinal; paging clamps a requested start to it.
 
@@ -135,7 +139,7 @@ A conversation keeps at most 128 records. Before appending when the count minus 
 
 The UI displays four records at a time and requests adjacent pages as the user scrolls. Records are returned oldest-first within a page, and the base value stops paging below the oldest retained record. `load_recent_messages` remains a thin wrapper over the same call for preview reads. Reads do not write flash.
 
-`delete_conversation` removes the message records and count for one conversation. `delete_all_conversations` enumerates every `m`/`n` key and deletes them in bounded batches so the RAM it uses does not grow with history size. These operations remove chat records; they do not erase contacts, settings, or identity.
+`delete_conversation` removes one conversation's message records, count, base, and chat-index entry. `delete_all_conversations` enumerates every `m`/`n`/`b` and `y` key and deletes them in bounded batches so the RAM it uses does not grow with history size. These operations remove chat records; they do not erase contacts, settings, or identity.
 
 Retention removes the oldest record of one conversation when its 128-record cap is reached; there is no global pruning or compaction. The partition is finite, `append_messages` reports a storage error when the map cannot accept a write, and the UI shows a `STORAGE FULL` alert for a failed append.
 

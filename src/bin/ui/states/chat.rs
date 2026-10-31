@@ -71,12 +71,7 @@ impl UiState {
         }
     }
 
-    /// Number of CHATS rows: every visible contact plus the clear-all row.
-    pub(super) fn chat_rows(&self) -> usize {
-        self.contacts.chat_indices().len() + 1
-    }
-
-    /// Conversation of one CHATS row, or `None` for the clear-all row.
+    /// Conversation of one CHATS row; `None` past the end of the list.
     pub(super) fn chat_row_conversation(&self, row: usize) -> Option<ConversationId> {
         self.contacts
             .chat_indices()

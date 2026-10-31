@@ -44,14 +44,14 @@ impl ContactEntry {
         }
     }
 
-    pub fn paired(device_id: [u8; 16], name: &str, key: [u8; 32], blocked: bool) -> Self {
+    pub fn paired(device_id: [u8; 16], name: &str, key: [u8; 32]) -> Self {
         let mut custom_name = String::new();
         let _ = custom_name.push_str(name);
         Self {
             conversation: ConversationId::Direct(device_id),
             custom_name,
             key: Some(key),
-            blocked,
+            blocked: false,
             preview: String::new(),
             preview_from_me: false,
             preview_acknowledged: false,
@@ -216,7 +216,6 @@ impl ContactBook {
         {
             existing.custom_name = contact.custom_name.clone();
             existing.key = Some(contact.key);
-            existing.blocked = contact.blocked;
             return Ok(());
         }
         self.entries
@@ -224,7 +223,6 @@ impl ContactBook {
                 contact.device_id,
                 contact.custom_name.as_str(),
                 contact.key,
-                contact.blocked,
             ))
             .map_err(|_| ContactBookError::Full)
     }
@@ -292,7 +290,8 @@ impl ContactBook {
         order
     }
 
-    /// A blocked peer is hidden everywhere until it is unblocked again.
+    /// Hide or reveal a peer's rows. The block list itself lives in flash;
+    /// this only mirrors it for the lists.
     pub fn set_blocked(&mut self, device_id: &[u8; 16], blocked: bool) -> bool {
         self.entries
             .iter_mut()

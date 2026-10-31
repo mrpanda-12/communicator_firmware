@@ -1,5 +1,9 @@
 #![no_std]
 #![no_main]
+// Packet, record, and radio APIs take their fields one by one because they
+// mirror a wire or register layout; bundling them into structs would not
+// reduce what a caller supplies, so the lint's proposed shape does not apply.
+#![allow(clippy::too_many_arguments)]
 pub mod calendar;
 pub mod crypto;
 #[cfg(feature = "debug-console")]
@@ -47,7 +51,7 @@ use crate::{
         flash::FlashStore,
         gps::Gps,
         keypad::{KEYPAD_EVENTS, Keypad},
-        lr1121::lr1121::Lr1121,
+        lr1121::driver::Lr1121,
         pinout,
     },
     network::{
@@ -55,11 +59,12 @@ use crate::{
     },
     radio::{
         control::RadioControl,
+        driver::Radio,
         queue::RadioQueue,
-        radio::Radio,
         types::{FrequencyBand, LoraBandwidth, PaMode, RadioConfig},
     },
     storage::{
+        block::is_blocked,
         session::{FLASH_BUFFER_SIZE, Flash, FlashSession},
         storage_manager::StorageManager,
     },
@@ -332,6 +337,11 @@ async fn main(_spawner: Spawner) -> ! {
     let last_message_id = saved_ids.map(|ids| ids.last_message_id).unwrap_or(0);
     packet::packet_data::set_packet_ids(next_id, last_message_id);
     let settings = ui::states::settings::Settings::load(&mut storage, &mut flash_buffer).await;
+    // Publish the blocked device IDs before the receive path can see a frame.
+    match storage.load_blocked(&mut flash_buffer).await {
+        Ok(blocked) => storage::block::replace(blocked),
+        Err(_) => defmt::warn!("Could not load the blocked device list from flash"),
+    }
     let mut contacts = ui::contact::ContactBook::new();
     match storage.load_contacts(&mut flash_buffer).await {
         Ok(saved_contacts) => {
@@ -341,9 +351,33 @@ async fn main(_spawner: Spawner) -> ! {
                     continue;
                 }
                 let _ = contacts.adopt(&contact);
+                // A saved contact that is on the block list starts out hidden.
+                if is_blocked(&contact.device_id) {
+                    contacts.set_blocked(&contact.device_id, true);
+                }
             }
         }
         Err(_) => defmt::warn!("Could not load saved contacts from flash"),
+    }
+    // Restore a row for every conversation that still has history, including
+    // peers that were only heard on air and never saved as contacts.
+    match storage.load_chat_ids(&mut flash_buffer).await {
+        Ok(chat_ids) => {
+            for chat_id in chat_ids {
+                // Broadcast is already the first entry of every list.
+                if chat_id == storage::message::BROADCAST_STORAGE_ID {
+                    continue;
+                }
+                if !contacts.note_unknown(chat_id) {
+                    continue;
+                }
+                // A blocked peer's row stays hidden until it is unblocked.
+                if is_blocked(&chat_id) {
+                    contacts.set_blocked(&chat_id, true);
+                }
+            }
+        }
+        Err(_) => defmt::warn!("Could not load the chat index from flash"),
     }
     // The UI seeds every chat-list preview from flash before its first draw.
     // Hands the startup scratch buffer to the session, so only one copy of the

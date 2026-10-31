@@ -8,6 +8,14 @@
 //!
 //! Run with `cargo test` inside `tests/`.
 
+// These modules are the firmware's own files, included whole: a test uses a
+// subset of each, and the packet/message/radio APIs carry their wire and
+// register fields as separate arguments on purpose.
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
+
+extern crate alloc;
+
 pub mod network;
 pub mod packet;
 pub mod radio;

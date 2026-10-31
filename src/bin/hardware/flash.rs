@@ -8,7 +8,9 @@ use sequential_storage::{
     map::{MapConfig, MapStorage, Value},
 };
 
-use crate::storage::{contact::Contact, message::StoredMessage, settings::StorageKey};
+use crate::storage::{
+    block::BlockedDevice, contact::Contact, message::StoredMessage, settings::StorageKey,
+};
 
 type StorageCache = Cache<Uncached, Uncached, Uncached, StorageKey>;
 type AsyncFlash<'d> = BlockingAsync<FlashStorage<'d>>;
@@ -22,6 +24,7 @@ pub const DUPLICATE_WINDOW: u32 = 8;
 pub enum StoreError {
     InvalidKey,
     InvalidContact,
+    InvalidBlockedDevice,
     MessageIndexOverflow,
     MissingMessageRecord,
     Storage(sequential_storage::Error<FlashStorageError>),
@@ -134,6 +137,62 @@ impl<'d> FlashStore<'d> {
         Ok(contacts)
     }
 
+    /// Read every blocked device ID, in the order the records are found.
+    pub async fn read_blocks(
+        &mut self,
+        data_buffer: &mut [u8],
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
+        let mut iterator = self
+            .storage
+            .fetch_all_items(data_buffer)
+            .await
+            .map_err(StoreError::Storage)?;
+        let mut ids: Vec<[u8; 16]> = Vec::new();
+
+        while let Some((key, value)) = iterator
+            .next::<&[u8]>(data_buffer)
+            .await
+            .map_err(StoreError::Storage)?
+        {
+            if !key.is_blocked() {
+                continue;
+            }
+            let (blocked, _) = BlockedDevice::deserialize_from(value)
+                .map_err(|_| StoreError::InvalidBlockedDevice)?;
+            if !ids.contains(&blocked.0) {
+                ids.push(blocked.0);
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// Add or replace one blocked device ID.
+    pub async fn write_block(
+        &mut self,
+        device_id: &[u8; 16],
+        data_buffer: &mut [u8],
+    ) -> Result<(), StoreError> {
+        let key = StorageKey::blocked(device_id);
+        self.storage
+            .store_item(data_buffer, &key, &BlockedDevice(*device_id))
+            .await
+            .map_err(StoreError::Storage)
+    }
+
+    /// Drop one blocked device ID; a missing record is already unblocked.
+    pub async fn remove_block(
+        &mut self,
+        device_id: &[u8; 16],
+        data_buffer: &mut [u8],
+    ) -> Result<(), StoreError> {
+        let key = StorageKey::blocked(device_id);
+        self.storage
+            .remove_item(data_buffer, &key)
+            .await
+            .map_err(StoreError::Storage)
+    }
+
     /// Insert or replace a contact, including its serialized pairwise key.
     pub async fn write_contact(
         &mut self,
@@ -157,6 +216,13 @@ impl<'d> FlashStore<'d> {
         messages: &[StoredMessage],
         buffer: &mut [u8],
     ) -> Result<(), StoreError> {
+        // Register the conversation in the chat index first, so a reboot can
+        // list a row for it even when the peer is not a saved contact.
+        self.storage
+            .store_item(buffer, &StorageKey::chat_index(device_id), &1u8)
+            .await
+            .map_err(StoreError::Storage)?;
+
         let count_key = StorageKey::message_count(device_id);
         let base_key = StorageKey::message_base(device_id);
         let mut count = self
@@ -353,13 +419,46 @@ impl<'d> FlashStore<'d> {
             .remove_item(&mut buffer[..], &StorageKey::message_base(device_id))
             .await
             .map_err(StoreError::Storage)?;
+        self.storage
+            .remove_item(&mut buffer[..], &StorageKey::chat_index(device_id))
+            .await
+            .map_err(StoreError::Storage)?;
         Ok(())
+    }
+
+    /// Read every conversation ID that still has stored history.
+    pub async fn read_chat_ids(
+        &mut self,
+        data_buffer: &mut [u8],
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
+        let mut iterator = self
+            .storage
+            .fetch_all_items(data_buffer)
+            .await
+            .map_err(StoreError::Storage)?;
+        let mut ids: Vec<[u8; 16]> = Vec::new();
+
+        while let Some((key, _)) = iterator
+            .next::<&[u8]>(data_buffer)
+            .await
+            .map_err(StoreError::Storage)?
+        {
+            let Some(conversation_id) = key.chat_index_id() else {
+                continue;
+            };
+            if !ids.contains(&conversation_id) {
+                ids.push(conversation_id);
+            }
+        }
+
+        Ok(ids)
     }
 
     /// Erase the history of every conversation, including orphaned ones.
     ///
-    /// The scan removes every `message`/`message_count` key found under any
-    /// device ID, not only conversations the contact list still knows about.
+    /// The scan removes every `message`/`message_count`/`message_base` key
+    /// found under any device ID, and the chat-index entry of each conversation,
+    /// not only conversations the contact list still knows about.
     ///
     /// Keys are deleted a bounded batch at a time: holding one key per stored
     /// message would cost tens of kilobytes on a full partition and could
@@ -386,7 +485,7 @@ impl<'d> FlashStore<'d> {
                     else {
                         break;
                     };
-                    if key.is_conversation_message() {
+                    if key.is_conversation_message() || key.is_chat_index() {
                         keys.push(key);
                     }
                 }

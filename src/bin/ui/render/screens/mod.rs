@@ -3,6 +3,7 @@
 
 pub mod add_contact;
 pub mod announce;
+pub mod blocked;
 pub mod chat;
 pub mod contacts;
 pub mod devices;

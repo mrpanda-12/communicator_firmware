@@ -7,12 +7,12 @@ fn contact_labels_for_known_and_unknown_peers() {
     assert!(!broadcast.is_deletable());
     assert!(!broadcast.is_unknown());
 
-    let paired = ContactEntry::paired(id(0x12), "Alice", [1; KEY_SIZE], false);
+    let paired = ContactEntry::paired(id(0x12), "Alice", [1; KEY_SIZE]);
     assert_eq!(paired.list_label().as_str(), "Alice");
     assert_eq!(paired.name_or_id().as_str(), "Alice");
     assert!(!paired.is_unknown());
 
-    let unnamed = ContactEntry::paired(id(0x12), "", [1; KEY_SIZE], false);
+    let unnamed = ContactEntry::paired(id(0x12), "", [1; KEY_SIZE]);
     assert!(unnamed.list_label().starts_with("PAIRED "));
     assert!(unnamed.list_label().ends_with("..."));
     assert_eq!(unnamed.name_or_id(), hex_device_id(&id(0x12)));
@@ -28,26 +28,25 @@ fn contact_book_adopts_and_updates() {
     let mut book = ContactBook::new();
     assert_eq!(book.entries().len(), 1);
 
-    assert_eq!(book.adopt(&contact(0x11, "a", 1, false)), Ok(()));
-    assert_eq!(book.adopt(&contact(0x22, "b", 2, false)), Ok(()));
+    assert_eq!(book.adopt(&contact(0x11, "a", 1)), Ok(()));
+    assert_eq!(book.adopt(&contact(0x22, "b", 2)), Ok(()));
     assert_eq!(book.entries().len(), 3);
     assert!(book.direct_key(&id(0x11)).is_some());
     assert!(book.entry_by_conversation(ConversationId::Direct(id(0x22))).is_some());
 
     // Adopting the same peer again updates in place.
-    assert_eq!(book.adopt(&contact(0x11, "renamed", 9, true)), Ok(()));
+    assert_eq!(book.adopt(&contact(0x11, "renamed", 9)), Ok(()));
     assert_eq!(book.entries().len(), 3);
     let entry = book
         .entry_by_conversation(ConversationId::Direct(id(0x11)))
         .unwrap();
     assert_eq!(entry.custom_name.as_str(), "renamed");
-    assert!(entry.blocked);
+    assert!(!entry.blocked, "a contact record carries no block state");
 
     let reserved = Contact {
         device_id: [0; 16],
         key: [0; KEY_SIZE],
         custom_name: String::new(),
-        blocked: false,
     };
     assert_eq!(
         book.adopt(&reserved),
@@ -58,7 +57,7 @@ fn contact_book_adopts_and_updates() {
 #[test]
 fn contact_book_renames_and_registers_peers() {
     let mut book = ContactBook::new();
-    book.adopt(&contact(0x11, "old", 1, false)).unwrap();
+    book.adopt(&contact(0x11, "old", 1)).unwrap();
 
     book.set_name(id(0x11), "new");
     assert_eq!(
@@ -83,15 +82,18 @@ fn contact_book_renames_and_registers_peers() {
 #[test]
 fn contact_book_blocks_and_removes() {
     let mut book = ContactBook::new();
-    book.adopt(&contact(0x11, "a", 1, false)).unwrap();
-    book.adopt(&contact(0x22, "b", 2, false)).unwrap();
+    book.adopt(&contact(0x11, "a", 1)).unwrap();
+    book.adopt(&contact(0x22, "b", 2)).unwrap();
 
     assert_eq!(book.visible_indices(false).len(), 3);
     assert_eq!(book.visible_indices(true).len(), 2);
 
     assert!(book.set_blocked(&id(0x11), true));
     assert_eq!(book.visible_indices(false).len(), 2);
-    assert!(!book.set_blocked(&id(0x99), true), "unknown peer cannot be blocked");
+    assert!(
+        !book.set_blocked(&id(0x99), true),
+        "a peer without a row has nothing to hide"
+    );
 
     assert_eq!(
         book.remove(0),
@@ -108,8 +110,8 @@ fn contact_book_blocks_and_removes() {
 #[test]
 fn contact_book_sorts_chats_by_activity() {
     let mut book = ContactBook::new();
-    book.adopt(&contact(0x11, "a", 1, false)).unwrap();
-    book.adopt(&contact(0x22, "b", 2, false)).unwrap();
+    book.adopt(&contact(0x11, "a", 1)).unwrap();
+    book.adopt(&contact(0x22, "b", 2)).unwrap();
 
     book.seed_preview(ConversationId::Direct(id(0x11)), "one", true, false, 100);
     book.seed_preview(ConversationId::Direct(id(0x22)), "two", false, false, 200);

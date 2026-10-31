@@ -39,20 +39,20 @@ impl PairingCoordinator {
     }
 
     pub fn set_request_nonce(&self, peer_id: [u8; 16], nonce: [u8; crypto::NONCE_SIZE]) {
-        if let Some(mut pending) = self.pending() {
-            if pending.peer_id == peer_id {
-                pending.request_nonce = Some(nonce);
-                self.pending.sender().send(Some(pending));
-            }
+        if let Some(mut pending) = self.pending()
+            && pending.peer_id == peer_id
+        {
+            pending.request_nonce = Some(nonce);
+            self.pending.sender().send(Some(pending));
         }
     }
 
     pub fn set_response_nonce(&self, peer_id: [u8; 16], nonce: [u8; crypto::NONCE_SIZE]) {
-        if let Some(mut pending) = self.pending() {
-            if pending.peer_id == peer_id {
-                pending.response_nonce = Some(nonce);
-                self.pending.sender().send(Some(pending));
-            }
+        if let Some(mut pending) = self.pending()
+            && pending.peer_id == peer_id
+        {
+            pending.response_nonce = Some(nonce);
+            self.pending.sender().send(Some(pending));
         }
     }
 

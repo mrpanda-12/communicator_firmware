@@ -32,7 +32,7 @@ where
     draw_rows(
         display,
         "SETTINGS",
-        &["DEVICE", "FREQUENCY", "GPS"],
+        &["DEVICE", "FREQUENCY", "GPS", "BLOCKED", "DELETE ALL CHATS"],
         selected,
     )
 }
@@ -63,7 +63,12 @@ pub fn update_settings_selection<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    update_rows(display, &["DEVICE", "FREQUENCY", "GPS"], previous, selected)
+    update_rows(
+        display,
+        &["DEVICE", "FREQUENCY", "GPS", "BLOCKED", "DELETE ALL CHATS"],
+        previous,
+        selected,
+    )
 }
 
 /// Draw the entries of one Settings category with its selection.
@@ -128,8 +133,6 @@ where
             draw_chat_row(display, entry, row, selected)?;
         }
     }
-    // Deleting a single contact uses RIGHT; this last row clears every chat.
-    draw_row(display, "DELETE ALL CHATS", indices.len(), selected)?;
     text(
         display,
         "ENTER OPEN   RIGHT MANAGE   BACK MENU",
@@ -155,9 +158,7 @@ where
     }
     let indices = contacts.chat_indices();
     for row in [previous, selected] {
-        if row == indices.len() {
-            draw_row(display, "DELETE ALL CHATS", row, selected)?;
-        } else if let Some(index) = indices.get(row)
+        if let Some(index) = indices.get(row)
             && let Some(entry) = contacts.entry(*index)
         {
             draw_chat_row(display, entry, row, selected)?;

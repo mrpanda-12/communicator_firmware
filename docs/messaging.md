@@ -17,7 +17,7 @@ Incoming records have `from_me = false`, sender ID, packet/message IDs, encrypti
 
 ### From keypress to send request
 
-The keypad worker debounces a key and sends one `KeypadKey` through the static event channel. The UI loop passes it to `UiState::handle_keypad`. In a chat, two hex digits compose one ASCII character. ENTER opens the send menu; the selected action creates either a text `OutgoingMessage` or a coordinate message from the latest valid GPS fix. The pending command is consumed by the UI loop.
+The keypad worker debounces a key and sends one `KeypadKey` through the static event channel. The UI loop passes it to `UiState::handle_keypad`. In a chat, two hex digits compose one ASCII character. ENTER opens the send menu and SEND transmits at once; either action creates a text `OutgoingMessage`, or a coordinate message from the latest valid GPS fix when the composer is empty or the GPS row is picked. The pending command is consumed by the UI loop.
 
 ### Validation, encryption, IDs, and fragmentation
 
@@ -53,7 +53,7 @@ The duplicate cache is RAM-only. A repeated packet key is dropped from normal pr
 
 ### Direct authentication
 
-For direct text, coordinates, and ACKs, `decrypt_direct` looks up the sender contact in flash. A blocked contact is rejected. A saved contact must use the encrypted form and pass AES-GCM authentication; plaintext from a paired contact is rejected. An unknown sender may send plaintext introductions, but encrypted traffic without a saved key is rejected. Thus plaintext acceptance is an explicit unpaired path, not a fallback after decryption failure.
+For direct text, coordinates, and ACKs, `decrypt_direct` looks up the sender contact in flash. A sender on the block list is rejected before any dispatch. A saved contact must use the encrypted form and pass AES-GCM authentication; plaintext from a paired contact is rejected. An unknown sender may send plaintext introductions, but encrypted traffic without a saved key is rejected. Thus plaintext acceptance is an explicit unpaired path, not a fallback after decryption failure.
 
 Broadcast text is delivered only when unencrypted. Encrypted broadcast has no shared key and is not displayed locally. Broadcast coordinates must also be plaintext. Packet forwarding is distinct from chat delivery: a relayed packet is not written to a conversation just because the relay received it.
 

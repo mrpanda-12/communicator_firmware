@@ -13,6 +13,12 @@ use super::{
     RenameCommand, ResetUiStatus, Screen, SettingsSection, UiState, device_list,
 };
 
+/// Rows on the settings menu: three categories, the block list, and the
+/// delete-all confirmation.
+const SETTINGS_ROWS: usize = 5;
+/// Settings row that opens the block list.
+const SETTINGS_BLOCKED_ROW: usize = 3;
+
 /// The screen a chat entry opens: the warning when a direct chat has no key,
 /// the chat view itself otherwise.
 fn open_chat_target(
@@ -81,13 +87,11 @@ impl UiState {
             Screen::ChatView { unencrypted_dm, .. } => *unencrypted_dm || encrypted_direct,
             _ => false,
         };
-        // These lookups run before the mutable screen match, because helper
-        // methods inside its arms would borrow the whole state.
-        let (chats_clear_row, chats_row_conversation) = match &self.screen {
-            Screen::ChatsList { selected } => {
-                (self.chat_rows(), self.chat_row_conversation(*selected))
-            }
-            _ => (0, None),
+        // This lookup runs before the mutable screen match, because a helper
+        // method inside its arms would borrow the whole state.
+        let chats_row_conversation = match &self.screen {
+            Screen::ChatsList { selected } => self.chat_row_conversation(*selected),
+            _ => None,
         };
         let contacts_open_conversation: Option<ConversationId> = match &self.screen {
             Screen::ContactsList { selected } => {
@@ -111,17 +115,15 @@ impl UiState {
                 _ => {}
             },
             Screen::ChatsList { selected } => {
-                // Rows: every visible contact, then a "clear everything" row.
-                let is_clear = *selected + 1 == chats_clear_row;
                 let row_conversation = chats_row_conversation;
+                let row_count = self.contacts.chat_indices().len();
                 match key {
                     Key::Back => self.screen = Screen::MainMenu { selected: 0 },
-                    Key::Up => *selected = selected.saturating_sub(1),
-                    Key::Down if *selected < chats_clear_row.saturating_sub(1) => *selected += 1,
+                    // Both directions wrap, like every other list here.
+                    Key::Up if row_count > 0 => *selected = (*selected + row_count - 1) % row_count,
+                    Key::Down if row_count > 0 => *selected = (*selected + 1) % row_count,
                     Key::Enter => {
-                        if is_clear {
-                            self.pending_delete_all = true;
-                        } else if let Some(conversation) = row_conversation {
+                        if let Some(conversation) = row_conversation {
                             let has_key = match conversation {
                                 ConversationId::Direct(device_id) => {
                                     self.contacts.direct_key(&device_id).is_some()
@@ -219,7 +221,7 @@ impl UiState {
                             Screen::ContactsList { selected: 0 }
                         };
                     }
-                    Key::Up => *selected = selected.saturating_sub(1),
+                    Key::Up => *selected = (*selected + action_count - 1) % action_count,
                     Key::Down => *selected = (*selected + 1) % action_count,
                     Key::Enter if have_entry && *selected == 0 => {
                         self.screen = Screen::NameEntry {
@@ -263,6 +265,7 @@ impl UiState {
                             device_id: *device_id,
                             action,
                             from_chats: *from_chats,
+                            from_blocked: false,
                         });
                     }
                     _ => {}
@@ -328,7 +331,8 @@ impl UiState {
                 let item_count = 2;
                 match key {
                     Key::Back => self.screen = device_list(*origin),
-                    Key::Up | Key::Down => *selected = (*selected + 1) % item_count,
+                    Key::Up => *selected = (*selected + item_count - 1) % item_count,
+                    Key::Down => *selected = (*selected + 1) % item_count,
                     Key::Enter if *selected == 0 => {
                         self.screen = Screen::NameEntry {
                             device_id: *device_id,
@@ -535,7 +539,7 @@ impl UiState {
                     Key::Back => self.screen = Screen::ChatsList { selected: 0 },
                     Key::Left => *cursor = cursor.saturating_sub(1),
                     Key::Right => *cursor = (*cursor + 1).min(self.chat_input.len()),
-                    Key::Up if *menu_open => *menu_index = menu_index.saturating_sub(1),
+                    Key::Up if *menu_open => *menu_index = (*menu_index + 1) % 2,
                     Key::Down if *menu_open => *menu_index = (*menu_index + 1) % 2,
                     // Browse and page through flash history only while not typing.
                     Key::Up if self.chat_input.is_empty() && !*menu_open && rows > 0 => {
@@ -598,6 +602,34 @@ impl UiState {
                     }
                     Key::Enter if can_send => *menu_open = true,
                     Key::Enter => {}
+                    // SEND transmits at once; it never opens a menu. The
+                    // highlighted menu row wins while the menu is open,
+                    // otherwise the typed text goes first, then the position.
+                    Key::Send if can_send => {
+                        let coordinates = *menu_open && *menu_index == 1;
+                        let body = if coordinates && self.gps_snapshot.fix {
+                            Some(OutgoingBody::Coords {
+                                latitude_microdegrees: self.gps_snapshot.latitude_microdegrees,
+                                longitude_microdegrees: self.gps_snapshot.longitude_microdegrees,
+                            })
+                        } else if self.chat_input.is_empty() {
+                            None
+                        } else {
+                            Some(OutgoingBody::Text)
+                        };
+                        if let Some(body) = body {
+                            self.pending_message = Some(OutgoingMessage {
+                                conversation: *conversation,
+                                unencrypted: match conversation {
+                                    ConversationId::Broadcast => true,
+                                    _ => *unencrypted_dm,
+                                },
+                                body,
+                            });
+                        }
+                        *menu_open = false;
+                    }
+                    Key::Send => {}
                     Key::Backspace if *cursor > 0 => {
                         self.chat_input.remove(*cursor - 1);
                         *cursor -= 1;
@@ -628,8 +660,15 @@ impl UiState {
             }
             Screen::Settings { selected } => match key {
                 Key::Back => self.screen = Screen::MainMenu { selected: 2 },
-                Key::Up => *selected = (*selected + 2) % 3,
-                Key::Down => *selected = (*selected + 1) % 3,
+                Key::Up => *selected = (*selected + SETTINGS_ROWS - 1) % SETTINGS_ROWS,
+                Key::Down => *selected = (*selected + 1) % SETTINGS_ROWS,
+                Key::Enter if *selected == SETTINGS_BLOCKED_ROW => {
+                    self.screen = Screen::BlockedDevices { selected: 0 }
+                }
+                // The last row asks before clearing every conversation.
+                Key::Enter if *selected == SETTINGS_ROWS - 1 => {
+                    self.screen = Screen::DeleteAllChats
+                }
                 Key::Enter => {
                     self.screen = Screen::SettingsSection {
                         section: SettingsSection::from_index(*selected),
@@ -638,6 +677,44 @@ impl UiState {
                 }
                 _ => {}
             },
+            Screen::DeleteAllChats => match key {
+                Key::Back => {
+                    self.screen = Screen::Settings {
+                        selected: SETTINGS_ROWS - 1,
+                    }
+                }
+                Key::Enter => {
+                    self.pending_delete_all = true;
+                    self.screen = Screen::Settings {
+                        selected: SETTINGS_ROWS - 1,
+                    };
+                }
+                _ => {}
+            },
+            Screen::BlockedDevices { selected } => {
+                let item_count = self.blocked.len().max(1);
+                match key {
+                    Key::Back => {
+                        self.screen = Screen::Settings {
+                            selected: SETTINGS_ROWS - 1,
+                        }
+                    }
+                    Key::Up => *selected = (*selected + item_count - 1) % item_count,
+                    Key::Down => *selected = (*selected + 1) % item_count,
+                    // ENTER unblocks the picked device; the run loop saves it.
+                    Key::Enter => {
+                        if let Some(device_id) = self.blocked.get(*selected).copied() {
+                            self.pending_manage = Some(ManageCommand {
+                                device_id,
+                                action: ManageAction::Block(false),
+                                from_chats: false,
+                                from_blocked: true,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Screen::SettingsSection { section, selected } => match key {
                 Key::Back => {
                     self.screen = Screen::Settings {
@@ -714,7 +791,7 @@ impl UiState {
                 chosen,
             } => {
                 let peers = self.contacts.visible_indices(true).len();
-                let row_count = peers + 1;
+                let row_count = peers.max(1);
                 let frequency_hz = *frequency_hz;
                 match key {
                     Key::Back => {
@@ -726,15 +803,15 @@ impl UiState {
                     }
                     Key::Up => *cursor = (*cursor + row_count - 1) % row_count,
                     Key::Down => *cursor = (*cursor + 1) % row_count,
-                    // The last row asks every ticked contact, then retunes here.
-                    Key::Enter if *cursor == peers => {
+                    Key::Enter => *chosen ^= 1 << *cursor,
+                    // SEND asks every ticked contact, then retunes here.
+                    Key::Send => {
                         self.pending_frequency_requests = Some((frequency_hz, *chosen));
                         self.pending_frequency = Some(frequency_hz);
                         self.screen = Screen::FrequencyStatus {
                             status: FrequencyUiStatus::Queued,
                         };
                     }
-                    Key::Enter => *chosen ^= 1 << *cursor,
                     _ => {}
                 }
             }

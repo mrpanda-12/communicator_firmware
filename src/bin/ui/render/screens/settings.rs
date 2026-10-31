@@ -38,6 +38,33 @@ where
     menu::update_settings_section_selection(display, section, previous, selected)
 }
 
+/// Ask before erasing every conversation; the run loop clears the records.
+pub fn draw_delete_all<D>(display: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    text(display, "DELETE ALL CHATS", 12, 38, CYAN, true)?;
+    text(
+        display,
+        "EVERY CONVERSATION AND ITS",
+        12,
+        92,
+        WARNING,
+        false,
+    )?;
+    text(display, "MESSAGES ARE ERASED.", 12, 112, WARNING, false)?;
+    text(
+        display,
+        "CONTACTS AND SETTINGS STAY.",
+        12,
+        136,
+        MUTED,
+        false,
+    )?;
+    text(display, "ENTER: DELETE ALL", 12, 176, WHITE, false)?;
+    text(display, "BACK: CANCEL", 12, 200, WHITE, false)
+}
+
 /// Show the persisted device identity and describe other setting actions.
 pub fn draw_item<D>(
     display: &mut D,
@@ -292,10 +319,6 @@ where
             name.as_str()
         );
         menu::draw_row(display, line.as_str(), row - first, cursor - first)?;
-    }
-    let send_row = indices.len();
-    if send_row < first + VISIBLE {
-        menu::draw_row(display, "SEND REQUESTS", send_row - first, cursor - first)?;
     }
     text(display, "ENTER: TOGGLE  SEND: ASK", 8, 218, WHITE, false)
 }

@@ -1,3 +1,4 @@
+pub mod block;
 pub mod contact;
 pub mod message;
 pub mod session;

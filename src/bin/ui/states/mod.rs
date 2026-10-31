@@ -28,6 +28,7 @@ use crate::network::types::DiscoveryList;
 use crate::packet::packet_data::MAX_LOGICAL_MESSAGE_SIZE;
 use crate::radio::types::RadioConfig;
 
+use crate::storage::block::BlockList;
 use crate::ui::contact::ContactBook;
 use settings::Settings;
 
@@ -49,6 +50,8 @@ pub struct UiState {
     pub announced_devices: DiscoveryList,
     /// Peers heard in any other packet, for the passive list.
     pub passive_devices: DiscoveryList,
+    /// Blocked device IDs, mirrored from flash for the lists and the block page.
+    pub blocked: BlockList,
     /// Chat rows of the open conversation: flash-backed, refreshed on change.
     pub messages: Vec<ChatRow, MAX_CHAT_MESSAGES>,
     /// Composer text of the open chat. It lives here instead of inside
@@ -109,6 +112,7 @@ impl UiState {
             announced_devices: DiscoveryList::new(),
             passive_devices: DiscoveryList::new(),
             settings,
+            blocked: BlockList::new(),
             messages: Vec::new(),
             chat_input: String::new(),
             popup: None,

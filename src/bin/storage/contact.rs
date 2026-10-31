@@ -3,6 +3,8 @@ use crate::hex::hex_device_id;
 use heapless::String;
 use sequential_storage::map::{SerializationError, Value};
 
+/// The last byte is unused: it held the block flag before blocking became its
+/// own records, and keeping it lets contacts written by older firmware parse.
 const CONTACT_RECORD_BYTES: usize = 16 + KEY_SIZE + 32 + 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,8 +12,6 @@ pub struct Contact {
     pub device_id: [u8; 16],
     pub key: [u8; KEY_SIZE],
     pub custom_name: String<32>,
-    /// Blocked contacts are dropped on receive and hidden from both lists.
-    pub blocked: bool,
 }
 
 impl Contact {
@@ -30,14 +30,14 @@ impl<'a> Value<'a> for Contact {
         if buffer.len() < CONTACT_RECORD_BYTES {
             return Err(SerializationError::BufferTooSmall);
         }
-        // Pack the fixed record as id | key | zero-padded name | blocked flag.
+        // Pack the fixed record as id | key | zero-padded name | reserved.
         buffer[..16].copy_from_slice(&self.device_id);
         buffer[16..16 + KEY_SIZE].copy_from_slice(&self.key);
         encode_fixed_string(
             &self.custom_name,
             &mut buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES - 1],
         );
-        buffer[CONTACT_RECORD_BYTES - 1] = u8::from(self.blocked);
+        buffer[CONTACT_RECORD_BYTES - 1] = 0;
         Ok(CONTACT_RECORD_BYTES)
     }
 
@@ -52,13 +52,11 @@ impl<'a> Value<'a> for Contact {
             .try_into()
             .map_err(|_| SerializationError::InvalidFormat)?;
         let custom_name = decode_fixed_string(&buffer[16 + KEY_SIZE..CONTACT_RECORD_BYTES - 1])?;
-        let blocked = buffer[CONTACT_RECORD_BYTES - 1] == 1;
         Ok((
             Self {
                 device_id,
                 key,
                 custom_name,
-                blocked,
             },
             CONTACT_RECORD_BYTES,
         ))

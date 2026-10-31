@@ -9,10 +9,10 @@ pub const DEVICE_ID_CHARS: usize = 32;
 /// Write `bytes` as uppercase hex, optionally separated between bytes.
 pub fn write_hex(out: &mut impl Write, bytes: &[u8], separator: Option<char>) -> core::fmt::Result {
     for (index, byte) in bytes.iter().enumerate() {
-        if index > 0 {
-            if let Some(separator) = separator {
-                out.write_char(separator)?;
-            }
+        if index > 0
+            && let Some(separator) = separator
+        {
+            out.write_char(separator)?;
         }
         write!(out, "{byte:02X}")?;
     }

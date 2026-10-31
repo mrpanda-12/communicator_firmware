@@ -29,7 +29,7 @@ The handler then applies these checks in order:
 | `Coordinates` | Broadcast or addressed here | Require one fragment, decrypt direct if paired, validate 8-byte coordinate, save | Broadcast can be relayed; authenticated direct coordinates may be ACKed after save. |
 | Other types / unmatched traffic | — | No local chat action | Broadcast or packet addressed elsewhere may be relayed. |
 
-Encrypted broadcast text is not delivered locally. The protocol has no shared broadcast key. A direct packet addressed here that fails authentication is not decrypted with a plaintext fallback. The code drops unknown encrypted senders, missing keys, bad GCM tags, plaintext from a saved contact, blocked contacts, invalid coordinates, and malformed text.
+Encrypted broadcast text is not delivered locally. The protocol has no shared broadcast key. A direct packet addressed here that fails authentication is not decrypted with a plaintext fallback. The code drops unknown encrypted senders, missing keys, bad GCM tags, plaintext from a saved contact, blocked senders, invalid coordinates, and malformed text.
 
 ## Direct-key rules
 
@@ -37,7 +37,7 @@ Encrypted broadcast text is not delivered locally. The protocol has no shared br
 
 | Saved contact | Packet encrypted? | Result |
 | --- | --- | --- |
-| Blocked | Either | Reject before decryption/delivery. |
+| Blocked sender | Addressed here | Reject before dispatch; broadcasts are still relayed. |
 | Saved and allowed | Yes, valid GCM tag | Return plaintext and the authenticating pair key. |
 | Saved and allowed | No | Reject; there is no downgrade path. |
 | No saved contact | Yes | Reject; no key is available. |

@@ -192,7 +192,6 @@ impl UiState {
                 device_id: event.peer_id,
                 key: event.key,
                 custom_name: name.clone(),
-                blocked: false,
             };
             self.paired_contact(&contact);
             // The handshake saves the contact without a name, so write it now.

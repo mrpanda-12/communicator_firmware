@@ -23,6 +23,7 @@ pub fn draw<D>(
     input: &str,
     pending_hex: Option<u8>,
     menu_open: bool,
+    menu_index: usize,
     unencrypted_dm: bool,
     send_enabled: bool,
     selected_message: Option<usize>,
@@ -36,7 +37,7 @@ where
     draw_chat_controls(display, send_enabled)?;
 
     if menu_open {
-        draw_context_menu(display)
+        draw_context_menu(display, menu_index)
     } else {
         Ok(())
     }
@@ -166,8 +167,8 @@ where
     text(display, "...", 294, 162, CYAN, false)
 }
 
-/// Draw the context menu overlay when it opens.
-pub fn draw_context_menu<D>(display: &mut D) -> Result<(), D::Error>
+/// Draw the context menu overlay when it opens; the marker follows the pick.
+pub fn draw_context_menu<D>(display: &mut D, menu_index: usize) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -175,9 +176,31 @@ where
         .into_styled(PrimitiveStyle::with_fill(crate::ui::render::style::WARNING))
         .draw(display)?;
     text(display, "SEND MESSAGE", 168, 92, WHITE, false)?;
-    text(display, "0 SEND TEXT", 168, 110, CYAN, false)?;
-    text(display, "1 SEND GPS POS", 168, 128, CYAN, false)?;
-    text(display, "BACK CANCEL", 168, 146, MUTED, false)
+    text(
+        display,
+        if menu_index == 0 {
+            "> SEND TEXT"
+        } else {
+            "  SEND TEXT"
+        },
+        168,
+        110,
+        CYAN,
+        false,
+    )?;
+    text(
+        display,
+        if menu_index == 1 {
+            "> SEND GPS POS"
+        } else {
+            "  SEND GPS POS"
+        },
+        168,
+        128,
+        CYAN,
+        false,
+    )?;
+    text(display, "ENTER SEND  BACK OUT", 168, 146, MUTED, false)
 }
 
 /// Clear just the context menu overlay when it closes.
@@ -196,7 +219,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     let controls = if send_enabled {
-        "HEX 2 DIGITS = 1 CHAR  ENTER: SEND MENU  UP/DOWN: BROWSE  BACK: CHATS"
+        "HEX 2 DIGITS = 1 CHAR  SEND: SEND  ENTER: MENU  BACK: CHATS"
     } else {
         "SENDING DISABLED   BACK: CHATS"
     };

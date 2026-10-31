@@ -18,7 +18,7 @@ Each matrix press produces one logical event after three stable 10 ms scans. The
 
 - `UP` and `DOWN` move list selection; in a chat with an empty composer they select history rows and page through older/newer records.
 - `LEFT`/`RIGHT` move the text cursor where supported and adjust UTC offset in its setting.
-- `ENTER` and `SEND` activate the same primary action.
+- `ENTER` opens or confirms the highlighted row; `SEND` transmits and never opens a menu.
 - `BACK` dismisses a pending hex nibble first, then deletes a character if applicable, then navigates back.
 - `HELP` opens or closes the legend overlay. The overlay consumes input except Help, Back, and Enter.
 - Every key except HELP dismisses an active popup first, without passing the press on to the screen underneath. HELP toggles the legend even while a popup is visible.
@@ -33,7 +33,7 @@ The menu opens Chats, Contacts, or Settings. Up/Down selects; Enter opens; Back 
 
 ### Chats list
 
-The list includes the reserved broadcast conversation and visible known or heard peers, plus the clear-history row. Enter opens the selected conversation; direct chats without a saved pairing key show an explicit unencrypted warning. Right opens contact-management actions for a direct peer. The clear-history row requests deletion of all conversation message keys; it does not delete the device ID or settings.
+The list includes the reserved broadcast conversation and visible known or heard peers, restored at boot from saved contacts and from the stored chat index, so a conversation that still has history gets a row even when its peer was never saved as a contact. Enter opens the selected conversation; direct chats without a saved pairing key show an explicit unencrypted warning. Right opens contact-management actions for a direct peer. Clearing every conversation lives in Settings → DELETE ALL CHATS: it erases all conversation message keys, keeps contacts, device ID, and settings, and asks for confirmation.
 
 A broadcast message row displays the sender label before the message. For paired/saved peers that label is the contact display name (currently custom name or full hex ID); for an unknown sender it is a short `UNHEARD` ID. That label is derived from the stored message's sender ID; it is not part of the broadcast payload.
 
@@ -47,7 +47,7 @@ Pairing uses the same shared secret entered on both devices. The UI accepts any 
 
 A chat displays four records at a time, loaded from flash in chronological order within the selected page. Up selects the preceding row; Down selects the next row. At the first row, Up loads the preceding four-record page when one exists. At the last row, Down loads the following page; after the newest record, one more Down clears selection. Up/Down do not scroll history while there is draft text or the send menu is open. The text composer is bounded by the 512-byte protocol limit.
 
-A new message/history revision reloads the newest page. The UI retains only the visible rows in RAM; older records are fetched by index from flash when requested. Enter on a selected coordinate row opens the navigation view; otherwise Enter in the composer opens the send menu, which sends the typed text or the latest valid GPS position. On send, the UI queues all fragment packets, then appends one local history record. A queue or flash failure is logged; a queue may already contain earlier fragments if a later fragment fails.
+A new message/history revision reloads the newest page. The UI retains only the visible rows in RAM; older records are fetched by index from flash when requested. Enter on a selected coordinate row opens the navigation view; otherwise Enter in the composer opens the send menu. SEND transmits at once — the typed text, or the latest valid GPS position when the composer is empty — and confirms the highlighted menu row while the menu is open. On send, the UI queues all fragment packets, then appends one local history record. A queue or flash failure is logged; a queue may already contain earlier fragments if a later fragment fails.
 
 Message color and prefix behavior:
 
@@ -69,9 +69,11 @@ A received coordinate is shown as a selectable `GPS` row. Enter opens a simple n
 | Device | Device info | Shows the current 16-byte ID and firmware version. |
 | Device | Reset identity | Generates and saves a different ID using the TRNG; updates `DEVICE_ID` so the UI and receive handler use it without rebooting. Contacts and history remain on this device. Peers must pair again with the new ID. Failure is shown on the result screen. |
 | Frequency | Current frequency | Displays the current worker-published frequency and transmit power. |
-| Frequency | Change frequency | Offers configured presets 869.4 MHz sub-GHz and 2.4 GHz. Enter queues a local retune through `RadioControl`; the radio worker applies it at a safe point and publishes the resulting config. Peers are not notified. A full control channel or rejected request reports busy. Hardware-level radio failure is handled by the worker. |
+| Frequency | Change frequency | Offers configured presets 869.4 MHz sub-GHz and 2.4 GHz. Enter opens the peer picker: ENTER ticks peers and SEND asks them on the air and queues the local retune through `RadioControl`; the radio worker applies it at a safe point and publishes the resulting config. A full control channel or rejected request reports busy. Hardware-level radio failure is handled by the worker. |
 | GPS | Fix status, coordinates, UTC time | Read-only values from the latest GPS snapshot. |
 | GPS | UTC offset | Up/Down or Left/Right changes a fixed offset in 30-minute steps between UTC−12 and UTC+14. The new value is written to flash as the key is changed. It adjusts display only, not protocol timestamps. |
+| Blocked | Blocked devices | Lists the blocked device IDs from flash, one row per ID; ENTER unblocks the picked one and BACK returns to the settings menu. Blocking itself is offered by the contact actions screen, reachable with RIGHT from both the chat list and the contact list, and needs no contact record. |
+| Delete all chats | Delete all chats | Confirmation page: ENTER erases every conversation's message records and every chat-list preview, BACK cancels. Contacts, blocked IDs, the device ID, and settings are kept. |
 
 The display brightness setting is loaded from flash at boot and applied to GPIO7 PWM. There is not currently a connected brightness-adjustment screen.
 
@@ -98,7 +100,7 @@ If the radio, GPS, keypad, or a shared watch cannot initialize, the firmware dra
 | Announcement | Allocate packet ID and queue one broadcast `DeviceAnnounce`. |
 | Reset identity | Regenerate and save device ID, publish new value through watch. |
 | Frequency change | Request worker retune via `RadioControl`. |
-| Contact delete/block | Write/remove contact and conversation data in flash. |
+| Contact delete/block | Delete conversation data and the contact record; block and unblock write or remove one block record. |
 | History paging | Read one four-record page by indexed storage ordinal. |
 | UTC offset | Persist the value; display applies it to GPS UTC. |
 

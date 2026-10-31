@@ -51,7 +51,8 @@ impl UiState {
                 _ => {}
             },
             KeypadKey::Back => self.handle_keypad_back(),
-            KeypadKey::Send | KeypadKey::Enter => self.handle_key(Key::Enter),
+            KeypadKey::Enter => self.handle_key(Key::Enter),
+            KeypadKey::Send => self.handle_key(Key::Send),
             KeypadKey::Up => self.handle_key(Key::Up),
             KeypadKey::Down => self.handle_key(Key::Down),
             KeypadKey::Left => self.handle_key(Key::Left),

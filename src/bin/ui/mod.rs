@@ -42,7 +42,7 @@ use heapless::Vec as HeaplessVec;
 use states::MAX_CHAT_MESSAGES;
 use states::settings::Settings;
 use states::{
-    AnnouncementStatus, ChatRow, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, UiState,
+    AnnouncementStatus, ChatRow, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, Screen, UiState,
 };
 
 /// A broadcast row names the sender; unknown peers render a short ID instead.
@@ -172,6 +172,9 @@ where
         DiscoveryList::new(),
         settings,
     );
+
+    // Mirror the block list that boot loaded from flash.
+    state.blocked = crate::storage::block::snapshot();
 
     let mut current_gps = gps.get().await;
     state.update_gps_snapshot(current_gps);
@@ -790,9 +793,13 @@ async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Pop
     state.show_popup(popup);
 }
 
-/// Execute one contact-manage command and return to its source list.
+/// Execute one contact-manage command and return to its source screen.
 async fn apply_manage(state: &mut UiState, flash: &Flash, manage: ManageCommand) {
     let index = state.contacts.direct_index(&manage.device_id);
+    let blocked_selection = match &state.screen {
+        Screen::BlockedDevices { selected } => *selected,
+        _ => 0,
+    };
     match manage.action {
         ManageAction::Delete => {
             let deleted = flash
@@ -813,34 +820,40 @@ async fn apply_manage(state: &mut UiState, flash: &Flash, manage: ManageCommand)
             defmt::info!("Deleted one contact and its chat history");
         }
         ManageAction::Block(blocked) => {
-            let saved = flash
-                .with(async |session| {
-                    let Some(mut contact) = session
-                        .storage
-                        .load_contact(&manage.device_id, &mut session.buffer)
-                        .await
-                        .ok()
-                        .flatten()
-                    else {
-                        // Unknown senders have no record in flash; the block
-                        // lives in the session only.
-                        return false;
-                    };
-                    contact.blocked = blocked;
-                    session
-                        .storage
-                        .save_contact(&contact, &mut session.buffer)
-                        .await
-                        .is_ok()
-                })
-                .await;
-            if saved || state.contacts.contains_direct(&manage.device_id) {
-                state.contacts.set_blocked(&manage.device_id, blocked);
+            // The block list is keyed by device ID in flash, so a peer that
+            // never became a contact can be blocked too.
+            if set_blocked_in_flash(flash, &manage.device_id, blocked).await {
+                crate::storage::block::set(manage.device_id, blocked);
+                state.blocked = crate::storage::block::snapshot();
+                // A blocked peer's rows disappear from both lists.
+                let _ = state.contacts.set_blocked(&manage.device_id, blocked);
+                defmt::info!("Block list saved for one device: blocked={}", blocked);
+            } else {
+                defmt::warn!("Could not save the block list to flash");
             }
-            defmt::info!("Block state saved for one contact: {}", blocked);
         }
     }
-    state.after_manage(manage.from_chats);
+    // The block list returns to itself; the other actions return to a list.
+    if manage.from_blocked {
+        state.screen = Screen::BlockedDevices {
+            selected: blocked_selection.min(state.blocked.len().saturating_sub(1)),
+        };
+    } else {
+        state.after_manage(manage.from_chats);
+    }
+}
+
+/// Add or remove one device ID in the persisted block list.
+async fn set_blocked_in_flash(flash: &Flash, device_id: &[u8; 16], blocked: bool) -> bool {
+    flash
+        .with(async |session| {
+            session
+                .storage
+                .save_blocked(device_id, blocked, &mut session.buffer)
+                .await
+                .is_ok()
+        })
+        .await
 }
 
 /// Load the newest page when a conversation is opened.

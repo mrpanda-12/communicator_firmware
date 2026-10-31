@@ -7,7 +7,7 @@ use sequential_storage::map::{SerializationError, Value};
 
 use crate::{
     hardware::flash::{FlashStore, StoreError},
-    storage::contact::Contact,
+    storage::{block::BlockList, contact::Contact},
 };
 
 const DEVICE_ID_KEY: &str = "device_id";
@@ -105,7 +105,10 @@ impl<'flash> StorageManager<'flash> {
     where
         for<'a> T: Value<'a>,
     {
-        self.flash.read_setting::<T>(key, buffer).await.map_err(store_error)
+        self.flash
+            .read_setting::<T>(key, buffer)
+            .await
+            .map_err(store_error)
     }
 
     pub async fn load_device_id(&mut self, buffer: &mut [u8]) -> Result<Option<[u8; 16]>, String> {
@@ -173,6 +176,40 @@ impl<'flash> StorageManager<'flash> {
         Err(String::from(
             "TRNG repeatedly returned the current device ID",
         ))
+    }
+
+    /// Conversation IDs that still have stored history.
+    pub async fn load_chat_ids(&mut self, buffer: &mut [u8]) -> Result<Vec<[u8; 16]>, String> {
+        self.flash.read_chat_ids(buffer).await.map_err(store_error)
+    }
+
+    /// Read every blocked device ID; an empty list before anything is blocked.
+    pub async fn load_blocked(&mut self, buffer: &mut [u8]) -> Result<BlockList, String> {
+        self.flash
+            .read_blocks(buffer)
+            .await
+            .map(BlockList::from_ids)
+            .map_err(store_error)
+    }
+
+    /// Block or unblock one device ID; each ID is its own flash record.
+    pub async fn save_blocked(
+        &mut self,
+        device_id: &[u8; 16],
+        blocked: bool,
+        buffer: &mut [u8],
+    ) -> Result<(), String> {
+        if blocked {
+            self.flash
+                .write_block(device_id, buffer)
+                .await
+                .map_err(store_error)
+        } else {
+            self.flash
+                .remove_block(device_id, buffer)
+                .await
+                .map_err(store_error)
+        }
     }
 
     pub async fn save_contact(

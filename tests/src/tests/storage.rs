@@ -79,7 +79,7 @@ fn stored_message_rejects_oversized_text_length() {
 
 #[test]
 fn contact_round_trip_and_display_name() {
-    let original = contact(0x55, "alice", 0xAB, true);
+    let original = contact(0x55, "alice", 0xAB);
     let mut buffer = [0u8; 128];
     let written = original.serialize_into(&mut buffer).unwrap();
     let (decoded, consumed) = Contact::deserialize_from(&buffer).unwrap();
@@ -87,10 +87,43 @@ fn contact_round_trip_and_display_name() {
     assert_eq!(decoded, original);
     assert_eq!(decoded.display_name().as_str(), "alice");
 
-    let unnamed = contact(0x55, "", 0, false);
+    let unnamed = contact(0x55, "", 0);
     let label = unnamed.display_name();
     assert_eq!(label.len(), DEVICE_ID_CHARS);
     assert_eq!(label, hex_device_id(&id(0x55)));
+}
+
+#[test]
+fn blocked_device_record_round_trip() {
+    let original = BlockedDevice(id(0x31));
+    let mut buffer = [0u8; 32];
+    let written = original.serialize_into(&mut buffer).unwrap();
+    let (decoded, consumed) = BlockedDevice::deserialize_from(&buffer).unwrap();
+    assert_eq!(consumed, written);
+    assert_eq!(decoded, original);
+
+    let mut list = BlockList::new();
+    assert!(list.is_empty());
+    assert!(list.set(&id(0x11), true));
+    assert!(list.set(&id(0x22), true));
+    assert!(!list.set(&id(0x11), true), "a listed ID is unchanged");
+    assert_eq!(list.len(), 2);
+    assert!(list.contains(&id(0x22)));
+    assert!(list.set(&id(0x22), false));
+    assert!(!list.contains(&id(0x22)));
+    assert!(!list.set(&id(0x22), false));
+    assert_eq!(list.ids(), &[id(0x11)]);
+}
+
+#[test]
+fn block_cache_tracks_the_persisted_list() {
+    crate::storage::block::replace(BlockList::from_ids(vec![id(0x77)]));
+    assert!(crate::storage::block::is_blocked(&id(0x77)));
+    assert!(!crate::storage::block::is_blocked(&id(0x78)));
+    assert!(crate::storage::block::set(id(0x77), false));
+    assert!(!crate::storage::block::is_blocked(&id(0x77)));
+    assert!(!crate::storage::block::set(id(0x77), false));
+    crate::storage::block::replace(BlockList::new());
 }
 
 #[test]
@@ -101,6 +134,14 @@ fn storage_keys_are_namespaced_and_distinct() {
     let message = StorageKey::message(&device, 3);
     let count = StorageKey::message_count(&device);
     let base = StorageKey::message_base(&device);
+    let chat_index = StorageKey::chat_index(&device);
+
+    assert!(chat_index.is_chat_index());
+    assert_eq!(chat_index.chat_index_id(), Some(device));
+    assert!(!chat_index.is_contact());
+    assert!(!chat_index.is_conversation_message());
+    assert_ne!(contact_key, chat_index);
+    assert_eq!(StorageKey::contact(&device).chat_index_id(), None);
 
     assert!(contact_key.is_contact());
     assert!(!setting.is_contact());

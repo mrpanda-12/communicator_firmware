@@ -1,3 +1,5 @@
+#[path = "../../../src/bin/storage/block.rs"]
+pub mod block;
 #[path = "../../../src/bin/storage/contact.rs"]
 pub mod contact;
 #[path = "../../../src/bin/storage/message.rs"]

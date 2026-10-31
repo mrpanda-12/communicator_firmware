@@ -186,6 +186,12 @@ pub enum Screen {
         section: SettingsSection,
         item: usize,
     },
+    /// Blocked device IDs from flash; ENTER unblocks the picked one.
+    BlockedDevices {
+        selected: usize,
+    },
+    /// Confirmation page for erasing every conversation; ENTER deletes.
+    DeleteAllChats,
     /// Identity regeneration requested; shows progress and the result.
     IdentityReset {
         status: ResetUiStatus,
@@ -277,6 +283,8 @@ pub struct ManageCommand {
     pub device_id: [u8; 16],
     pub action: ManageAction,
     pub from_chats: bool,
+    /// The block list opened this command, so return there instead of a list.
+    pub from_blocked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,7 +293,10 @@ pub enum Key {
     Down,
     Left,
     Right,
+    /// Confirm or open the highlighted row.
     Enter,
+    /// Transmit the current message or request; never opens a menu.
+    Send,
     Back,
     Character(char),
     Backspace,

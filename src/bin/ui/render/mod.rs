@@ -113,6 +113,7 @@ where
                 unencrypted_dm: old_unencrypted,
                 pending_hex: old_pending_hex,
                 menu_open: old_menu_open,
+                menu_index: old_menu_index,
                 selected_message: old_selected_message,
                 ..
             },
@@ -121,6 +122,7 @@ where
                 unencrypted_dm,
                 pending_hex,
                 menu_open,
+                menu_index,
                 selected_message,
                 ..
             },
@@ -139,9 +141,9 @@ where
             if previous.chat_input != state.chat_input || old_pending_hex != pending_hex {
                 screens::chat::draw_input(display, state.chat_input.as_str(), *pending_hex)?;
             }
-            if old_menu_open != menu_open {
+            if old_menu_open != menu_open || (*menu_open && old_menu_index != menu_index) {
                 if *menu_open {
-                    screens::chat::draw_context_menu(display)?;
+                    screens::chat::draw_context_menu(display, *menu_index)?;
                 } else {
                     screens::chat::clear_context_menu(display)?;
                 }
@@ -267,6 +269,10 @@ where
         Screen::SettingsSection { section, selected } => {
             screens::settings::draw(display, *section, *selected)
         }
+        Screen::BlockedDevices { selected } => {
+            screens::blocked::draw(display, &state.blocked, *selected)
+        }
+        Screen::DeleteAllChats => screens::settings::draw_delete_all(display),
         Screen::SettingsItem { section, item } => screens::settings::draw_item(
             display,
             *section,
@@ -301,6 +307,7 @@ where
             unencrypted_dm,
             pending_hex,
             menu_open,
+            menu_index,
             selected_message,
             ..
         } => {
@@ -317,6 +324,7 @@ where
                 state.chat_input.as_str(),
                 *pending_hex,
                 *menu_open,
+                *menu_index,
                 *unencrypted_dm,
                 send_enabled,
                 *selected_message,

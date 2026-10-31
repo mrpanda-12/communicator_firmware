@@ -27,7 +27,7 @@ where
         "0-F: HEX DIGITS, 2 = 1 ASCII CHAR",
         "41=A  5A=Z  61=a  7A=z  30=0",
         "20=SPACE  2E=.  2C=,  3F=?",
-        "SEND / ENTER: CONFIRM ACTION",
+        "SEND: TRANSMIT  ENTER: CONFIRM",
         "BACK: DELETE, THEN LEAVE SCREEN",
         "ARROWS: SELECT OR MOVE CURSOR",
         "HELP: CLOSE THIS PANEL",

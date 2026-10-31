@@ -1,17 +1,16 @@
 use core::ops::AsyncFnMut;
 
-use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Timer};
-use embedded_hal::spi::SpiBus;
-use esp_hal::spi::Error as SpiError;
-
-use crate::hardware::lr1121::lr1121::Lr1121;
+use crate::hardware::lr1121::driver::Lr1121;
 use crate::packet::packet_data::{MAX_PACKET_SIZE, PacketData};
 use crate::radio::control::RadioControl;
 use crate::radio::duty_cycle::DutyCycle;
 use crate::radio::queue::{Packet, QueueError, RadioQueue};
 use crate::radio::radio_error::RadioError;
 use crate::radio::types::{FrequencyBand, LoraBandwidth, PaMode, PacketStatus, RadioConfig};
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Timer};
+use embedded_hal::spi::SpiBus;
+use esp_hal::spi::Error as SpiError;
 
 // Routes these LR1121 IRQ register bits to DIO9.
 const IRQ_TX_DONE: u32 = 1 << 2;

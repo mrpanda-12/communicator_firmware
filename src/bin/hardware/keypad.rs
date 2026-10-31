@@ -265,14 +265,15 @@ impl<I2C: I2c> Keypad<I2C> {
             self.drive_column(column)?;
             let rows_a = self.read_register(REG_GPIO_A)?;
             let rows_b = self.read_register(REG_GPIO_B)?;
-            for row in 0..ROWS {
+            for (row, keys) in LAYOUT.iter().enumerate().take(ROWS) {
                 let row_low = if row < 4 {
                     rows_a & (1 << row) == 0
                 } else {
                     rows_b & ROW_B_MASK == 0
                 };
                 if row_low {
-                    pressed = Some(LAYOUT[row][column]);
+                    // The column comes from the driven pin, not a list index.
+                    pressed = keys.get(column).copied();
                     break;
                 }
             }

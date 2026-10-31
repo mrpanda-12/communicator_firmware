@@ -5,6 +5,7 @@ use core::str::from_utf8;
 
 use heapless::Vec;
 
+use crate::storage::block::is_blocked;
 use crate::storage::message::ConversationId;
 use crate::{
     DEVICE_ID, crypto,
@@ -100,6 +101,14 @@ impl PacketHandler {
         let broadcast = packet.is_broadcast();
         let here = packet.is_for(&device_id);
 
+        // A blocked sender's traffic addressed to this device stops here: it is
+        // not remembered, dispatched, decrypted, or acknowledged. Broadcasts
+        // from that sender are still relayed for other peers.
+        if here && is_blocked(&packet.from) {
+            defmt::debug!("RX ignored: sender is blocked");
+            return;
+        }
+
         // Answer a retransmit from the accepted cache and stop.
         if self.is_duplicate(packet.from, packet.packet_id) {
             self.repeat_ack(&packet, device_id, broadcast, here, tx, flash)
@@ -144,12 +153,12 @@ impl PacketHandler {
             }
             // A direct add-contact request only prompts the user.
             PacketType::DeviceAnnounceResponse if !broadcast && here => {
-                Self::accept_contact_request(&packet, flash).await;
+                Self::accept_contact_request(&packet);
                 return;
             }
             // A direct retune request only prompts the user.
             PacketType::FrequencyChange if !broadcast && here => {
-                Self::accept_frequency_change_request(&packet, flash).await;
+                Self::accept_frequency_change_request(&packet);
                 return;
             }
             // Relay everything else further down.
@@ -383,45 +392,19 @@ impl PacketHandler {
     }
 
     /// Show an add-contact request from a peer; nothing is stored or keyed.
-    async fn accept_contact_request(packet: &PacketData, flash: &Flash) {
-        let looked_up = flash
-            .with(async |session| {
-                session
-                    .storage
-                    .load_contact(&packet.from, &mut session.buffer)
-                    .await
-            })
-            .await;
-        // A blocked peer's request is dropped like any other traffic of theirs.
-        if matches!(looked_up, Ok(Some(contact)) if contact.blocked) {
-            defmt::debug!("Dropped contact request from a blocked peer");
-            return;
-        }
+    fn accept_contact_request(packet: &PacketData) {
         defmt::info!("Heard an add-contact request");
         notify::contact_request(packet.from);
     }
 
     /// Show a peer's retune request; the UI asks the user to accept it.
-    async fn accept_frequency_change_request(packet: &PacketData, flash: &Flash) {
+    fn accept_frequency_change_request(packet: &PacketData) {
         let Some(frequency_hz) = decode_frequency(packet.payload.as_slice()) else {
             defmt::warn!("Rejected frequency request: payload is not four bytes");
             return;
         };
         if crate::radio::types::FrequencyBand::for_frequency(frequency_hz).is_none() {
             defmt::warn!("Rejected frequency request for an unsupported frequency");
-            return;
-        }
-        // A blocked peer's request is dropped like any other traffic of theirs.
-        let looked_up = flash
-            .with(async |session| {
-                session
-                    .storage
-                    .load_contact(&packet.from, &mut session.buffer)
-                    .await
-            })
-            .await;
-        if matches!(looked_up, Ok(Some(contact)) if contact.blocked) {
-            defmt::debug!("Dropped frequency request from a blocked peer");
             return;
         }
         defmt::info!("Heard a frequency change request");
@@ -535,7 +518,6 @@ impl PacketHandler {
             device_id: packet.from,
             key,
             custom_name: heapless::String::new(),
-            blocked: false,
         };
         let saved = flash
             .with(async |session| {
@@ -560,17 +542,12 @@ impl PacketHandler {
         plaintext: &[u8],
         kind: &str,
     ) -> Option<ReassembledMessage> {
-        match self
-            .fragments
+        self.fragments
             .push(packet.clone(), plaintext, fingerprint(packet))
-        {
-            // `Ok(None)` means more fragments are still missing.
-            Ok(message) => message,
-            Err(_) => {
+            .unwrap_or_else(|_| {
                 defmt::warn!("Rejected malformed {} fragments", kind);
                 None
-            }
-        }
+            })
     }
 
     /// Store one accepted fragment, replacing an older copy of the same fragment.
@@ -664,7 +641,8 @@ fn parse_frame(frame: &Packet) -> Option<PacketData> {
 
 /// Apply the pair-key rules to a direct packet and return its plaintext.
 ///
-/// The `Option<PairKey>` is `Some` only when the payload was authenticated.
+/// Blocked senders never reach this function. The `Option<PairKey>` is `Some`
+/// only when the payload was authenticated.
 async fn decrypt_direct(packet: &PacketData, flash: &Flash) -> Option<(Payload, Option<PairKey>)> {
     // Look up the key this sender is expected to use.
     let looked_up = flash
@@ -679,11 +657,6 @@ async fn decrypt_direct(packet: &PacketData, flash: &Flash) -> Option<(Payload, 
         defmt::warn!("Rejected packet: contact lookup failed");
         return None;
     };
-    // A blocked peer is dropped before any message of theirs is processed.
-    if saved.as_ref().is_some_and(|contact| contact.blocked) {
-        defmt::warn!("Dropped packet from a blocked contact");
-        return None;
-    }
 
     match (saved, packet.is_encrypted) {
         // Decrypt traffic from a paired contact and keep its key.

@@ -9,6 +9,8 @@ const NAMESPACE_CONTACT: u8 = b'c';
 const NAMESPACE_MESSAGE: u8 = b'm';
 const NAMESPACE_MESSAGE_COUNT: u8 = b'n';
 const NAMESPACE_MESSAGE_BASE: u8 = b'b';
+const NAMESPACE_BLOCKED: u8 = b'x';
+const NAMESPACE_CHAT_INDEX: u8 = b'y';
 
 /// Keys carry a one-byte namespace so settings, contacts, and message records
 /// cannot alias one another.
@@ -34,6 +36,36 @@ impl StorageKey {
 
     pub(crate) const fn is_contact(&self) -> bool {
         self.len == 17 && self.bytes[0] == NAMESPACE_CONTACT
+    }
+
+    /// One blocked device ID: the ID is the whole key, so listing the records
+    /// enumerates the block list.
+    pub(crate) fn blocked(device_id: &[u8; 16]) -> Self {
+        Self::from_parts(NAMESPACE_BLOCKED, device_id)
+    }
+
+    pub(crate) const fn is_blocked(&self) -> bool {
+        self.len == 17 && self.bytes[0] == NAMESPACE_BLOCKED
+    }
+
+    /// One entry of the chat index: the conversation storage ID is the key, so
+    /// listing the records lists every conversation that still has history.
+    pub(crate) fn chat_index(conversation_id: &[u8; 16]) -> Self {
+        Self::from_parts(NAMESPACE_CHAT_INDEX, conversation_id)
+    }
+
+    pub(crate) const fn is_chat_index(&self) -> bool {
+        self.len == 17 && self.bytes[0] == NAMESPACE_CHAT_INDEX
+    }
+
+    /// The conversation ID of a chat-index key.
+    pub(crate) fn chat_index_id(&self) -> Option<[u8; 16]> {
+        if !self.is_chat_index() {
+            return None;
+        }
+        let mut conversation_id = [0; 16];
+        conversation_id.copy_from_slice(&self.bytes[1..17]);
+        Some(conversation_id)
     }
 
     pub(crate) fn message(device_id: &[u8; 16], index: u32) -> Self {
