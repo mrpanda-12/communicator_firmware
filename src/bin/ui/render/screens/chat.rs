@@ -9,9 +9,11 @@ use embedded_graphics::{
 use heapless::String;
 
 use crate::storage::message::ConversationId;
-use crate::ui::state::ChatRow;
+use crate::ui::states::ChatRow;
 
-use super::style::{ACK_GREEN, BLUE, CYAN, MUTED, WARNING, WHITE, text, write_coordinate};
+use crate::ui::render::style::{
+    ACK_GREEN, BLUE, CYAN, MUTED, WARNING, WHITE, text, write_coordinate,
+};
 
 /// Draw the selected conversation, composer, and context menu.
 pub fn draw<D>(
@@ -55,7 +57,7 @@ where
         (ConversationId::Direct(_), false) => "DIRECT MESSAGE",
     };
     Rectangle::new(Point::new(5, 28), Size::new(310, 22))
-        .into_styled(PrimitiveStyle::with_fill(super::style::BLACK))
+        .into_styled(PrimitiveStyle::with_fill(crate::ui::render::style::BLACK))
         .draw(display)?;
     text(display, "<", 8, 34, CYAN, false)?;
     text(display, title, 28, 34, WHITE, false)
@@ -74,7 +76,7 @@ where
 {
     // Clear the interior first so a shorter list never leaves older text behind.
     Rectangle::new(Point::new(6, 55), Size::new(308, 89))
-        .into_styled(PrimitiveStyle::with_fill(super::style::BLACK))
+        .into_styled(PrimitiveStyle::with_fill(crate::ui::render::style::BLACK))
         .draw(display)?;
     Rectangle::new(Point::new(5, 54), Size::new(310, 91))
         .into_styled(PrimitiveStyle::with_stroke(MUTED, 1))
@@ -86,7 +88,9 @@ where
         let row_y = 59 + index as i32 * 19;
         if Some(index) == selected_message {
             Rectangle::new(Point::new(7, row_y), Size::new(306, 17))
-                .into_styled(PrimitiveStyle::with_fill(super::style::SELECTED))
+                .into_styled(PrimitiveStyle::with_fill(
+                    crate::ui::render::style::SELECTED,
+                ))
                 .draw(display)?;
         }
         let mut line = String::<80>::new();
@@ -168,7 +172,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     Rectangle::new(Point::new(162, 86), Size::new(152, 60))
-        .into_styled(PrimitiveStyle::with_fill(super::style::WARNING))
+        .into_styled(PrimitiveStyle::with_fill(crate::ui::render::style::WARNING))
         .draw(display)?;
     text(display, "SEND MESSAGE", 168, 92, WHITE, false)?;
     text(display, "0 SEND TEXT", 168, 110, CYAN, false)?;
@@ -182,7 +186,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     Rectangle::new(Point::new(162, 86), Size::new(152, 60))
-        .into_styled(PrimitiveStyle::with_fill(super::style::BLACK))
+        .into_styled(PrimitiveStyle::with_fill(crate::ui::render::style::BLACK))
         .draw(display)
 }
 

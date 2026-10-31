@@ -38,12 +38,14 @@ pub fn distance_and_bearing(from: (i32, i32), to: (i32, i32)) -> Option<(f64, u1
 
 /// Return a compass abbreviation for an absolute bearing.
 pub fn compass_direction(degrees: u16) -> &'static str {
+    // Snap the bearing to the nearest 45-degree sector.
     const DIRECTIONS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     DIRECTIONS[((degrees as usize + 22) / 45) % DIRECTIONS.len()]
 }
 
 /// Return the signed shortest turn from the current course to a target bearing.
 pub fn relative_turn_degrees(target: u16, course: u16) -> i16 {
+    // The +540 offset keeps the difference positive before folding it into -180..180.
     let difference = (target as i32 - course as i32 + 540) % 360 - 180;
     difference as i16
 }

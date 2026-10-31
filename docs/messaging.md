@@ -1,6 +1,6 @@
 # Message lifecycle
 
-This guide follows one logical chat message through the code. The UI state machine lives in `src/bin/ui/state.rs`; command execution, fragmentation, sending, and flash-backed history live in `src/bin/ui/mod.rs`; radio framing is in `src/bin/packet/`; receive dispatch is in `src/bin/network/packet_handler.rs`; and the shared flash session is in `src/bin/storage/session.rs`.
+This guide follows one logical chat message through the code. The UI state machine lives in `src/bin/ui/states/`; command execution, fragmentation, sending, and flash-backed history live in `src/bin/ui/mod.rs`; radio framing is in `src/bin/packet/`; receive dispatch is in `src/bin/network/packet_handler.rs`; and the shared flash session is in `src/bin/storage/session.rs`.
 
 ## Conversations and stored records
 

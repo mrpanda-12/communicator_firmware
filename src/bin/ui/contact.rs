@@ -2,8 +2,8 @@ use core::fmt::Write;
 
 use heapless::{String, Vec};
 
-use crate::storage::{contact::Contact, message::ConversationId};
 use crate::hex::{hex_device_id, write_hex};
+use crate::storage::{contact::Contact, message::ConversationId};
 
 /// List capacity; the broadcast conversation occupies one slot.
 pub const MAX_CONTACTS: usize = 32;
@@ -179,7 +179,9 @@ impl ContactBook {
     }
 
     pub fn entry_by_conversation(&self, conversation: ConversationId) -> Option<&ContactEntry> {
-        self.entries.iter().find(|entry| entry.conversation == conversation)
+        self.entries
+            .iter()
+            .find(|entry| entry.conversation == conversation)
     }
 
     pub fn contains_direct(&self, device_id: &[u8; 16]) -> bool {
@@ -257,7 +259,11 @@ impl ContactBook {
         acknowledged: bool,
         timestamp: u32,
     ) {
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.conversation == conversation) else {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.conversation == conversation)
+        else {
             return;
         };
         entry.preview.clear();

@@ -24,10 +24,17 @@ pub const POPUP_NAME_CHARS: usize = 32;
 /// What a toast reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupType {
-    NewMessage,
+    /// A received text message.
+    Text,
+    /// A received position.
+    Gps,
     Alert,
     /// A peer asked to be added; nothing is stored and no key is made.
     ContactRequest,
+    /// A peer asks this device to retune. ENTER accepts, BACK declines.
+    FrequencyChangeRequest {
+        frequency_hz: u32,
+    },
 }
 
 /// One toast: which conversation, the sender name, and a short line of text.
@@ -65,21 +72,29 @@ fn fit<const N: usize>(text: &str) -> String<N> {
     line
 }
 
-/// Record one accepted message: queue a popup toast and bump the revision.
-pub fn message_received(conversation: ConversationId, from: [u8; 16], text: &str) {
-    let popup = Popup {
-        conversation,
-        popup_type: PopupType::NewMessage,
-        sender_id: from,
-        name: String::new(),
-        text: fit(text),
-    };
-    // A full queue drops the oldest toast so the newest message is still shown.
+/// Queue one toast, dropping the oldest when the queue is full.
+fn queue(popup: Popup) {
     if POPUP_QUEUE.free_capacity() == 0 {
         let receiver = POPUP_QUEUE.receiver();
         let _ = receiver.try_receive();
     }
     let _ = POPUP_QUEUE.try_send(popup);
+}
+
+/// Record one accepted message: queue a popup toast and bump the revision.
+pub fn message_received(
+    conversation: ConversationId,
+    from: [u8; 16],
+    text: &str,
+    popup_type: PopupType,
+) {
+    queue(Popup {
+        conversation,
+        popup_type,
+        sender_id: from,
+        name: String::new(),
+        text: fit(text),
+    });
     history_changed();
 }
 
@@ -90,18 +105,24 @@ pub fn storage_full(conversation: ConversationId) {
 
 /// Tell the user a peer asked to be added; this pairs nothing by itself.
 pub fn contact_request(from: [u8; 16]) {
-    let popup = Popup {
+    queue(Popup {
         conversation: ConversationId::from_peer(from),
         popup_type: PopupType::ContactRequest,
         sender_id: from,
         name: String::new(),
         text: fit("WANTS TO ADD YOU"),
-    };
-    if POPUP_QUEUE.free_capacity() == 0 {
-        let receiver = POPUP_QUEUE.receiver();
-        let _ = receiver.try_receive();
-    }
-    let _ = POPUP_QUEUE.try_send(popup);
+    });
+}
+
+/// Tell the user a peer wants this device to retune; the UI asks yes or no.
+pub fn frequency_change_request(from: [u8; 16], frequency_hz: u32) {
+    queue(Popup {
+        conversation: ConversationId::from_peer(from),
+        popup_type: PopupType::FrequencyChangeRequest { frequency_hz },
+        sender_id: from,
+        name: String::new(),
+        text: fit("WANTS TO RETUNE"),
+    });
 }
 
 /// Warn that the outbox is full and the message stayed in the composer.
@@ -110,18 +131,13 @@ pub fn send_queue_full(conversation: ConversationId) {
 }
 
 fn alert(conversation: ConversationId, text: &str) {
-    let popup = Popup {
+    queue(Popup {
         conversation,
         popup_type: PopupType::Alert,
         sender_id: [0; 16],
         name: String::new(),
         text: fit(text),
-    };
-    if POPUP_QUEUE.free_capacity() == 0 {
-        let receiver = POPUP_QUEUE.receiver();
-        let _ = receiver.try_receive();
-    }
-    let _ = POPUP_QUEUE.try_send(popup);
+    });
 }
 
 /// Signal the UI that history changed without an accompanying toast.

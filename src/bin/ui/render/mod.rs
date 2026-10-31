@@ -1,7 +1,3 @@
-mod chat;
-mod help;
-pub mod menu;
-mod navigation;
 mod popup;
 pub mod screens;
 pub mod style;
@@ -18,7 +14,7 @@ use crate::storage::message::ConversationId;
 
 use super::{
     GpsSnapshot,
-    state::{Screen, UiState},
+    states::{Screen, UiState},
 };
 
 /// Draw the fixed status bar, then dispatch to the active page renderer.
@@ -27,7 +23,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     display.clear(style::BLACK)?;
-    top_bar::draw(display, gps, state.timezone_offset_minutes)?;
+    top_bar::draw(display, gps, state.settings.timezone_offset_minutes)?;
     draw_page(display, state)
 }
 
@@ -49,15 +45,15 @@ where
         *previous_gps = Some(gps);
         return Ok(());
     };
-    let old_timezone_offset = old_state.timezone_offset_minutes;
+    let old_timezone_offset = old_state.settings.timezone_offset_minutes;
 
     if old_state != state {
         draw_state_changes(display, old_state, state)?;
         *previous_state = Some(state.clone());
     }
     // The timezone lives in the state, so an offset change repaints the bar too.
-    if *previous_gps != Some(gps) || old_timezone_offset != state.timezone_offset_minutes {
-        top_bar::draw(display, gps, state.timezone_offset_minutes)?;
+    if *previous_gps != Some(gps) || old_timezone_offset != state.settings.timezone_offset_minutes {
+        top_bar::draw(display, gps, state.settings.timezone_offset_minutes)?;
         *previous_gps = Some(gps);
     }
 
@@ -84,12 +80,13 @@ where
         draw_page(display, state)?;
         return Ok(());
     }
+    // Patch only the region that differs; unknown transitions repaint the page.
     match (&previous.screen, &state.screen) {
         (Screen::MainMenu { selected: old }, Screen::MainMenu { selected }) => {
-            menu::update_main_selection(display, *old, *selected)
+            screens::menu::update_main_selection(display, *old, *selected)
         }
         (Screen::Settings { selected: old }, Screen::Settings { selected }) => {
-            menu::update_settings_selection(display, *old, *selected)
+            screens::menu::update_settings_selection(display, *old, *selected)
         }
         (Screen::ContactsList { selected: old }, Screen::ContactsList { selected })
             if previous.contacts == state.contacts =>
@@ -108,13 +105,12 @@ where
         (Screen::ChatsList { selected: old }, Screen::ChatsList { selected })
             if previous.contacts == state.contacts && previous.messages == state.messages =>
         {
-            menu::update_chat_selection(display, &state.contacts, *old, *selected)
+            screens::menu::update_chat_selection(display, &state.contacts, *old, *selected)
         }
         (
             Screen::ChatView {
                 conversation: old_conversation,
                 unencrypted_dm: old_unencrypted,
-                input: old_input,
                 pending_hex: old_pending_hex,
                 menu_open: old_menu_open,
                 selected_message: old_selected_message,
@@ -123,7 +119,6 @@ where
             Screen::ChatView {
                 conversation,
                 unencrypted_dm,
-                input,
                 pending_hex,
                 menu_open,
                 selected_message,
@@ -131,7 +126,7 @@ where
             },
         ) => {
             if previous.messages != state.messages || old_selected_message != selected_message {
-                chat::draw_message_panel(
+                screens::chat::draw_message_panel(
                     display,
                     *conversation,
                     &state.messages,
@@ -139,16 +134,16 @@ where
                 )?;
             }
             if old_conversation != conversation || old_unencrypted != unencrypted_dm {
-                chat::draw_header(display, *conversation, *unencrypted_dm)?;
+                screens::chat::draw_header(display, *conversation, *unencrypted_dm)?;
             }
-            if old_input != input || old_pending_hex != pending_hex {
-                chat::draw_input(display, input.as_str(), *pending_hex)?;
+            if previous.chat_input != state.chat_input || old_pending_hex != pending_hex {
+                screens::chat::draw_input(display, state.chat_input.as_str(), *pending_hex)?;
             }
             if old_menu_open != menu_open {
                 if *menu_open {
-                    chat::draw_context_menu(display)?;
+                    screens::chat::draw_context_menu(display)?;
                 } else {
-                    chat::clear_context_menu(display)?;
+                    screens::chat::clear_context_menu(display)?;
                 }
             }
             Ok(())
@@ -176,7 +171,7 @@ where
 {
     draw_screen(display, state)?;
     if state.help_open {
-        help::draw(display)?;
+        screens::help::draw(display)?;
     }
     if let Some(popup) = &state.popup {
         popup::draw(display, popup)?;
@@ -189,8 +184,10 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     match &state.screen {
-        Screen::MainMenu { selected } => menu::draw_main(display, *selected),
-        Screen::ChatsList { selected } => menu::draw_chat_list(display, &state.contacts, *selected),
+        Screen::MainMenu { selected } => screens::menu::draw_main(display, *selected),
+        Screen::ChatsList { selected } => {
+            screens::menu::draw_chat_list(display, &state.contacts, *selected)
+        }
         Screen::ContactsList { selected } => {
             screens::contacts::draw(display, &state.contacts, *selected)
         }
@@ -259,14 +256,14 @@ where
             target_latitude_microdegrees,
             target_longitude_microdegrees,
             ..
-        } => navigation::draw(
+        } => screens::navigation::draw(
             display,
             state.gps_snapshot,
             state.movement_course_degrees,
             *target_latitude_microdegrees,
             *target_longitude_microdegrees,
         ),
-        Screen::Settings { selected } => menu::draw_settings(display, *selected),
+        Screen::Settings { selected } => screens::menu::draw_settings(display, *selected),
         Screen::SettingsSection { section, selected } => {
             screens::settings::draw(display, *section, *selected)
         }
@@ -277,7 +274,7 @@ where
             state.device_id,
             state.firmware_version,
             state.radio_config,
-            state.timezone_offset_minutes,
+            state.settings.timezone_offset_minutes,
         ),
         Screen::IdentityReset { status } => {
             screens::settings::draw_identity_reset(display, state.device_id, *status)
@@ -285,13 +282,23 @@ where
         Screen::FrequencyChange { selected } => {
             screens::settings::draw_frequency_change(display, *selected)
         }
+        Screen::FrequencyPeers {
+            frequency_hz,
+            cursor,
+            chosen,
+        } => screens::settings::draw_frequency_peers(
+            display,
+            &state.contacts,
+            *frequency_hz,
+            *cursor,
+            *chosen,
+        ),
         Screen::FrequencyStatus { status } => {
             screens::settings::draw_frequency_status(display, *status)
         }
         Screen::ChatView {
             conversation,
             unencrypted_dm,
-            input,
             pending_hex,
             menu_open,
             selected_message,
@@ -303,11 +310,11 @@ where
                     *unencrypted_dm || state.contacts.direct_key(device_id).is_some()
                 }
             };
-            chat::draw(
+            screens::chat::draw(
                 display,
                 *conversation,
                 &state.messages,
-                input.as_str(),
+                state.chat_input.as_str(),
                 *pending_hex,
                 *menu_open,
                 *unencrypted_dm,

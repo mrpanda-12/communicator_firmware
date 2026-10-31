@@ -49,6 +49,7 @@ pub fn derive_pair_key(password: &[u8], my_id: &[u8; 16], peer_id: &[u8; 16]) ->
     salt[DOMAIN.len()..DOMAIN.len() + 16].copy_from_slice(&ids[0]);
     salt[DOMAIN.len() + 16..].copy_from_slice(&ids[1]);
 
+    // Stretch the shared password so a short secret stays expensive to guess.
     let mut key = [0; KEY_SIZE];
     pbkdf2_hmac::<Sha256>(password, &salt, PAIR_KDF_ROUNDS, &mut key);
     key
@@ -57,6 +58,7 @@ pub fn derive_pair_key(password: &[u8], my_id: &[u8; 16], peer_id: &[u8; 16]) ->
 pub fn encrypt(key: &[u8; KEY_SIZE], data: &[u8], aad: &[u8]) -> Result<Sealed, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::InvalidKey)?;
 
+    // Draw a fresh random nonce for every packet; AES-GCM must never reuse one.
     let mut nonce = [0; NONCE_SIZE];
     Rng::new().read(&mut nonce);
 
@@ -107,6 +109,7 @@ pub fn encrypt_packet_payload(
         ciphertext,
         tag,
     } = encrypt(key, plaintext, &aad)?;
+    // Lay out nonce | ciphertext | tag, the order decrypt_packet_payload expects.
     packet.payload.clear();
     packet
         .payload

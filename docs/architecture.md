@@ -91,7 +91,7 @@ Received messages use `notify::message_received`: one bounded popup is queued an
 | `network/` | Discovery list, pairing coordinator, receive and relay path. |
 | `storage/` | Message/conversation model, contact model, key namespaces, shared flash session. |
 | `notify/` | Bounded popup channel and chat-history revision signal. |
-| `ui/state.rs` | Screens, input behavior, commands, history-page selection, display-ready rows. |
+| `ui/states/` | Screens, input behavior, commands, history-page selection, display-ready rows. |
 | `ui/render/` | TFT drawing by page and widget. |
 | `calendar.rs`, `hex.rs` | Shared civil-date conversion and device-ID formatting. |
 | `tests/` | Test crate that re-includes the modules above via `#[path]`. |
@@ -102,7 +102,7 @@ Received messages use `notify::message_received`: one bounded popup is queued an
 - Radio IDs and receiver duplicate/reassembly caches are finite and volatile. The wire ID widths cannot promise permanent uniqueness.
 - Storage is serialised because the map and scratch buffer are shared. Each sent/received chat message is persisted once per logical message; ACK status updates the sent record separately.
 - The outbox retransmits a whole direct message; there is no per-fragment resend. If a fragment is lost, the receiver does not deliver the incomplete message, so the sender's retry sends the complete set again.
-- `DeviceAnnounceResponse` is user-facing only as the ASK TO ADD request: plaintext, empty payload, nothing stored on receipt. `Heading` and `FrequencyChange` exist in the packet enum but have no sender or handler, and local frequency selection does not coordinate peers.
+- `DeviceAnnounceResponse` is user-facing only as the ASK TO ADD request: plaintext, empty payload, nothing stored on receipt. `FrequencyChange` is a direct, plaintext request carrying a four-byte frequency: the sender asks each selected contact from Settings, and the recipient accepts or declines in a popup. `Heading` still has no sender or handler.
 - Discovery IDs and unpaired plaintext introductions are unauthenticated. Contact pair keys are stored as serialized key bytes, not encrypted at rest.
 - Automated tests are in `tests/` (`cd tests && cargo test`) and cover the packet, storage, radio-type, calendar, contact, notification, and outbox modules.
 

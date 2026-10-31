@@ -215,6 +215,7 @@ impl Defragmenter {
         let entry_index = match self.cache.iter().position(|entry| entry.key == key) {
             Some(index) => index,
             None => {
+                // Evict the oldest reassembly so a stalled message cannot block new ones.
                 if self.cache.is_full() {
                     self.cache.remove(0);
                 }
@@ -235,6 +236,7 @@ impl Defragmenter {
             }
         };
 
+        // Reject a fragment whose metadata disagrees with the first one seen.
         let consistent = {
             let entry = &self.cache[entry_index];
             entry.total == packet.fragment_count
@@ -247,6 +249,7 @@ impl Defragmenter {
             return Err(PacketError::InvalidFragmentMetadata);
         }
 
+        // Rebuild rather than mix bytes when a fragment slot is reused.
         let duplicate = self.cache[entry_index].fragments[index].as_ref();
         if let Some(existing) = duplicate {
             if existing.packet_id == packet.packet_id && existing.fingerprint == fingerprint {
@@ -283,6 +286,7 @@ impl Defragmenter {
             let mut payload = Vec::new();
             let mut accepted_fragments = Vec::new();
             let first_packet = entry.first_packet;
+            // Stitch in fragment order; arrivals may have been out of order.
             for i in 0..entry.total {
                 let Some(fragment) = entry.fragments[i as usize].as_ref() else {
                     return Err(PacketError::InvalidFragmentMetadata);

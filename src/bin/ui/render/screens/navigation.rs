@@ -10,10 +10,10 @@ use heapless::String;
 
 use crate::ui::{
     GpsSnapshot,
-    navigation::{compass_direction, distance_and_bearing, relative_turn_degrees},
+    states::navigation::{compass_direction, distance_and_bearing, relative_turn_degrees},
 };
 
-use super::style::{ACK_GREEN, MUTED, WHITE, text, write_coordinate};
+use crate::ui::render::style::{ACK_GREEN, MUTED, WHITE, text, write_coordinate};
 
 /// Draw distance and movement-relative guidance to the selected remote coordinate.
 pub fn draw<D>(

@@ -147,6 +147,11 @@ impl PacketHandler {
                 Self::accept_contact_request(&packet, flash).await;
                 return;
             }
+            // A direct retune request only prompts the user.
+            PacketType::FrequencyChange if !broadcast && here => {
+                Self::accept_frequency_change_request(&packet, flash).await;
+                return;
+            }
             // Relay everything else further down.
             _ => {}
         }
@@ -394,6 +399,33 @@ impl PacketHandler {
         }
         defmt::info!("Heard an add-contact request");
         notify::contact_request(packet.from);
+    }
+
+    /// Show a peer's retune request; the UI asks the user to accept it.
+    async fn accept_frequency_change_request(packet: &PacketData, flash: &Flash) {
+        let Some(frequency_hz) = decode_frequency(packet.payload.as_slice()) else {
+            defmt::warn!("Rejected frequency request: payload is not four bytes");
+            return;
+        };
+        if crate::radio::types::FrequencyBand::for_frequency(frequency_hz).is_none() {
+            defmt::warn!("Rejected frequency request for an unsupported frequency");
+            return;
+        }
+        // A blocked peer's request is dropped like any other traffic of theirs.
+        let looked_up = flash
+            .with(async |session| {
+                session
+                    .storage
+                    .load_contact(&packet.from, &mut session.buffer)
+                    .await
+            })
+            .await;
+        if matches!(looked_up, Ok(Some(contact)) if contact.blocked) {
+            defmt::debug!("Dropped frequency request from a blocked peer");
+            return;
+        }
+        defmt::info!("Heard a frequency change request");
+        notify::frequency_change_request(packet.from, frequency_hz);
     }
 
     /// Advance the pending handshake by one stage, then save the pair key.
@@ -765,17 +797,27 @@ async fn save_message(
         .await;
     if saved {
         // A position row shows its marker; message text is cut to one line.
-        let body = match stored.kind.coordinates() {
+        let coordinates = stored.kind.coordinates();
+        let body = match coordinates {
             Some(_) => "[GPS]",
             None => stored.text.as_str(),
         };
-        notify::message_received(conversation, stored.sender_id, body);
+        let popup_type = match coordinates {
+            Some(_) => notify::PopupType::Gps,
+            None => notify::PopupType::Text,
+        };
+        notify::message_received(conversation, stored.sender_id, body, popup_type);
         SaveResult::Stored
     } else {
         defmt::warn!("Could not save the received message to flash");
         notify::storage_full(conversation);
         SaveResult::Failed
     }
+}
+
+/// Decode the four big-endian bytes of a frequency request.
+fn decode_frequency(payload: &[u8]) -> Option<u32> {
+    payload.try_into().ok().map(u32::from_be_bytes)
 }
 
 /// Decode two big-endian coordinates and reject values outside the WGS84 range.

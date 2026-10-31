@@ -10,11 +10,13 @@ pub fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
     let m = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * m + 2) / 5 + day as i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    // 719_468 shifts the civil era origin to 1970-01-01.
     era * 146_097 + doe - 719_468
 }
 
 /// Inverse of `days_from_civil`: the civil date for days since the epoch.
 pub fn civil_from_days(days: i32) -> (i32, i32, i32) {
+    // Undo the same epoch shift that days_from_civil applies.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

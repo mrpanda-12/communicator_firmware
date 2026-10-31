@@ -5,17 +5,17 @@ use heapless::String;
 
 use crate::{
     radio::types::RadioConfig,
-    ui::state::{
+    ui::states::{
         FREQUENCY_PRESETS, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, SettingsSection,
     },
 };
 
 use super::draw_option;
 use crate::hex::{hex_device_id, write_hex};
-use crate::ui::render::{
-    menu,
-    style::{CYAN, MUTED, WARNING, WHITE, text},
-};
+use crate::ui::contact::ContactBook;
+use crate::ui::render::style::{CYAN, MUTED, WARNING, WHITE, text};
+
+use super::menu;
 
 /// Draw one category's setting rows or the selected row's detail page.
 pub fn draw<D>(display: &mut D, section: SettingsSection, selected: usize) -> Result<(), D::Error>
@@ -248,12 +248,68 @@ where
     )?;
     text(
         display,
-        "UP/DOWN SELECT  ENTER: RETUNE",
+        "UP/DOWN SELECT  ENTER: PICK PEERS",
         8,
         218,
         WHITE,
         false,
     )
+}
+
+/// Let the user tick contacts to ask before this device retunes.
+pub fn draw_frequency_peers<D>(
+    display: &mut D,
+    contacts: &ContactBook,
+    frequency_hz: u32,
+    cursor: usize,
+    chosen: u32,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let label = frequency_label(frequency_hz);
+    let mut title = String::<48>::new();
+    let _ = write!(title, "ASK PEERS: {}", label.as_str());
+    text(display, title.as_str(), 12, 38, CYAN, true)?;
+
+    let indices = contacts.visible_indices(true);
+    if indices.is_empty() {
+        text(display, "NO CONTACTS TO ASK", 12, 92, MUTED, false)?;
+    }
+    // Five rows, scrolled to follow the cursor like the other lists.
+    const VISIBLE: usize = 5;
+    let first = cursor.saturating_sub(VISIBLE - 1);
+    for (row, index) in indices.iter().enumerate().skip(first).take(VISIBLE) {
+        let name = contacts
+            .entry(*index)
+            .map(|entry| entry.list_label())
+            .unwrap_or_default();
+        let mut line = String::<40>::new();
+        let _ = write!(
+            line,
+            "[{}] {}",
+            if chosen & (1 << row) != 0 { "X" } else { " " },
+            name.as_str()
+        );
+        menu::draw_row(display, line.as_str(), row - first, cursor - first)?;
+    }
+    let send_row = indices.len();
+    if send_row < first + VISIBLE {
+        menu::draw_row(display, "SEND REQUESTS", send_row - first, cursor - first)?;
+    }
+    text(display, "ENTER: TOGGLE  SEND: ASK", 8, 218, WHITE, false)
+}
+
+/// Format a frequency the way the screens show it: "869.400 MHZ".
+pub(crate) fn frequency_label(frequency_hz: u32) -> String<24> {
+    let mut label = String::<24>::new();
+    let _ = write!(
+        label,
+        "{}.{:03} MHZ",
+        frequency_hz / 1_000_000,
+        (frequency_hz % 1_000_000) / 1_000
+    );
+    label
 }
 
 /// Show the outcome of one retune request.

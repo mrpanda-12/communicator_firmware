@@ -47,9 +47,11 @@ impl Default for DeviceDiscovery {
 }
 
 fn remember_device(devices: &mut DiscoveryList, device_id: [u8; 16]) {
+    // Re-insert at the tail so the list stays newest-last.
     if let Some(index) = devices.iter().position(|known| *known == device_id) {
         devices.remove(index);
     }
+    // Drop the oldest peer once the list is full.
     if devices.is_full() {
         devices.remove(0);
     }

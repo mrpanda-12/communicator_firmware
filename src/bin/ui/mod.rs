@@ -4,12 +4,11 @@
 //! notifications here, so there is never a second copy of chat history in RAM.
 
 pub mod contact;
-pub mod display_settings;
-pub mod navigation;
 pub mod render;
-pub mod state;
+pub mod states;
 
 use crate::DEVICE_ID;
+use crate::calendar::days_from_civil;
 use crate::crypto;
 use crate::hardware::keypad::KeypadQueue;
 use crate::network::{
@@ -29,20 +28,20 @@ use crate::radio::{
     radio_error::RadioError,
     types::RadioConfig,
 };
-use crate::calendar::days_from_civil;
 use crate::storage::message::{ConversationId, StoredMessage};
 use crate::storage::session::Flash;
 use crate::ui::contact::preview_text;
 use crate::ui::{
     contact::ContactBook,
-    state::{HistoryPageRequest, ManageAction, ManageCommand, OutgoingBody, OutgoingMessage},
+    states::{HistoryPageRequest, ManageAction, ManageCommand, OutgoingBody, OutgoingMessage},
 };
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::rng::Trng;
 use heapless::Vec as HeaplessVec;
-use state::MAX_CHAT_MESSAGES;
-use state::{
+use states::MAX_CHAT_MESSAGES;
+use states::settings::Settings;
+use states::{
     AnnouncementStatus, ChatRow, FrequencyUiStatus, PairingUiStatus, ResetUiStatus, UiState,
 };
 
@@ -60,9 +59,6 @@ fn broadcast_sender_label(contacts: &ContactBook, sender_id: &[u8; 16]) -> heapl
         }
     }
 }
-
-/// List rows that can have a conversation: every contact slot, including the
-/// broadcast entry that always occupies the first one.
 
 /// A scan repeats its announcement at this rate while it is open.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -125,7 +121,6 @@ impl GpsSnapshot {
     }
 }
 
-
 /// React to screen events, chat storage, and received-message notifications.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<'a, D>(
@@ -133,7 +128,7 @@ pub async fn run<'a, D>(
     device_id: Option<[u8; 16]>,
     contacts: ContactBook,
     firmware_version: &'static str,
-    timezone_offset_minutes: i32,
+    settings: Settings,
     pairing: &PairingCoordinator,
     flash: &'a Flash,
     radio_control: &RadioControl,
@@ -175,7 +170,7 @@ where
         firmware_version,
         initial_radio_config,
         DiscoveryList::new(),
-        timezone_offset_minutes,
+        settings,
     );
 
     let mut current_gps = gps.get().await;
@@ -370,6 +365,10 @@ where
             }
         }
 
+        if let Some((frequency_hz, chosen)) = state.take_pending_frequency_requests() {
+            send_frequency_requests(&state, frequency_hz, chosen, flash, radio_queue).await;
+        }
+
         if let Some(frequency_hz) = state.take_pending_frequency() {
             let status = match radio_control.request_frequency_change(frequency_hz) {
                 Ok(()) => {
@@ -388,7 +387,7 @@ where
         if let Some(offset) = state.take_pending_timezone() {
             let saved = flash
                 .with(async |session| {
-                    crate::ui::display_settings::save_timezone_offset(
+                    crate::ui::states::settings::Settings::save_timezone_offset(
                         &mut session.storage,
                         offset,
                         &mut session.buffer,
@@ -422,7 +421,9 @@ where
                 .map(|entry| entry.conversation)
                 .collect::<alloc::vec::Vec<_>>();
             for conversation in conversations {
-                state.contacts.seed_preview(conversation, "", false, false, 0);
+                state
+                    .contacts
+                    .seed_preview(conversation, "", false, false, 0);
             }
             defmt::info!("Deleted all chat history");
         }
@@ -482,9 +483,15 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
 
     let packet_type = match outgoing.body {
         OutgoingBody::Coords { .. } => PacketType::Coordinates,
-        OutgoingBody::Text(_) => PacketType::Text,
+        OutgoingBody::Text => PacketType::Text,
     };
-    let payload = outgoing.payload();
+    // A text send reads the composer buffer; coordinates never carry it.
+    let text = if outgoing.is_text() {
+        state.chat_input.as_str()
+    } else {
+        ""
+    };
+    let payload = outgoing.payload(text);
     let fragment_count = match Fragmenter::fragment_count_with_limit(
         encrypted,
         payload.len(),
@@ -531,7 +538,7 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
         true,
         timestamp,
         outgoing.message_type(),
-        outgoing.text(),
+        text,
         packet_id,
         message_id,
         device_id,
@@ -548,7 +555,7 @@ async fn send_message(state: &mut UiState, flash: &Flash, outgoing: OutgoingMess
         .await;
     if saved {
         notify::history_changed();
-        let preview = preview_text(outgoing.text(), outgoing.coordinates());
+        let preview = preview_text(text, outgoing.coordinates());
         state
             .contacts
             .seed_preview(conversation, preview.as_str(), true, false, timestamp);
@@ -681,6 +688,64 @@ async fn send_contact_request(
     }
 }
 
+/// Ask every ticked contact to retune; each peer gets its own packet.
+async fn send_frequency_requests(
+    state: &UiState,
+    frequency_hz: u32,
+    chosen: u32,
+    flash: &Flash,
+    radio_queue: &RadioQueue,
+) {
+    let Some(device_id) = state.device_id else {
+        defmt::warn!("Could not send frequency requests: device identity unavailable");
+        return;
+    };
+    let payload = frequency_hz.to_be_bytes();
+    for (row, index) in state.contacts.visible_indices(true).iter().enumerate() {
+        if chosen & (1 << row) == 0 {
+            continue;
+        }
+        let Some(peer_id) =
+            state
+                .contacts
+                .entry(*index)
+                .and_then(|entry| match entry.conversation {
+                    ConversationId::Direct(device_id) => Some(device_id),
+                    ConversationId::Broadcast => None,
+                })
+        else {
+            continue;
+        };
+        let packet_id = flash.reserve_packet_ids(1).await;
+        let packet = match PacketData::new(
+            packet_id,
+            packet_id,
+            0,
+            1,
+            device_id,
+            peer_id,
+            false,
+            PacketType::FrequencyChange,
+            &payload,
+            DEFAULT_HOP_LIMIT,
+            DEFAULT_HOP_LIMIT,
+        ) {
+            Ok(packet) => packet,
+            Err(_) => {
+                defmt::warn!("Could not build a frequency request");
+                continue;
+            }
+        };
+        match radio_queue.add_packet(&packet) {
+            Ok(()) => defmt::info!("Asked a peer to retune to {} Hz", frequency_hz),
+            Err(QueueError::Full) => {
+                defmt::warn!("Could not ask peer to retune: TX queue is full")
+            }
+            Err(_) => defmt::warn!("Could not ask peer to retune"),
+        }
+    }
+}
+
 /// Process one new-message toast: reveal unknown senders in the lists,
 /// refresh the row preview, and show the toast unless the peer is blocked.
 async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Popup) {
@@ -689,8 +754,11 @@ async fn handle_popup(state: &mut UiState, flash: &Flash, mut popup: notify::Pop
         state.show_popup(popup);
         return;
     }
-    // An add request names the peer and stores nothing.
-    if popup.popup_type == notify::PopupType::ContactRequest {
+    // Add and retune requests name the peer and store nothing.
+    if matches!(
+        popup.popup_type,
+        notify::PopupType::ContactRequest | notify::PopupType::FrequencyChangeRequest { .. }
+    ) {
         popup.name = match state
             .contacts
             .entry_by_conversation(ConversationId::Direct(popup.sender_id))
@@ -825,8 +893,7 @@ async fn load_conversation_page(state: &mut UiState, flash: &Flash, request: His
     if request.start.is_none()
         && let Some(newest) = records.last()
     {
-        let preview =
-            preview_text(newest.text.as_str(), newest.kind.coordinates());
+        let preview = preview_text(newest.text.as_str(), newest.kind.coordinates());
         state.contacts.seed_preview(
             request.conversation,
             preview.as_str(),
@@ -872,7 +939,8 @@ async fn seed_preview_conversation(
 
 /// Fill every visible chat-list preview from flash at boot.
 async fn seed_previews(state: &mut UiState, flash: &Flash) {
-    let mut conversations: heapless::Vec<ConversationId, { contact::MAX_CONTACTS }> = heapless::Vec::new();
+    let mut conversations: heapless::Vec<ConversationId, { contact::MAX_CONTACTS }> =
+        heapless::Vec::new();
     for index in state.contacts.visible_indices(false).iter() {
         if let Some(entry) = state.contacts.entry(*index)
             && conversations.push(entry.conversation).is_err()

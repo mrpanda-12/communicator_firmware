@@ -200,6 +200,7 @@ fn build_pairing_packet(
     )
     .ok()?;
 
+    // Pairing frames carry no plaintext; the tag authenticates the AAD alone.
     let (aad, aad_len) = pairing_aad(&packet, stage, request_nonce, response_nonce);
     let crypto::Sealed {
         nonce,

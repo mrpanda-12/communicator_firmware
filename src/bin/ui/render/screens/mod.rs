@@ -1,17 +1,26 @@
-//! One module per screen: contacts, announce, devices, add, settings.
+//! Every screen: lists, chat, menu, help, navigation, settings, and the
+//! shared screen types.
 
 pub mod add_contact;
 pub mod announce;
+pub mod chat;
 pub mod contacts;
 pub mod devices;
+pub mod help;
+pub mod menu;
+pub mod navigation;
 pub mod settings;
+/// Screen identifiers, their labels, and the values a screen submits.
+pub mod types;
+
+pub use types::*;
 
 use embedded_graphics::{pixelcolor::Rgb565, prelude::DrawTarget};
 
-use crate::network::types::DiscoveryList;
 use crate::hex::hex_device_id;
-use crate::ui::render::menu::draw_row;
+use crate::network::types::DiscoveryList;
 use crate::ui::render::style::{CYAN, MUTED, WHITE, text};
+use menu::draw_row;
 
 /// Rows a device list shows at once; the list scrolls to the selection.
 const VISIBLE_DEVICES: usize = 5;

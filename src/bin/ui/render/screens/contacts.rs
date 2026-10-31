@@ -3,8 +3,8 @@
 use embedded_graphics::{pixelcolor::Rgb565, prelude::DrawTarget};
 use heapless::String;
 
+use super::menu::draw_row;
 use crate::ui::contact::ContactBook;
-use crate::ui::render::menu::draw_row;
 use crate::ui::render::style::{CYAN, MUTED, WHITE, text};
 
 use super::draw_option;

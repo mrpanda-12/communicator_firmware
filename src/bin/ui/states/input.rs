@@ -1,420 +1,25 @@
-use heapless::{String, Vec};
+//! Logical key handling: what every key does on every screen.
 
-use crate::{
-    crypto::{self, KEY_SIZE},
-    hardware::keypad::KeypadKey,
-    network::types::{DiscoveryList, PairingEvent},
-    radio::types::RadioConfig,
-    storage::contact::Contact,
-    storage::message::{ConversationId, MessageType},
+use heapless::String;
+
+use crate::crypto;
+use crate::storage::message::ConversationId;
+
+use crate::ui::states::settings::TIMEZONE_STEP;
+
+use super::{
+    DeviceOrigin, FREQUENCY_PRESETS, FrequencyUiStatus, HistoryPageRequest, Key, MAX_CHAT_MESSAGES,
+    ManageAction, ManageCommand, OutgoingBody, OutgoingMessage, PairingCommand, PairingUiStatus,
+    RenameCommand, ResetUiStatus, Screen, SettingsSection, UiState, device_list,
 };
-
-use super::contact::{ContactBook, PREVIEW_CHARS};
-
-/// Chat rows the message panel draws at once.
-pub const MAX_CHAT_MESSAGES: usize = 4;
-/// Characters of one message shown in a chat panel row.
-pub const ROW_TEXT_CHARS: usize = 28;
-/// Text bytes one message can carry, matching the protocol limit.
-pub const MAX_TEXT_BYTES: usize = crate::packet::packet_data::MAX_LOGICAL_MESSAGE_SIZE;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SettingsSection {
-    Device,
-    Frequency,
-    Gps,
-}
-
-impl SettingsSection {
-    pub const fn from_index(index: usize) -> Self {
-        match index {
-            0 => Self::Device,
-            1 => Self::Frequency,
-            _ => Self::Gps,
-        }
-    }
-
-    pub const fn root_index(self) -> usize {
-        match self {
-            Self::Device => 0,
-            Self::Frequency => 1,
-            _ => 2,
-        }
-    }
-
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::Device => "DEVICE SETTINGS",
-            Self::Frequency => "FREQUENCY SETTINGS",
-            Self::Gps => "GPS SETTINGS",
-        }
-    }
-
-    pub const fn item_count(self) -> usize {
-        match self {
-            Self::Device => 3,
-            Self::Frequency => 2,
-            Self::Gps => 4,
-        }
-    }
-
-    pub const fn item_label(self, index: usize) -> &'static str {
-        match (self, index) {
-            (Self::Device, 0) => "DEVICE INFO",
-            (Self::Device, 1) => "PACKET IDS",
-            (Self::Device, _) => "RESET IDENTITY",
-            (Self::Frequency, 0) => "CURRENT FREQUENCY",
-            (Self::Frequency, _) => "CHANGE FREQUENCY",
-            (Self::Gps, 0) => "FIX STATUS",
-            (Self::Gps, 1) => "COORDINATES",
-            (Self::Gps, 2) => "UTC TIME",
-            (Self::Gps, _) => "UTC OFFSET",
-        }
-    }
-
-    pub const fn item_description(self, index: usize) -> &'static str {
-        match (self, index) {
-            (Self::Device, 0) => "Device identity and firmware version.",
-            (Self::Device, 1) => "Last packet and message ID, and space left.",
-            (Self::Device, _) => "ENTER regenerates the identity in flash.",
-            (Self::Frequency, 0) => "Shows configured frequency and transmit power.",
-            (Self::Frequency, _) => "Pick a preset; every peer must retune too.",
-            (Self::Gps, 0) => "Current fix status is also shown in the top bar.",
-            (Self::Gps, 1) => "Coordinates appear here when the receiver has a fix.",
-            (Self::Gps, 2) => "The top bar shows GPS time in UTC.",
-            (Self::Gps, _) => "Adjust the top-bar local clock next to UTC.",
-        }
-    }
-
-    /// Index of the UTC offset item inside the GPS section.
-    pub fn is_timezone_item(self, item: usize) -> bool {
-        matches!(self, Self::Gps) && item == 3
-    }
-}
-
-/// One action the contact-manage screen can submit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ManageAction {
-    Delete,
-    Block(bool),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Screen {
-    MainMenu {
-        selected: usize,
-    },
-    ChatsList {
-        selected: usize,
-    },
-    ContactsList {
-        selected: usize,
-    },
-    /// Delete / block actions for one contact, reachable from both lists.
-    ContactManage {
-        device_id: [u8; 16],
-        selected: usize,
-        from_chats: bool,
-    },
-    /// Active scan: announces every two seconds and lists the replies.
-    AnnounceDevices {
-        selected: usize,
-    },
-    /// One list of peers heard on the air: active, then passively heard.
-    Devices {
-        selected: usize,
-    },
-    DiscoveredDevice {
-        device_id: [u8; 16],
-        selected: usize,
-        origin: DeviceOrigin,
-    },
-    UnencryptedDmWarning {
-        device_id: [u8; 16],
-        from_discovery: bool,
-    },
-    /// One-line contact name, typed as hex pairs on the keypad.
-    NameEntry {
-        device_id: [u8; 16],
-        name: String<32>,
-        cursor: usize,
-        /// High nibble of a keystroke waiting for its second hex digit.
-        pending_hex: Option<u8>,
-        /// The add flow continues to the password step; otherwise it saves.
-        add_flow: bool,
-        from_chats: bool,
-        origin: DeviceOrigin,
-    },
-    /// Shared-secret password for the pairing handshake.
-    SecretEntry {
-        device_id: [u8; 16],
-        name: String<32>,
-        secret: String<64>,
-        cursor: usize,
-        /// High nibble of a keystroke waiting for its second hex digit.
-        pending_hex: Option<u8>,
-        /// Return to the contact actions instead of the discovery list.
-        from_manage: bool,
-        /// Device list this password step belongs to.
-        origin: DeviceOrigin,
-    },
-    PairingStatus {
-        device_id: [u8; 16],
-        status: PairingUiStatus,
-    },
-    ChatView {
-        conversation: ConversationId,
-        unencrypted_dm: bool,
-        from_discovery: bool,
-        input: String<MAX_TEXT_BYTES>,
-        cursor: usize,
-        /// High nibble of a keystroke waiting for its second hex digit.
-        pending_hex: Option<u8>,
-        menu_open: bool,
-        /// 0 sends the typed text, 1 sends the current GPS position.
-        menu_index: usize,
-        /// Chat row picked for coordinate navigation; `None` while typing or browsing normally.
-        selected_message: Option<usize>,
-        /// Oldest record still retained for this conversation.
-        history_base: u32,
-        /// Absolute record index of the first row in `messages`.
-        history_start: u32,
-        /// Next record ordinal; the exclusive upper bound of the history.
-        history_total: u32,
-    },
-    Navigation {
-        conversation: ConversationId,
-        unencrypted_dm: bool,
-        from_discovery: bool,
-        target_latitude_microdegrees: i32,
-        target_longitude_microdegrees: i32,
-    },
-    Settings {
-        selected: usize,
-    },
-    SettingsSection {
-        section: SettingsSection,
-        selected: usize,
-    },
-    SettingsItem {
-        section: SettingsSection,
-        item: usize,
-    },
-    /// Identity regeneration requested; shows progress and the result.
-    IdentityReset {
-        status: ResetUiStatus,
-    },
-    /// Pick a preset frequency for the radio worker to retune.
-    FrequencyChange {
-        selected: usize,
-    },
-    /// Outcome of one retune request.
-    FrequencyStatus {
-        status: FrequencyUiStatus,
-    },
-}
-
-/// Which device list opened a peer's actions; BACK returns there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceOrigin {
-    Announce,
-    Search,
-    Recent,
-}
-
-/// The list screen one origin returns to, so BACK always has a target.
-pub fn device_list(origin: DeviceOrigin) -> Screen {
-    match origin {
-        DeviceOrigin::Announce => Screen::AnnounceDevices { selected: 0 },
-        DeviceOrigin::Search | DeviceOrigin::Recent => Screen::Devices { selected: 0 },
-    }
-}
-
-/// Frequencies the Change frequency screen offers, in RF order.
-pub const FREQUENCY_PRESETS: [(u32, &str); 2] = [
-    (869_400_000, "869.400 MHZ  SUB-GHZ"),
-    (2_400_000_000, "2400.000 MHZ  2.4 GHZ"),
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResetUiStatus {
-    Working,
-    Done,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrequencyUiStatus {
-    Queued,
-    Busy,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnnouncementStatus {
-    Queued,
-    Failed,
-    NoIdentity,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PairingUiStatus {
-    Starting,
-    Waiting,
-    RequestSent,
-    Paired,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PairingCommand {
-    pub peer_id: [u8; 16],
-    pub key: [u8; KEY_SIZE],
-}
-
-/// A contact name the run loop still has to write to flash.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RenameCommand {
-    pub device_id: [u8; 16],
-    pub name: String<32>,
-}
-
-/// One message the user wants to send from the composer.
-#[derive(Clone, Debug, PartialEq)]
-pub enum OutgoingBody {
-    /// Already-typed composer text.
-    Text(String<MAX_TEXT_BYTES>),
-    /// Coordinates from the latest GPS fix.
-    Coords {
-        latitude_microdegrees: i32,
-        longitude_microdegrees: i32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct OutgoingMessage {
-    pub conversation: ConversationId,
-    pub unencrypted: bool,
-    pub body: OutgoingBody,
-}
-
-impl OutgoingMessage {
-    pub fn message_type(&self) -> MessageType {
-        match &self.body {
-            OutgoingBody::Text(_) => MessageType::Text,
-            OutgoingBody::Coords {
-                latitude_microdegrees,
-                longitude_microdegrees,
-            } => MessageType::Coords {
-                latitude_microdegrees: *latitude_microdegrees,
-                longitude_microdegrees: *longitude_microdegrees,
-            },
-        }
-    }
-
-    /// Optional coordinate payload when this message carries a position.
-    pub fn coordinates(&self) -> Option<(i32, i32)> {
-        match &self.body {
-            OutgoingBody::Text(_) => None,
-            OutgoingBody::Coords {
-                latitude_microdegrees,
-                longitude_microdegrees,
-            } => Some((*latitude_microdegrees, *longitude_microdegrees)),
-        }
-    }
-
-    /// Composer text, or empty for a coordinate message.
-    pub fn text(&self) -> &str {
-        match &self.body {
-            OutgoingBody::Text(text) => text.as_str(),
-            OutgoingBody::Coords { .. } => "",
-        }
-    }
-
-    /// Sender-side packet payload without any packet framing.
-    pub fn payload(&self) -> Vec<u8, MAX_TEXT_BYTES> {
-        let mut payload = Vec::new();
-        match &self.body {
-            OutgoingBody::Text(text) => {
-                let _ = payload.extend_from_slice(text.as_bytes());
-            }
-            OutgoingBody::Coords {
-                latitude_microdegrees,
-                longitude_microdegrees,
-            } => {
-                let _ = payload.extend_from_slice(&latitude_microdegrees.to_be_bytes());
-                let _ = payload.extend_from_slice(&longitude_microdegrees.to_be_bytes());
-            }
-        }
-        payload
-    }
-}
-
-/// Command submitted by the contact-manage screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ManageCommand {
-    pub device_id: [u8; 16],
-    pub action: ManageAction,
-    pub from_chats: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Key {
-    Up,
-    Down,
-    Left,
-    Right,
-    Enter,
-    Back,
-    Character(char),
-    Backspace,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct UiState {
-    pub screen: Screen,
-    pub contacts: ContactBook,
-    pub device_id: Option<[u8; 16]>,
-    pub firmware_version: &'static str,
-    pub radio_config: RadioConfig,
-    pub discovered_devices: DiscoveryList,
-    /// Peers whose own announcement was heard, for the search screen.
-    pub announced_devices: DiscoveryList,
-    /// Peers heard in any other packet, for the passive list.
-    pub passive_devices: DiscoveryList,
-    /// Chat rows of the open conversation: flash-backed, refreshed on change.
-    pub messages: Vec<ChatRow, MAX_CHAT_MESSAGES>,
-    /// Latest received-message toast, drawn over any screen.
-    pub popup: Option<crate::notify::Popup>,
-    pub gps_snapshot: crate::ui::GpsSnapshot,
-    pub movement_course_degrees: Option<u16>,
-    pub timezone_offset_minutes: i32,
-    /// Keypad legend overlay; the full ASCII table is a later addition.
-    pub help_open: bool,
-    course_anchor: Option<(i32, i32)>,
-    pending_message: Option<OutgoingMessage>,
-    pending_manage: Option<ManageCommand>,
-    pending_delete_all: bool,
-    pending_timezone: Option<i32>,
-    pending_announcement: bool,
-    /// Stop the repeating announce scan when the user leaves the list.
-    cancel_scan: bool,
-    /// Peer to send a plaintext add-contact request to.
-    pending_contact_request: Option<[u8; 16]>,
-    pending_pairing: Option<PairingCommand>,
-    /// Contact name submitted but not yet written to flash.
-    pending_rename: Option<RenameCommand>,
-    /// Name to give the contact a running pairing will save.
-    pending_contact_name: String<32>,
-    /// Regenerate the flash identity when the run loop reaches a storage slot.
-    pending_reset_identity: bool,
-    /// Frequency the user picked for the radio worker to retune.
-    pending_frequency: Option<u32>,
-    pending_history_page: Option<HistoryPageRequest>,
-}
 
 /// The screen a chat entry opens: the warning when a direct chat has no key,
 /// the chat view itself otherwise.
-fn open_chat_target(device_has_key: bool, conversation: ConversationId, from_discovery: bool) -> Screen {
+fn open_chat_target(
+    device_has_key: bool,
+    conversation: ConversationId,
+    from_discovery: bool,
+) -> Screen {
     if let ConversationId::Direct(device_id) = conversation
         && !device_has_key
     {
@@ -431,7 +36,6 @@ fn chat_screen(conversation: ConversationId, unencrypted_dm: bool, from_discover
         conversation,
         unencrypted_dm,
         from_discovery,
-        input: String::new(),
         cursor: 0,
         pending_hex: None,
         menu_open: false,
@@ -443,63 +47,19 @@ fn chat_screen(conversation: ConversationId, unencrypted_dm: bool, from_discover
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HistoryPageRequest {
-    pub conversation: ConversationId,
-    /// `None` loads the latest window; `Some` loads from this record ordinal.
-    pub start: Option<u32>,
-    /// Absolute record ordinal to select once the page is loaded.
-    pub select: Option<u32>,
-}
-
 impl UiState {
-    /// Start at the application menu with chats selected and the radio
-    /// clock showing UTC plus the saved offset.
-    pub fn new(
-        device_id: Option<[u8; 16]>,
-        contacts: ContactBook,
-        firmware_version: &'static str,
-        radio_config: RadioConfig,
-        discovered_devices: DiscoveryList,
-        timezone_offset_minutes: i32,
-    ) -> Self {
-        Self {
-            screen: Screen::MainMenu { selected: 0 },
-            contacts,
-            device_id,
-            firmware_version,
-            radio_config,
-            discovered_devices,
-            announced_devices: DiscoveryList::new(),
-            passive_devices: DiscoveryList::new(),
-            timezone_offset_minutes,
-            messages: Vec::new(),
-            popup: None,
-            gps_snapshot: crate::ui::GpsSnapshot::default(),
-            movement_course_degrees: None,
-            help_open: false,
-            course_anchor: None,
-            pending_message: None,
-            pending_manage: None,
-            pending_delete_all: false,
-            pending_timezone: None,
-            pending_announcement: false,
-            cancel_scan: false,
-            pending_contact_request: None,
-            pending_pairing: None,
-            pending_rename: None,
-            pending_contact_name: String::new(),
-            pending_reset_identity: false,
-            pending_frequency: None,
-            pending_history_page: None,
-        }
-    }
-
     /// Apply a logical key event; the input hardware can map buttons to this API.
     pub fn handle_key(&mut self, key: Key) {
-        // One key always hides the toast before it acts on the screen.
-        if self.popup.is_some() {
-            self.popup = None;
+        // ENTER accepts (or acknowledges) a toast; BACK dismisses it.
+        if let Some(popup_type) = self.popup.as_ref().map(|popup| popup.popup_type) {
+            match (popup_type, key) {
+                (crate::notify::PopupType::FrequencyChangeRequest { frequency_hz }, Key::Enter) => {
+                    self.pending_frequency = Some(frequency_hz);
+                    self.dismiss_popup();
+                }
+                (_, Key::Enter | Key::Back) => self.dismiss_popup(),
+                _ => {}
+            }
             return;
         }
         // The help legend owns input until it is dismissed.
@@ -524,7 +84,9 @@ impl UiState {
         // These lookups run before the mutable screen match, because helper
         // methods inside its arms would borrow the whole state.
         let (chats_clear_row, chats_row_conversation) = match &self.screen {
-            Screen::ChatsList { selected } => (self.chat_rows(), self.chat_row_conversation(*selected)),
+            Screen::ChatsList { selected } => {
+                (self.chat_rows(), self.chat_row_conversation(*selected))
+            }
             _ => (0, None),
         };
         let contacts_open_conversation: Option<ConversationId> = match &self.screen {
@@ -566,6 +128,7 @@ impl UiState {
                                 }
                                 ConversationId::Broadcast => true,
                             };
+                            self.chat_input.clear();
                             self.screen = open_chat_target(has_key, conversation, false);
                         }
                     }
@@ -624,6 +187,7 @@ impl UiState {
                                 }
                                 ConversationId::Broadcast => true,
                             };
+                            self.chat_input.clear();
                             self.screen = open_chat_target(has_key, conversation, false);
                         }
                     }
@@ -796,6 +360,7 @@ impl UiState {
                 }
                 Key::Back => self.screen = Screen::ChatsList { selected: 0 },
                 Key::Enter => {
+                    self.chat_input.clear();
                     self.screen =
                         chat_screen(ConversationId::Direct(*device_id), true, *from_discovery);
                 }
@@ -946,7 +511,6 @@ impl UiState {
                 conversation,
                 unencrypted_dm,
                 from_discovery,
-                input,
                 cursor,
                 menu_open,
                 menu_index,
@@ -970,11 +534,11 @@ impl UiState {
                     }
                     Key::Back => self.screen = Screen::ChatsList { selected: 0 },
                     Key::Left => *cursor = cursor.saturating_sub(1),
-                    Key::Right => *cursor = (*cursor + 1).min(input.len()),
+                    Key::Right => *cursor = (*cursor + 1).min(self.chat_input.len()),
                     Key::Up if *menu_open => *menu_index = menu_index.saturating_sub(1),
                     Key::Down if *menu_open => *menu_index = (*menu_index + 1) % 2,
                     // Browse and page through flash history only while not typing.
-                    Key::Up if input.is_empty() && !*menu_open && rows > 0 => {
+                    Key::Up if self.chat_input.is_empty() && !*menu_open && rows > 0 => {
                         match *selected_message {
                             None => *selected_message = Some(rows - 1),
                             Some(picked) if picked > 0 => *selected_message = Some(picked - 1),
@@ -990,7 +554,7 @@ impl UiState {
                             _ => {}
                         }
                     }
-                    Key::Down if input.is_empty() && !*menu_open && rows > 0 => {
+                    Key::Down if self.chat_input.is_empty() && !*menu_open && rows > 0 => {
                         match *selected_message {
                             None => *selected_message = Some(0),
                             Some(picked) if picked + 1 < rows => {
@@ -1010,15 +574,15 @@ impl UiState {
                         }
                     }
                     Key::Enter if *menu_open && can_send => {
-                        let body = match *menu_index {
-                            1 if self.gps_snapshot.fix => Some(OutgoingBody::Coords {
+                        let body = if *menu_index == 1 && self.gps_snapshot.fix {
+                            Some(OutgoingBody::Coords {
                                 latitude_microdegrees: self.gps_snapshot.latitude_microdegrees,
                                 longitude_microdegrees: self.gps_snapshot.longitude_microdegrees,
-                            }),
-                            _ => match input.is_empty() {
-                                true => None,
-                                false => Some(OutgoingBody::Text(input.clone())),
-                            },
+                            })
+                        } else if self.chat_input.is_empty() {
+                            None
+                        } else {
+                            Some(OutgoingBody::Text)
                         };
                         if let Some(body) = body {
                             self.pending_message = Some(OutgoingMessage {
@@ -1035,12 +599,14 @@ impl UiState {
                     Key::Enter if can_send => *menu_open = true,
                     Key::Enter => {}
                     Key::Backspace if *cursor > 0 => {
-                        input.remove(*cursor - 1);
+                        self.chat_input.remove(*cursor - 1);
                         *cursor -= 1;
                     }
                     Key::Character(ch) if ch.is_ascii() && !ch.is_control() => {
-                        if input.push(ch).is_ok() {
-                            *cursor = input.len();
+                        // A full composer drops the character; the cursor stays put.
+                        let accepted = self.chat_input.push(ch).is_ok();
+                        if accepted {
+                            *cursor = self.chat_input.len();
                         }
                     }
                     _ => {}
@@ -1056,6 +622,7 @@ impl UiState {
                     let conversation = *conversation;
                     let unencrypted_dm = *unencrypted_dm;
                     let from_discovery = *from_discovery;
+                    self.chat_input.clear();
                     self.screen = chat_screen(conversation, unencrypted_dm, from_discovery);
                 }
             }
@@ -1106,10 +673,10 @@ impl UiState {
                     self.screen = Screen::FrequencyChange { selected: 0 };
                 }
                 Key::Right | Key::Up if section.is_timezone_item(*item) => {
-                    self.adjust_timezone_offset(crate::ui::display_settings::TIMEZONE_STEP)
+                    self.adjust_timezone_offset(TIMEZONE_STEP)
                 }
                 Key::Left | Key::Down if section.is_timezone_item(*item) => {
-                    self.adjust_timezone_offset(-crate::ui::display_settings::TIMEZONE_STEP)
+                    self.adjust_timezone_offset(-TIMEZONE_STEP)
                 }
                 _ => {}
             },
@@ -1133,13 +700,44 @@ impl UiState {
                 }
                 Key::Down => *selected = (*selected + 1) % FREQUENCY_PRESETS.len(),
                 Key::Enter => {
-                    self.pending_frequency = Some(FREQUENCY_PRESETS[*selected].0);
-                    self.screen = Screen::FrequencyStatus {
-                        status: FrequencyUiStatus::Queued,
+                    self.screen = Screen::FrequencyPeers {
+                        frequency_hz: FREQUENCY_PRESETS[*selected].0,
+                        cursor: 0,
+                        chosen: 0,
                     };
                 }
                 _ => {}
             },
+            Screen::FrequencyPeers {
+                frequency_hz,
+                cursor,
+                chosen,
+            } => {
+                let peers = self.contacts.visible_indices(true).len();
+                let row_count = peers + 1;
+                let frequency_hz = *frequency_hz;
+                match key {
+                    Key::Back => {
+                        let selected = FREQUENCY_PRESETS
+                            .iter()
+                            .position(|(hz, _)| *hz == frequency_hz)
+                            .unwrap_or(0);
+                        self.screen = Screen::FrequencyChange { selected };
+                    }
+                    Key::Up => *cursor = (*cursor + row_count - 1) % row_count,
+                    Key::Down => *cursor = (*cursor + 1) % row_count,
+                    // The last row asks every ticked contact, then retunes here.
+                    Key::Enter if *cursor == peers => {
+                        self.pending_frequency_requests = Some((frequency_hz, *chosen));
+                        self.pending_frequency = Some(frequency_hz);
+                        self.screen = Screen::FrequencyStatus {
+                            status: FrequencyUiStatus::Queued,
+                        };
+                    }
+                    Key::Enter => *chosen ^= 1 << *cursor,
+                    _ => {}
+                }
+            }
             Screen::FrequencyStatus { .. } => {
                 if key == Key::Back || key == Key::Enter {
                     self.screen = Screen::SettingsItem {
@@ -1151,191 +749,6 @@ impl UiState {
         }
     }
 
-    /// Nudge the UTC offset by one step and queue the new value for flash.
-    fn adjust_timezone_offset(&mut self, delta_minutes: i32) {
-        let next = (self.timezone_offset_minutes + delta_minutes).clamp(
-            crate::ui::display_settings::MIN_TIMEZONE_OFFSET,
-            crate::ui::display_settings::MAX_TIMEZONE_OFFSET,
-        );
-        if next != self.timezone_offset_minutes {
-            self.timezone_offset_minutes = next;
-            self.pending_timezone = Some(next);
-        }
-    }
-
-    /// The UTC offset whose new value the run loop still has to persist.
-    pub fn take_pending_timezone(&mut self) -> Option<i32> {
-        self.pending_timezone.take()
-    }
-
-    /// Remember a peer the book has never seen so it appears in the list.
-    /// Direct conversations only; broadcast is always present.
-    pub fn note_unknown_sender(&mut self, conversation: ConversationId) {
-        if let ConversationId::Direct(device_id) = conversation {
-            self.contacts.note_unknown(device_id);
-        }
-    }
-
-    /// Whether the open chat targets a contact with a pair key.
-    fn active_chat_is_encrypted(&self) -> bool {
-        match &self.screen {
-            Screen::ChatView {
-                conversation: ConversationId::Direct(device_id),
-                ..
-            } => self.contacts.direct_key(device_id).is_some(),
-            _ => false,
-        }
-    }
-
-    /// Number of CHATS rows: every visible contact plus the clear-all row.
-    fn chat_rows(&self) -> usize {
-        self.contacts.chat_indices().len() + 1
-    }
-
-    /// Conversation of one CHATS row, or `None` for the clear-all row.
-    fn chat_row_conversation(&self, row: usize) -> Option<ConversationId> {
-        self.contacts
-            .chat_indices()
-            .get(row)
-            .and_then(|index| self.contacts.entry(*index))
-            .map(|entry| entry.conversation)
-    }
-
-    /// Apply one 5x5 keypad key. Two hex digits type one ASCII character, so
-    /// a lone digit stays pending until its pair arrives or BACK clears it.
-    pub fn handle_keypad(&mut self, key: KeypadKey) {
-        if key == KeypadKey::Help {
-            self.help_open = !self.help_open;
-            return;
-        }
-        // Any other keypad key hides the toast first, like the logical keys.
-        if self.popup.is_some() {
-            self.popup = None;
-            return;
-        }
-        if self.help_open {
-            if matches!(key, KeypadKey::Back | KeypadKey::Enter) {
-                self.help_open = false;
-            }
-            return;
-        }
-        match key {
-            KeypadKey::Digit(digit) => match &mut self.screen {
-                Screen::ChatView {
-                    pending_hex,
-                    input,
-                    cursor,
-                    ..
-                } => Self::type_hex_digit(pending_hex, input, cursor, digit),
-                Screen::NameEntry {
-                    pending_hex,
-                    name,
-                    cursor,
-                    ..
-                } => Self::type_hex_digit(pending_hex, name, cursor, digit),
-                Screen::SecretEntry {
-                    pending_hex,
-                    secret,
-                    cursor,
-                    ..
-                } => Self::type_hex_digit(pending_hex, secret, cursor, digit),
-                _ => {}
-            },
-            KeypadKey::Back => self.handle_keypad_back(),
-            KeypadKey::Send | KeypadKey::Enter => self.handle_key(Key::Enter),
-            KeypadKey::Up => self.handle_key(Key::Up),
-            KeypadKey::Down => self.handle_key(Key::Down),
-            KeypadKey::Left => self.handle_key(Key::Left),
-            KeypadKey::Right => self.handle_key(Key::Right),
-            // Handled above, before the overlay gate.
-            KeypadKey::Help | KeypadKey::Unassigned => {}
-        }
-    }
-
-    /// Commit a hex pair to the focused field and leave a lone digit pending.
-    fn type_hex_digit<const N: usize>(
-        pending_hex: &mut Option<u8>,
-        text: &mut String<N>,
-        cursor: &mut usize,
-        digit: u8,
-    ) {
-        let digit = digit & 0x0F;
-        match pending_hex.take() {
-            None => *pending_hex = Some(digit),
-            Some(high) => {
-                let character = char::from((high << 4) | digit);
-                if character.is_ascii() && !character.is_control() && text.push(character).is_ok() {
-                    *cursor = text.len();
-                }
-            }
-        }
-    }
-
-    /// BACK clears a pending nibble, then deletes, and only then leaves the screen.
-    fn handle_keypad_back(&mut self) {
-        let position = match &self.screen {
-            Screen::ChatView {
-                pending_hex,
-                cursor,
-                ..
-            } => (pending_hex.is_some(), *cursor),
-            Screen::NameEntry {
-                pending_hex,
-                cursor,
-                ..
-            } => (pending_hex.is_some(), *cursor),
-            Screen::SecretEntry {
-                pending_hex,
-                cursor,
-                ..
-            } => (pending_hex.is_some(), *cursor),
-            _ => {
-                self.handle_key(Key::Back);
-                return;
-            }
-        };
-        let (pending_hex, cursor) = position;
-        if pending_hex {
-            match &mut self.screen {
-                Screen::ChatView { pending_hex, .. }
-                | Screen::NameEntry { pending_hex, .. }
-                | Screen::SecretEntry { pending_hex, .. } => *pending_hex = None,
-                _ => {}
-            }
-        } else if cursor > 0 {
-            self.handle_key(Key::Backspace);
-        } else {
-            self.handle_key(Key::Back);
-        }
-    }
-
-    /// Keep the latest fix and estimate course after at least five metres of movement.
-    pub fn update_gps_snapshot(&mut self, snapshot: crate::ui::GpsSnapshot) {
-        self.gps_snapshot = snapshot;
-        if !snapshot.fix {
-            self.course_anchor = None;
-            self.movement_course_degrees = None;
-            return;
-        }
-
-        let current = (
-            snapshot.latitude_microdegrees,
-            snapshot.longitude_microdegrees,
-        );
-        let Some(anchor) = self.course_anchor else {
-            self.course_anchor = Some(current);
-            return;
-        };
-        // Estimate course only after the user has moved far enough to reduce GPS drift.
-        if let Some((distance, bearing)) =
-            crate::ui::navigation::distance_and_bearing(anchor, current)
-            && distance >= 5.0
-        {
-            self.movement_course_degrees = Some(bearing);
-            self.course_anchor = Some(current);
-        }
-    }
-
     /// ENTER opens the picked coordinate row's navigation screen; `false` when
     /// nothing is picked or the row carries no position.
     fn open_selected_coordinate(&mut self) -> bool {
@@ -1344,11 +757,10 @@ impl UiState {
                 conversation,
                 unencrypted_dm,
                 from_discovery,
-                input,
                 menu_open,
                 selected_message,
                 ..
-            } if input.is_empty() && !*menu_open => (
+            } if self.chat_input.is_empty() && !*menu_open => (
                 *conversation,
                 *unencrypted_dm,
                 *from_discovery,
@@ -1375,235 +787,5 @@ impl UiState {
             target_longitude_microdegrees,
         };
         true
-    }
-
-    pub fn take_pending_message(&mut self) -> Option<OutgoingMessage> {
-        self.pending_message.take()
-    }
-
-    pub fn take_pending_manage(&mut self) -> Option<ManageCommand> {
-        self.pending_manage.take()
-    }
-
-    pub fn take_pending_delete_all(&mut self) -> bool {
-        core::mem::replace(&mut self.pending_delete_all, false)
-    }
-
-    /// The conversation whose chat panel is open, if any.
-    pub fn active_conversation(&self) -> Option<ConversationId> {
-        match &self.screen {
-            Screen::ChatView { conversation, .. } => Some(*conversation),
-            _ => None,
-        }
-    }
-
-    /// Replace the visible history window and its absolute flash position.
-    pub fn set_chat_page(
-        &mut self,
-        rows: Vec<ChatRow, MAX_CHAT_MESSAGES>,
-        base: u32,
-        start: u32,
-        total: u32,
-        selected_message: Option<usize>,
-    ) {
-        self.messages = rows;
-        if let Screen::ChatView {
-            history_base,
-            history_start,
-            history_total,
-            selected_message: selected,
-            ..
-        } = &mut self.screen
-        {
-            *history_base = base;
-            *history_start = start;
-            *history_total = total;
-            *selected = selected_message.filter(|index| *index < self.messages.len());
-        }
-    }
-
-    /// Take a request to load an adjacent page of the open conversation.
-    pub fn take_pending_history_page(&mut self) -> Option<HistoryPageRequest> {
-        self.pending_history_page.take()
-    }
-
-    /// Show one received-message toast over whatever screen is active.
-    pub fn show_popup(&mut self, popup: crate::notify::Popup) {
-        self.popup = Some(popup);
-    }
-
-    /// Clear the composer after a successful send.
-    pub fn clear_chat_input(&mut self) {
-        if let Screen::ChatView {
-            input,
-            cursor,
-            pending_hex,
-            ..
-        } = &mut self.screen
-        {
-            input.clear();
-            *cursor = 0;
-            *pending_hex = None;
-        }
-    }
-
-    /// Return to the list whose contact rows just changed, dropping stale picks.
-    pub fn after_manage(&mut self, from_chats: bool) {
-        self.screen = if from_chats {
-            Screen::ChatsList { selected: 0 }
-        } else {
-            Screen::ContactsList { selected: 0 }
-        };
-    }
-
-    pub fn take_pending_announcement(&mut self) -> bool {
-        core::mem::replace(&mut self.pending_announcement, false)
-    }
-
-    /// The contact name the run loop still has to persist.
-    pub fn take_pending_rename(&mut self) -> Option<RenameCommand> {
-        self.pending_rename.take()
-    }
-
-    /// True once the user left the scan list and repeats must stop.
-    pub fn take_pending_scan_cancel(&mut self) -> bool {
-        core::mem::replace(&mut self.cancel_scan, false)
-    }
-
-    /// One peer the run loop should send an add-contact request to.
-    pub fn take_pending_contact_request(&mut self) -> Option<[u8; 16]> {
-        self.pending_contact_request.take()
-    }
-
-    pub fn take_pending_pairing(&mut self) -> Option<PairingCommand> {
-        self.pending_pairing.take()
-    }
-
-    /// The identity reset the run loop still has to execute.
-    pub fn take_pending_reset_identity(&mut self) -> bool {
-        core::mem::replace(&mut self.pending_reset_identity, false)
-    }
-
-    /// The preset the run loop still has to send to the radio worker.
-    pub fn take_pending_frequency(&mut self) -> Option<u32> {
-        self.pending_frequency.take()
-    }
-
-    /// Report the outcome of the requested identity regeneration.
-    pub fn set_identity_reset_status(&mut self, status: ResetUiStatus) {
-        if let Screen::IdentityReset {
-            status: current_status,
-        } = &mut self.screen
-        {
-            *current_status = status;
-        }
-    }
-
-    /// Report the outcome of the requested retune.
-    pub fn set_frequency_status(&mut self, status: FrequencyUiStatus) {
-        if let Screen::FrequencyStatus {
-            status: current_status,
-        } = &mut self.screen
-        {
-            *current_status = status;
-        }
-    }
-
-    pub fn set_pairing_status(&mut self, device_id: [u8; 16], status: PairingUiStatus) {
-        if let Screen::PairingStatus {
-            device_id: current,
-            status: current_status,
-        } = &mut self.screen
-            && *current == device_id
-        {
-            *current_status = status;
-        }
-    }
-
-    pub fn handle_pairing_event(&mut self, event: PairingEvent) {
-        if event.succeeded {
-            let name = self.pending_contact_name.clone();
-            let contact = Contact {
-                device_id: event.peer_id,
-                key: event.key,
-                custom_name: name.clone(),
-                blocked: false,
-            };
-            self.paired_contact(&contact);
-            // The handshake saves the contact without a name, so write it now.
-            if !name.is_empty() {
-                self.pending_rename = Some(RenameCommand {
-                    device_id: event.peer_id,
-                    name,
-                });
-            }
-        } else {
-            self.set_pairing_status(event.peer_id, PairingUiStatus::Failed);
-        }
-        self.pending_contact_name.clear();
-    }
-
-    /// Insert or update the contact for a successful pairing.
-    pub fn paired_contact(&mut self, contact: &Contact) {
-        let _ = self.contacts.adopt(contact);
-        self.discovered_devices
-            .retain(|device_id| *device_id != contact.device_id);
-        self.set_pairing_status(contact.device_id, PairingUiStatus::Paired);
-    }
-}
-
-impl Default for UiState {
-    fn default() -> Self {
-        Self::new(
-            None,
-            ContactBook::new(),
-            "unknown",
-            RadioConfig::default(),
-            DiscoveryList::new(),
-            0,
-        )
-    }
-}
-
-/// One chat row exactly as the four-line panel draws it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChatRow {
-    pub from_me: bool,
-    pub encrypted: bool,
-    pub acknowledged: bool,
-    pub coordinates: Option<(i32, i32)>,
-    /// Already truncated to `ROW_TEXT_CHARS`; empty for a coordinate row.
-    pub text: String<ROW_TEXT_CHARS>,
-    /// Broadcast rows name the sending peer; direct rows keep the FROM label.
-    pub sender_label: Option<String<32>>,
-}
-
-impl ChatRow {
-    /// Trim one flash record down to the fields the panel draws.
-    /// `sender_label` comes from the contact book for broadcast conversations.
-    pub fn from_stored(
-        message: &crate::storage::message::StoredMessage,
-        sender_label: Option<String<32>>,
-    ) -> Self {
-        let mut row = Self {
-            from_me: message.from_me,
-            encrypted: message.encrypted,
-            acknowledged: message.acknowledged,
-            coordinates: message.kind.coordinates(),
-            text: String::new(),
-            sender_label,
-        };
-        let source = match &message.kind {
-            MessageType::Text => message.text.as_str(),
-            MessageType::Coords { .. } => "[GPS]",
-        };
-        let mut preview = String::<PREVIEW_CHARS>::new();
-        let _ = preview.push_str(source);
-        for character in preview.chars().take(ROW_TEXT_CHARS) {
-            if row.text.push(character).is_err() {
-                break;
-            }
-        }
-        row
     }
 }

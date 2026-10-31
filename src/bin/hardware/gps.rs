@@ -108,6 +108,7 @@ impl<'d> Gps<'d> {
     }
 
     fn feed_byte(&mut self, byte: u8) {
+        // Start a new sentence at '$' and drop bytes until one arrives.
         if byte == b'$' {
             self.sentence_len = 0;
             self.collecting_sentence = true;

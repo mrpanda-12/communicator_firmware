@@ -5,7 +5,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
 };
 
-use super::style::{BLACK, CYAN, MUTED, WHITE, text};
+use crate::ui::render::style::{BLACK, CYAN, MUTED, WHITE, text};
 
 /// Cover the page with a short legend for the 5x5 keypad.
 ///

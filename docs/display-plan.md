@@ -1,6 +1,6 @@
 # Display and controls
 
-The UI is a state machine in `src/bin/ui/state.rs` with drawing code in `src/bin/ui/render/`. It drives a 320×240 ILI9341 display. Hardware input comes from the MCP23017 5×5 keypad in `src/bin/hardware/keypad.rs`; there is no simulated navigator in the runtime. The keypad worker publishes debounced key events and the UI loop applies them to `UiState`.
+The UI is a state machine in `src/bin/ui/states/` with drawing code in `src/bin/ui/render/`. It drives a 320×240 ILI9341 display. Hardware input comes from the MCP23017 5×5 keypad in `src/bin/hardware/keypad.rs`; there is no simulated navigator in the runtime. The keypad worker publishes debounced key events and the UI loop applies them to `UiState`.
 
 ## Physical key layout
 

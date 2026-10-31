@@ -30,6 +30,7 @@ impl<'a> Value<'a> for Contact {
         if buffer.len() < CONTACT_RECORD_BYTES {
             return Err(SerializationError::BufferTooSmall);
         }
+        // Pack the fixed record as id | key | zero-padded name | blocked flag.
         buffer[..16].copy_from_slice(&self.device_id);
         buffer[16..16 + KEY_SIZE].copy_from_slice(&self.key);
         encode_fixed_string(

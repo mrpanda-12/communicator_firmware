@@ -331,10 +331,7 @@ async fn main(_spawner: Spawner) -> ! {
     let next_id = saved_ids.map(|ids| ids.next_packet_id).unwrap_or(0);
     let last_message_id = saved_ids.map(|ids| ids.last_message_id).unwrap_or(0);
     packet::packet_data::set_packet_ids(next_id, last_message_id);
-    let display_brightness =
-        ui::display_settings::load_brightness(&mut storage, &mut flash_buffer).await;
-    let timezone_offset_minutes =
-        ui::display_settings::load_timezone_offset(&mut storage, &mut flash_buffer).await;
+    let settings = ui::states::settings::Settings::load(&mut storage, &mut flash_buffer).await;
     let mut contacts = ui::contact::ContactBook::new();
     match storage.load_contacts(&mut flash_buffer).await {
         Ok(saved_contacts) => {
@@ -388,7 +385,7 @@ async fn main(_spawner: Spawner) -> ! {
     display_backlight
         .configure(channel::config::Config {
             timer: &backlight_timer,
-            duty_pct: display_brightness,
+            duty_pct: settings.display_brightness,
             drive_mode: DriveMode::PushPull,
         })
         .unwrap_or_else(|_| fatal("backlight PWM channel did not configure"));
@@ -503,7 +500,7 @@ async fn main(_spawner: Spawner) -> ! {
         device_id,
         contacts,
         FIRMWARE_VERSION,
-        timezone_offset_minutes,
+        settings,
         &pairing,
         &flash,
         &RADIO_CONTROL,

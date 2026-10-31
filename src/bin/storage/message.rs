@@ -143,6 +143,7 @@ impl<'a> Value<'a> for StoredMessage {
             return Err(SerializationError::BufferTooSmall);
         }
 
+        // Write fields in fixed order; the reader walks the same path.
         let mut offset = 0;
         buffer[offset..offset + 4].copy_from_slice(&self.conversation_ordinal.to_le_bytes());
         offset += 4;

@@ -565,6 +565,7 @@ where
             });
         }
 
+        // Pack the nine profile bytes ahead of the payload, the order the opcode expects.
         let mut params = [0u8; 9 + LrFhssProfile::SBandDefault.max_payload_size()];
         params[0] = profile.header_count() as u8;
         params[1] = profile.coding_rate() as u8;

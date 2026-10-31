@@ -36,7 +36,7 @@ A single-packet message has `fragment_index = 0` and `fragment_count = 1`.
 | `0x03` | `Coordinates` | Eight-byte position payload, single fragment. |
 | `0x04` | `Heading` | Declared type; no sender or handler in this firmware. |
 | `0x05` | `DeviceAnnounce` | Plaintext broadcast request; empty payload. |
-| `0x06` | `FrequencyChange` | Declared announcement type; no handler or automatic retune. |
+| `0x06` | `FrequencyChange` | Direct retune request; payload is the new frequency as four big-endian bytes. The recipient accepts or declines in a popup. |
 | `0x07` | `DeviceAnnounceResponse` | Plaintext direct add-contact request; sent from the devices screen. It pairs nothing and only prompts the peer. |
 | `0x08` | `PairingConfirm` | Authenticated three-stage pairing frame. |
 
@@ -175,7 +175,7 @@ Because this is a simple flood, multiple relays may transmit duplicates of the s
 
 - No per-fragment retransmission; the outbox retries a whole message after 20 s, up to three rounds.
 - No radio-level acknowledgement or over-the-air frequency negotiation. The worker enforces a 10 % transmit duty cycle per band.
-- No handling for `Heading` or `FrequencyChange`.
+- No handling for `Heading`.
 - No group/broadcast encryption.
 - No persistent replay protection. Duplicate suppression is a 128-entry RAM seen cache for received packets, plus a check of the newest eight stored records of that conversation before a record is appended; that second check is what suppresses a retransmit after a reboot. Packet-ID allocation itself is persistent: the counter advances in flash before any of its IDs can be sent.
 - No compression or binary text encoding; chat text is UTF-8 bytes.

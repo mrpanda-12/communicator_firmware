@@ -91,7 +91,7 @@ Because the worker processes one operation at a time, RX pauses while TX and con
 
 Applying a retune selects the modem for the new band, recalibrates sub-GHz image rejection when the new frequency is below 1 GHz, sets the frequency and its RSSI calibration table, programs the modem/LoRa or LR-FHSS parameters, chooses a compatible PA mode, adjusts bandwidth and power when the new band cannot use the current values, republishes the new config, and resumes RX when the band supports it. If hardware reconfiguration fails, the worker restores the previous config before returning the error.
 
-A local retune does not notify peers, and this firmware has no handler for the `FrequencyChange` packet type. Both operators must retune manually. The UI presets in `ui/state.rs` currently offer 869.4 MHz sub-GHz and 2.4 GHz; 2.4 GHz requires hardware that supports that path and a matching peer.
+Changing frequency in Settings picks a preset, then offers every paired contact as a checkbox. Sending asks each ticked contact with its own plaintext `FrequencyChange` packet carrying the new frequency (four big-endian bytes), and this device retunes locally as well. A recipient sees a popup naming the sender and frequency: ENTER accepts and queues the same local retune, BACK declines. The presets in `ui/render/screens/types.rs` offer 869.4 MHz sub-GHz and 2.4 GHz; 2.4 GHz requires hardware that supports that path and a matching peer.
 
 ## LR1121 initialization
 

@@ -7,9 +7,11 @@ use embedded_graphics::{
 use heapless::String;
 
 use crate::ui::contact::ContactBook;
-use crate::ui::state::SettingsSection;
+use crate::ui::states::SettingsSection;
 
-use super::style::{ACK_GREEN, BLACK, CYAN, MUTED, SELECTED, UNKNOWN, WARNING, WHITE, text};
+use crate::ui::render::style::{
+    ACK_GREEN, BLACK, CYAN, MUTED, SELECTED, UNKNOWN, WARNING, WHITE, text,
+};
 
 pub fn draw_main<D>(display: &mut D, selected: usize) -> Result<(), D::Error>
 where
@@ -64,9 +66,7 @@ where
     update_rows(display, &["DEVICE", "FREQUENCY", "GPS"], previous, selected)
 }
 
-/// Show saved contacts, passive nearby peers, and an active discovery scan.
-/// Repaint just the old and new rows in the contact manager.
-/// Draw the available entries for one selected Settings category.
+/// Draw the entries of one Settings category with its selection.
 pub fn draw_settings_section<D>(
     display: &mut D,
     section: SettingsSection,
