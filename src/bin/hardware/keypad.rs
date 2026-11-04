@@ -18,7 +18,7 @@ use embedded_hal::i2c::I2c;
 use esp_hal::gpio::Input;
 
 /// Default MCP23017 address with A0-A2 tied low.
-pub const ADDRESS: u8 = 0x20;
+pub const ADDRESS: u8 = 0x27;
 
 // Register addresses for BANK = 0, the reset default.
 const REG_IODIR_A: u8 = 0x00;
